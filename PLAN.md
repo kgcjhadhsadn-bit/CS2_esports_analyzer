@@ -1,6 +1,6 @@
 # CS2 Esports Analyzer & Betclic Auto-Bettor — Project Plan
 
-> Status: **planning** · Last updated: 2026-11-22
+> Status: **planning** · Last updated: 2026-11-22 (runtime moved to owner's PC)
 > This document is the single source of truth for scope, architecture and build order.
 > Change it before changing direction in code.
 
@@ -10,15 +10,15 @@
 
 | Topic | Decision |
 |---|---|
-| Data sources | PandaScore API (paid historical tier) + HLTV scraping (incl. demo files) |
+| Data sources | PandaScore API (**highest available tier**) + HLTV scraping from the owner's PC (incl. demo files) |
 | Match scope | **Tier 1 / Tier 2 only** |
 | Markets | **Every pre-match CS2 market Betclic offers**, analyzed in full detail |
 | Live (in-play) betting | **No**, pre-match only |
 | AI role | Statistical / simulation model computes probabilities; Claude adds news context and writes rationales |
 | Bet rule | **Confidence + edge filter**: high calibrated probability AND positive EV after tax |
 | Staking | **¼ Kelly + hard caps**, loss limits, kill switch |
-| Execution | **Fully automatic** bet placement on Betclic.pl |
-| Runtime | **Polish VPS** (Docker Compose) |
+| Execution | **Fully automatic** bet placement on the **owner's own Betclic.pl account** |
+| Runtime | **Owner's PC in Poland, everything local**: no server, no VPS |
 | Interface | **Web dashboard** |
 | Budget | **High** (500+ PLN / month) |
 | Go-live gate | **None**: go live as soon as the system is built (backtest still runs, because calibration needs it) |
@@ -34,14 +34,20 @@ Constraints the design must accept:
 - **Zero losing bets is impossible.** CS2 has real variance: clutches, eco-round upsets, force-buys, overtime, players having off days. Even a true 90% outcome loses 1 time in 10. The target is *calibrated* probabilities and long-run profit, not a perfect record. Success is measured with Brier score, log-loss, ROI, drawdown and **closing-line value (CLV)**.
 - **The bookmaker's edge is real.** Betclic esports margins are typically 6–10%, and Poland takes **12% tax off every stake**. A bet is only worth placing if `p × 0.88 × odds > 1` by a safety margin. "Bet on everything" is a guaranteed loss, so the system analyzes everything but bets selectively.
 - **Betclic's Terms forbid bots and automated betting.** If Betclic detects automation, it can restrict or close the account and withhold the balance. The site will also change and break the selectors. The owner has accepted this risk. Betting with a licensed operator is legal in Poland; automation is a contractual issue with Betclic (this is not legal advice). The account holder must be 18+.
-- **IP/geo:** Betclic.pl serves Polish IPs only, and datacenter IPs may be flagged even in Poland. Mitigations: persistent browser profile, human-like pacing, low bet frequency, an optional Polish residential proxy for the executor.
-- **HLTV has no official API.** Scraping is against its ToS and protected by Cloudflare. Use caching, polite rate limits and residential proxies, and expect maintenance work.
+- **The bot uses the owner's main Betclic account.** If Betclic restricts it, that is the account and balance at risk.
+- **IP/geo:** everything runs on the owner's PC in Poland, so Betclic sees a normal Polish home connection. That's the best case for not being flagged. Keep pacing human-like and bet frequency low.
+- **The PC must be on.** The bot only works while the PC is running and awake. Pre-match bets must be placed before each match starts, so the PC needs to be on in the hours before Tier 1/2 matches (sleep disabled, or scheduled wake). The scheduler catches up on missed data jobs after a restart.
+- **HLTV has no official API.** Scraping is against its ToS and protected by Cloudflare, and it will run from the owner's home IP. Too many requests can get that IP blocked by HLTV/Cloudflare (which would also affect normal browsing of HLTV). Mitigations: aggressive caching, slow polite rate limits, a real browser (Playwright) and, for the large one-off backfill, an optional residential proxy so the home IP isn't hammered. Expect maintenance work.
 
 ---
 
 ## 2. Architecture
 
-Python 3.12 monorepo, deployed with Docker Compose on a Polish VPS.
+Python 3.12 monorepo, running **entirely on the owner's PC** (Windows assumed):
+- **Docker Desktop** runs PostgreSQL (and MinIO, if used).
+- The Python app (scrapers, models, engines, executor, API) runs **natively** via `uv`, so Playwright can open a visible browser for the Betclic login.
+- The dashboard is served at `http://localhost`, reachable only from this PC.
+- One start command (`cs2bot up`) launches everything; an optional Windows Task Scheduler entry starts it at login.
 
 ```
 [PandaScore API]  [HLTV scraper]  [HLTV demos]  [News sources]   [Betclic odds collector]
@@ -74,7 +80,7 @@ Python 3.12 monorepo, deployed with Docker Compose on a Polish VPS.
 | LLM | Anthropic SDK: Opus for deep match context, Haiku for bulk news triage |
 | API | FastAPI |
 | Dashboard | React + Vite + Recharts |
-| Demo storage | Local disk or MinIO (S3-compatible) |
+| Demo storage | Local disk: raw demos deleted after parsing, parsed data kept as Parquet/Postgres |
 | Quality | ruff, mypy, pytest, GitHub Actions CI |
 
 ---
@@ -113,14 +119,16 @@ tests/
 A match is in scope if its PandaScore tournament tier is **S, A or B**, *or* either team is in the **HLTV top 50**. Both values are configurable.
 
 ### 4.2 Sources
-- **PandaScore (paid historical tier):** fixtures, tournaments, teams, rosters, results, per-game stats. The stable backbone of IDs and schedules.
-- **HLTV (scraped):** results, map stats, player ratings, rankings, veto sequences, lineups, stand-ins, LAN/online flag, demo download links.
+- **PandaScore (highest available tier):** fixtures, tournaments, teams, rosters, results, per-game stats. The stable backbone of IDs and schedules.
+- **HLTV (scraped from the owner's PC):** results, map stats, player ratings, rankings, veto sequences, lineups, stand-ins, LAN/online flag, demo download links.
 - **HLTV demos:** downloaded for every in-scope match and parsed with `demoparser2`. This yields every kill, player position (x/y/z + named map area), duel, utility throw, equipment value / economy state, and round result. **It is the source of the "which player holds which position against which opponent" detail.**
 - **News:** HLTV news, Liquipedia roster changes, team/player socials. Triaged and classified by Claude.
 - **Betclic odds collector:** polls the JSON endpoints Betclic's own frontend uses for every CS2 event and market every few minutes, and stores timestamped snapshots. **Build this first.** Historical Betclic odds can't be downloaded, so every day it isn't running is lost data. For backtests before that, use historical closing odds scraped from odds-comparison sites.
 
 ### 4.3 Backfill
 From the CS2 release (**September 2023**) to today, for all in-scope matches.
+
+**Disk:** raw HLTV demo archives are large (hundreds of MB per match). They are downloaded, parsed, then **deleted**; only parsed data is kept. Plan for roughly **100–200 GB free** (parsed data, database, temporary demo files). The backfill runs slowly over several days to stay within polite HLTV rate limits.
 
 ### 4.4 Entity matching
 PandaScore, HLTV and Betclic use different names and IDs. `event_matching.py` links them by normalized team names, an alias table, start-time window and tournament. Low-confidence matches go to a review queue in the dashboard and are **never bet on automatically**.
@@ -190,9 +198,11 @@ At `p = 0.75` this needs odds of about **1.52** or higher, so expect **few bets*
 
 ---
 
-## 7. Betclic executor (Polish VPS)
+## 7. Betclic executor (owner's PC)
 
-- **Playwright** with a **persistent Chromium profile**. The first login is done **by hand over VNC** to clear SMS / 2FA; the session is then reused. Credentials live in `.env` on the VPS only and are **never committed**.
+- **Playwright** with a **dedicated, persistent Chromium profile** on the owner's PC, separate from the owner's everyday browser.
+- **First login is done by the owner, by hand**, in that browser window (including SMS / 2FA). The session is then reused; when it expires, the bot pauses and the dashboard asks the owner to log in again.
+- Betclic credentials (if stored at all) live only in the local `.env` / Windows Credential Manager on this PC. They are **never committed, never sent anywhere, and never pasted into chat**.
 - **Bet flow:** open event → locate market and outcome → **re-read live odds** (abort if they moved beyond tolerance or the edge disappeared) → enter stake → confirm → capture Betclic bet ID + screenshot → write to `bets` / `bankroll_ledger`.
 - **Safety:**
   - kill switch (DB flag, checked before every action),
@@ -214,7 +224,7 @@ At `p = 0.75` this needs odds of about **1.52** or higher, so expect **few bets*
 - Pipeline health (scrapers, demo parser, odds collector, executor)
 - **Kill switch, pause / resume**, threshold & cap editor
 - Review queue for low-confidence entity matches
-- Login-protected (single user)
+- Local only (`localhost`), single user
 
 ---
 
@@ -222,7 +232,7 @@ At `p = 0.75` this needs odds of about **1.52** or higher, so expect **few bets*
 
 | # | Phase | Output |
 |---|---|---|
-| 0 | Scaffold | Repo structure, Docker Compose, CI (ruff, mypy, pytest), `.env.example`, **Betclic odds collector running ASAP** |
+| 0 | Scaffold | Repo structure, Docker Compose (Postgres) for the PC, CI (ruff, mypy, pytest), `.env.example`, Windows setup guide, **Betclic odds collector running ASAP** |
 | 1 | Ingestion | PandaScore + HLTV clients, DB schema, backfill from Sept 2023 |
 | 2 | Demo pipeline | Download + parse demos; kill/round/economy/position tables; duel & position aggregates |
 | 3 | Core models | Map ratings, veto model, round model, map simulator, match aggregator |
@@ -232,15 +242,16 @@ At `p = 0.75` this needs odds of about **1.52** or higher, so expect **few bets*
 | 7 | Engines | Pricing for all markets, decision rules, bankroll / Kelly / limits |
 | 8 | Executor | Betclic Playwright executor + safety controls |
 | 9 | Dashboard | FastAPI + React dashboard |
-| 10 | Deploy & go live | Polish VPS, monitoring and alerting, first `DRY_RUN` selector smoke test, then live |
+| 10 | Install & go live | Install on the owner's PC, auto-start, health alerts in the dashboard, first `DRY_RUN` selector smoke test, then live |
 
 ---
 
 ## 10. Open questions
 
 - Starting bankroll (PLN) and final values for caps / limits / bets-per-day.
-- VPS provider in Poland (e.g. OVH Warsaw) and whether to add a Polish residential proxy for the executor.
-- Betclic 2FA method; dedicated account/device or the owner's main one.
-- PandaScore plan tier; Anthropic API key; residential proxy provider for HLTV.
+- PC details: Windows version, RAM, free disk space, and which hours it is usually on.
+- Betclic 2FA method (SMS / app), so the re-login flow matches it.
+- PandaScore: the owner signs up for the top plan and puts the API key in the local `.env` (not in chat).
+- Anthropic API key (local `.env`).
+- Optional residential proxy for the HLTV backfill, to protect the home IP.
 - Which CS2 prop markets Betclic actually offers (the odds collector will reveal this).
-- Dashboard hosting: same VPS behind auth, or separate.
