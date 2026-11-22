@@ -112,6 +112,24 @@ Wires everything: sync → train → predict → price → decide → stake → 
 `flows.scheduler`: built-in job scheduler (interval + daily jobs, catch-up of runs missed while the PC was off,
 based on `job_runs`). `cs2bot up`: starts the API/dashboard on `127.0.0.1` and the scheduler in one command.
 
+## CLI (implemented by P12; names are fixed so docs and scripts can reference them)
+
+| Command | Purpose |
+|---|---|
+| `cs2bot up` | Start the API + dashboard on 127.0.0.1 and the built-in scheduler (one command) |
+| `cs2bot doctor` | Check environment: DB reachable, migrations applied, Chromium present, API keys set, disk space |
+| `cs2bot db upgrade` / `db seed-synthetic` | Migrations / demo data |
+| `cs2bot ingest upcoming` / `results` / `backfill --since 2023-09-27` / `rankings` / `news` / `match <hltv_id>` | Data ingestion |
+| `cs2bot demos process --limit N` | Download + parse pending demos |
+| `cs2bot odds collect [--once]` / `odds unmapped` | Betclic odds collection / list unmapped market names |
+| `cs2bot models train` / `models tune` | Fit ratings, veto, round, kill, ensemble models |
+| `cs2bot predict upcoming` / `predict match <id>` | Produce MatchPredictions + priced outcomes |
+| `cs2bot bet run [--dry-run]` | Decide + stake + execute for upcoming matches |
+| `cs2bot settle` | Settle finished bets, closing odds, CLV, ledger |
+| `cs2bot backtest --from YYYY-MM-DD --to YYYY-MM-DD` | Walk-forward backtest |
+| `cs2bot executor login` / `executor health` / `executor balance` | Open the Betclic login window / checks |
+| `cs2bot control kill-switch on|off` / `control pause` / `control resume` | Safety controls |
+
 ## Data flow for one upcoming match
 
 1. `ingest.*` keeps matches, lineups, vetoes, results, demos and news fresh.

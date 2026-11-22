@@ -11,12 +11,13 @@ The resolved row gets the external id and alias attached, so later lookups hit s
 
 from __future__ import annotations
 
+from datetime import datetime, timedelta
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import and_, or_, select
 from sqlalchemy.orm import Session
 
-from cs2bot.db.models import Player, Team, TeamAlias, Tournament
+from cs2bot.db.models import Match, Player, Team, TeamAlias, Tournament
 from cs2bot.domain.enums import DataSource, Tier
 from cs2bot.utils.names import normalize_player_name, normalize_team_name, team_name_similarity
 
@@ -165,3 +166,31 @@ def resolve_tournament(
             setattr(tour, key, value)
     session.flush()
     return tour
+
+
+def find_match(
+    session: Session, team_a_id: int, team_b_id: int, around: datetime, *, window_hours: float = 12.0
+) -> Match | None:
+    """Existing match between two teams (either orientation) scheduled within +-window of ``around``.
+
+    Used by every source (PandaScore, HLTV, Betclic linking) so the same real match is stored once.
+    When several candidates exist, the one closest in time wins.
+    """
+    lo, hi = around - timedelta(hours=window_hours), around + timedelta(hours=window_hours)
+    query = select(Match).where(
+        or_(
+            and_(Match.team1_id == team_a_id, Match.team2_id == team_b_id),
+            and_(Match.team1_id == team_b_id, Match.team2_id == team_a_id),
+        ),
+        Match.scheduled_at >= lo,
+        Match.scheduled_at <= hi,
+    )
+    candidates = [m for m in session.scalars(query) if m.scheduled_at is not None]
+    if not candidates:
+        return None
+    return min(candidates, key=lambda m: abs((m.scheduled_at - around).total_seconds()))  # type: ignore[operator]
+
+
+def is_swapped(match: Match, source_first_team_id: int) -> bool:
+    """True if the source lists our ``team2`` first (scores/sides/vetoes must then be swapped)."""
+    return match.team2_id == source_first_team_id and match.team1_id != source_first_team_id

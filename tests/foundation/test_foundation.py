@@ -301,3 +301,20 @@ def test_populate_db(session) -> None:
     assert m1 is not None and m1.scheduled_at is not None and m1.scheduled_at.tzinfo is not None
     assert {lu.player_id for lu in m1.lineups} and m1.maps[0].map_number == 1
     assert TeamSlot.TEAM1.other is TeamSlot.TEAM2
+
+
+def test_find_match_either_orientation(session) -> None:
+    from datetime import timedelta
+
+    from cs2bot.db.repo import find_match, is_swapped
+
+    a = resolve_team(session, name="Alpha", source=DataSource.HLTV, external_id=1)
+    b = resolve_team(session, name="Bravo", source=DataSource.HLTV, external_id=2)
+    assert a is not None and b is not None
+    t0 = datetime(2026, 5, 1, 15, tzinfo=UTC)
+    m = Match(team1_id=a.id, team2_id=b.id, scheduled_at=t0)
+    session.add(m)
+    session.flush()
+    assert find_match(session, b.id, a.id, t0 + timedelta(hours=2)) is m
+    assert find_match(session, a.id, b.id, t0 + timedelta(hours=30)) is None
+    assert is_swapped(m, b.id) and not is_swapped(m, a.id)
