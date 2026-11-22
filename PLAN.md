@@ -1,6 +1,6 @@
 # CS2 Esports Analyzer & Betclic Auto-Bettor — Project Plan
 
-> Status: **planning** · Last updated: 2026-11-22 (runtime moved to owner's PC)
+> Status: **planning, all decisions settled** · Last updated: 2026-11-22 (runtime moved to owner's PC)
 > This document is the single source of truth for scope, architecture and build order.
 > Change it before changing direction in code.
 
