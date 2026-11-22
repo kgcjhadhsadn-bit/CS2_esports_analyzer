@@ -318,3 +318,12 @@ def test_find_match_either_orientation(session) -> None:
     assert find_match(session, b.id, a.id, t0 + timedelta(hours=2)) is m
     assert find_match(session, a.id, b.id, t0 + timedelta(hours=30)) is None
     assert is_swapped(m, b.id) and not is_swapped(m, a.id)
+
+
+def test_resolve_path_falls_back_to_project_root() -> None:
+    from cs2bot.utils.paths import project_root, resolve_path
+
+    root = project_root()
+    assert (root / "pyproject.toml").is_file()
+    assert resolve_path("pyproject.toml") == root / "pyproject.toml"  # tests run in a temp cwd
+    assert resolve_path("/abs/x.yaml").as_posix() == "/abs/x.yaml"
