@@ -311,6 +311,9 @@ class Round(Base):
     team1_side: Mapped[Side] = mapped_column(str_enum(Side, 8))
     winner_side: Mapped[Side] = mapped_column(str_enum(Side, 8))
     winner_team_id: Mapped[int | None] = mapped_column(ForeignKey("teams.id", ondelete="SET NULL"))
+    # Where the row came from: DEMO rows are complete; HLTV round-history rows only know the winner,
+    # side and end reason. Demo parsing replaces HLTV rows; HLTV sync never overwrites DEMO rows.
+    source: Mapped[DataSource] = mapped_column(str_enum(DataSource), default=DataSource.DEMO)
     end_reason: Mapped[RoundEndReason] = mapped_column(str_enum(RoundEndReason), default=RoundEndReason.OTHER)
     ct_equipment_value: Mapped[int | None] = mapped_column(Integer)
     t_equipment_value: Mapped[int | None] = mapped_column(Integer)
@@ -535,6 +538,7 @@ class BookmakerMarket(Base):
     is_mapped: Mapped[bool] = mapped_column(Boolean, default=False)
     first_seen_at: Mapped[datetime] = mapped_column(UTCDateTime())
     last_seen_at: Mapped[datetime] = mapped_column(UTCDateTime())
+    extra: Mapped[dict[str, Any]] = mapped_column(default=dict)
 
     event: Mapped[BookmakerEvent] = relationship(back_populates="markets")
     selections: Mapped[list[BookmakerSelection]] = relationship(
@@ -553,7 +557,8 @@ class BookmakerSelection(Base):
     selection_key: Mapped[str | None] = mapped_column(String(64))  # our orientation (team1/over/...)
     is_mapped: Mapped[bool] = mapped_column(Boolean, default=False)
     last_odds: Mapped[Decimal | None] = mapped_column(OddsNum)
-    last_odds_at: Mapped[datetime | None] = mapped_column(UTCDateTime())
+    last_odds_at: Mapped[datetime | None] = mapped_column(UTCDateTime())  # price last confirmed at
+    last_seen_at: Mapped[datetime | None] = mapped_column(UTCDateTime())
     is_available: Mapped[bool] = mapped_column(Boolean, default=True)
 
     market: Mapped[BookmakerMarket] = relationship(back_populates="selections")
@@ -631,6 +636,7 @@ class MatchAnalysis(Base):
 
 class BetDecisionRow(Base):
     __tablename__ = "bet_decisions"
+    __table_args__ = (Index("ix_bet_decisions_outcome", "match_id", "spec_key", "selection_key"),)
 
     id: Mapped[int] = mapped_column(BigInteger().with_variant(Integer, "sqlite"), primary_key=True)
     match_id: Mapped[int] = mapped_column(ForeignKey("matches.id", ondelete="CASCADE"), index=True)
@@ -727,6 +733,7 @@ class AuditLog(Base):
 
 class JobRun(Base):
     __tablename__ = "job_runs"
+    __table_args__ = (Index("ix_job_runs_name_started", "job_name", "started_at"),)
 
     id: Mapped[int] = mapped_column(primary_key=True)
     job_name: Mapped[str] = mapped_column(String(64), index=True)

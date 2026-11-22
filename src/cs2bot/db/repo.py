@@ -108,9 +108,14 @@ def resolve_player(
     external_id: int | None = None,
     team_id: int | None = None,
     create: bool = True,
+    update_current_team: bool = True,
     **fields: Any,
 ) -> Player | None:
-    """Find or create a player. Nickname-only matching is restricted to the same current team."""
+    """Find or create a player. Nickname-only matching is restricted to the same current team.
+
+    Pass ``update_current_team=False`` when processing OLD matches (backfills): the player is still
+    matched/created with ``team_id`` but an existing ``current_team_id`` is left alone.
+    """
     id_field = _EXTERNAL_ID_FIELD.get(source)
     player: Player | None = None
     if id_field and external_id is not None:
@@ -131,7 +136,7 @@ def resolve_player(
         session.flush()
     if id_field and external_id is not None and getattr(player, id_field) is None:
         setattr(player, id_field, external_id)
-    if team_id is not None:
+    if team_id is not None and (update_current_team or player.current_team_id is None):
         player.current_team_id = team_id
     for key, value in fields.items():
         if value is not None and getattr(player, key, None) in (None, "", {}):

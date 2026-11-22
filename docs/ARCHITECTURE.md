@@ -120,6 +120,7 @@ based on `job_runs`). `cs2bot up`: starts the API/dashboard on `127.0.0.1` and t
 | `cs2bot doctor` | Check environment: DB reachable, migrations applied, Chromium present, API keys set, disk space |
 | `cs2bot db upgrade` / `db seed-synthetic` | Migrations / demo data |
 | `cs2bot ingest upcoming` / `results` / `backfill --since 2023-09-27` / `rankings` / `news` / `match <hltv_id>` | Data ingestion |
+| `cs2bot ingest hltv-browser` | Open HLTV in a visible window with the bot's browser profile (pass a challenge by hand) |
 | `cs2bot demos process --limit N` | Download + parse pending demos |
 | `cs2bot odds collect [--once]` / `odds unmapped` | Betclic odds collection / list unmapped market names |
 | `cs2bot models train` / `models tune` | Fit ratings, veto, round, kill, ensemble models |

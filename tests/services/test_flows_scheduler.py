@@ -7,8 +7,11 @@ from datetime import UTC, datetime, time, timedelta
 
 import pytest
 from sqlalchemy import select
+from sqlalchemy.orm import sessionmaker
 
+from cs2bot.db.base import Base
 from cs2bot.db.models import JobRun
+from cs2bot.db.session import make_engine
 from cs2bot.domain.enums import JobStatus
 from cs2bot.flows.scheduler import Daily, Interval, Job, Scheduler, last_run_times, recent_failures
 from cs2bot.flows.worker import ThreadWorker
@@ -118,7 +121,12 @@ def test_catch_up_after_restart(session_factory) -> None:
     assert ran == [1]
 
 
-def test_lanes_run_in_threads(session_factory) -> None:
+def test_lanes_run_in_threads(tmp_path) -> None:
+    # Lanes are real threads: use a file database so each thread gets its own connection
+    # (the in-memory fixture shares ONE SQLite connection, which is not safe across threads).
+    engine = make_engine(f"sqlite:///{tmp_path / 'lanes.db'}")
+    Base.metadata.create_all(engine)
+    session_factory = sessionmaker(bind=engine, expire_on_commit=False, autoflush=False)
     started = threading.Event()
     release = threading.Event()
     fast_ran = threading.Event()
@@ -142,6 +150,7 @@ def test_lanes_run_in_threads(session_factory) -> None:
     finally:
         release.set()
         sch.stop()
+        engine.dispose()
     assert sch.stopped
 
 

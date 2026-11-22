@@ -7,7 +7,7 @@ from datetime import datetime
 from pydantic import BaseModel, Field
 
 from cs2bot.domain.context import ContextFlag
-from cs2bot.domain.enums import MatchFormat, TeamSlot, Tier
+from cs2bot.domain.enums import MatchFormat, PlayerRole, Side, TeamSlot, Tier
 from cs2bot.domain.records import VetoStep
 
 
@@ -15,6 +15,7 @@ class LineupPlayer(BaseModel):
     player_id: int
     nickname: str | None = None
     is_standin: bool = False
+    role: PlayerRole | None = None
 
 
 class MatchContext(BaseModel):
@@ -34,6 +35,8 @@ class MatchContext(BaseModel):
     map_pool: list[str] = Field(default_factory=list)
     known_veto: list[VetoStep] = Field(default_factory=list)  # empty until published
     first_veto_team: TeamSlot | None = None
+    # map name -> team1's starting side, once the side choice is known (None/missing = unknown)
+    start_sides: dict[str, Side | None] = Field(default_factory=dict)
     context_flags: list[ContextFlag] = Field(default_factory=list)
 
     @property

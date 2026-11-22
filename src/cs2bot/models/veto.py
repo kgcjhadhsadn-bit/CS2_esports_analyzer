@@ -580,7 +580,7 @@ class VetoModel:
         coef = self._coef_adv if use_adv and self._coef_adv is not None else self._coef
         out: dict[tuple[TeamSlot, VetoAction], dict[str, float]] = {}
         for slot, team, opp in ((TeamSlot.TEAM1, team1_id, team2_id), (TeamSlot.TEAM2, team2_id, team1_id)):
-            adv = {m: 0.0 for m in pool}
+            adv = dict.fromkeys(pool, 0.0)
             if use_adv and map_advantage is not None:
                 adv = {m: float(map_advantage(team, opp, m, t_adv)) for m in pool}
             opp_pick = {m: self._pref(opp, VetoAction.PICK, m, t_pref) for m in pool}
@@ -762,7 +762,7 @@ class VetoModel:
                         new_played = (*played, (m, None)) if has_leftover else played
                         nxt[(rem - {m}, new_played)] += p * q
                     continue
-                weights = expu[(actor, action)] if actor is not None else {m: 1.0 for m in rem}
+                weights = expu[(actor, action)] if actor is not None else dict.fromkeys(rem, 1.0)
                 denom = sum(weights[m] for m in rem)
                 if ks is not None:
                     choices = [ks[2]] if ks[2] in rem else []

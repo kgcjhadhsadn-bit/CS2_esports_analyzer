@@ -34,6 +34,8 @@ class CollectedEvent(BaseModel):
     starts_at: datetime | None = None
     url: str | None = None
     is_live: bool = False
+    captured_at: datetime | None = None  # when this event's prices were read (UTC)
+    sport_raw: str | None = None
     markets: list[CollectedMarket] = Field(default_factory=list)
 
 

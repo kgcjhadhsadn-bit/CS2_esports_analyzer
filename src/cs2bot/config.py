@@ -84,6 +84,13 @@ class HLTVSettings(BaseModel):
     headless: bool = True
     chromium_executable: OptionalStr = None
     navigation_timeout_s: float = 60.0
+    # Persistent browser profile: cookies survive restarts, so a challenge the owner passes by hand
+    # once in a visible window (CS2BOT_HLTV__HEADLESS=false) keeps working afterwards.
+    browser_profile_dir: Path | None = Path("data/browser/hltv")
+    challenge_wait_s: float = 20.0
+    cooldown_base_s: float = 900.0  # first cool-down after a block; doubles on each repeat
+    cooldown_max_s: float = 43_200.0
+    block_resources: bool = True  # skip images / media / fonts (less traffic for HLTV and us)
 
 
 class DemoSettings(BaseModel):
@@ -98,7 +105,7 @@ class DemoSettings(BaseModel):
 
 class BetclicSettings(BaseModel):
     base_url: str = "https://www.betclic.pl"
-    # Listing page for CS2 events. Unverified from outside Poland - confirm on the VPS.
+    # Listing page for CS2 events. Unverified from outside Poland - confirm on the owner's PC.
     cs2_listing_path: str = "/e-sport-s102"
     offering_api_base: OptionalStr = None
     site_code: str = "plpl"
@@ -123,6 +130,11 @@ class BetclicSettings(BaseModel):
     proxy_url: OptionalSecret = None
     min_stake: Decimal = Decimal("2.00")
     odds_max_age_s: int = 600
+    # Settlement-rule assumptions; adjust once real Betclic settlements have been observed.
+    void_refunds_stake_tax: bool = True  # a voided/pushed bet returns the full gross stake
+    winnings_tax_rounding: Literal["zloty", "grosz"] = "zloty"
+    h2h_tie_rule: Literal["push", "lose"] = "push"  # player head-to-head kills ending level
+    totals_include_overtime: bool = True  # round totals / handicaps count overtime rounds
 
 
 class LLMSettings(BaseModel):
@@ -147,6 +159,11 @@ class ModelSettings(BaseModel):
     min_maps_for_rating: int = 8
     calibration_holdout_days: int = 90
     sigma_floor: float = 0.01
+    scenario_n_simulations: int | None = None  # low/high scenarios; None = n_map_simulations // 2
+    ot_start_money: int = 10_000  # per player at each overtime half (some organisers use 12 500)
+    round_model_half_life_days: float = 365.0
+    kill_model_half_life_days: float = 120.0
+    top_fragger_samples: int = 20_000
 
 
 class MarketThresholds(BaseModel):
@@ -196,6 +213,19 @@ class ExecutorSettings(BaseModel):
     headless: bool = False  # visible browser on the owner's desktop, logged-in persistent profile
     screenshot_dir: Path = Path("data/screenshots")
     reconcile_tolerance: Decimal = Decimal("0.05")
+    # Browser automation tuning (see cs2bot.executor.tuning.ExecutorTuning).
+    element_timeout_s: float = 10.0
+    optional_timeout_s: float = 1.5
+    slip_update_timeout_s: float = 8.0
+    confirmation_timeout_s: float = 45.0  # receipt / error after the final click, else UNCERTAIN
+    min_seconds_between_bets: float = 20.0
+    max_odds_change_rounds: int = 2
+    viewport_width: int = 1440
+    viewport_height: int = 900
+    save_html_on_selector_error: bool = True
+    health_check_event_page: bool = True
+    lock_stale_after_s: float = 600.0
+    lock_heartbeat_s: float = 30.0
 
 
 class APISettings(BaseModel):
@@ -209,6 +239,10 @@ class APISettings(BaseModel):
     session_secret: OptionalSecret = None
     session_max_age_s: int = 60 * 60 * 12
     cors_origins: list[str] = Field(default_factory=lambda: ["http://localhost:5173"])
+    allowed_hosts: list[str] = Field(default_factory=list)  # extra Host-header names (non-loopback)
+    login_max_failures: int = 5
+    login_global_max_failures: int = 20
+    login_window_s: float = 300.0
 
     @property
     def is_loopback(self) -> bool:

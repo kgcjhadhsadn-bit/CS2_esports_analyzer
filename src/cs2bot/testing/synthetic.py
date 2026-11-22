@@ -245,6 +245,7 @@ class SynthUniverse:
                             first_k[a] = first_k.get(a, 0) + 1
                             first_d[v] = first_d.get(v, 0) + 1
                 n_rounds = len(mp.rounds)
+                own_rounds = {m.team1_id: mp.team1_rounds, m.team2_id: mp.team2_rounds}
                 for team_id, opp_id in ((m.team1_id, m.team2_id), (m.team2_id, m.team1_id)):
                     for p in self.teams[team_id].players:
                         out.append(
@@ -259,6 +260,8 @@ class SynthUniverse:
                                 kills=kills.get(p.id, 0),
                                 deaths=deaths.get(p.id, 0),
                                 rounds_played=n_rounds,
+                                team_rounds_won=own_rounds[team_id],
+                                opponent_rounds_won=own_rounds[opp_id],
                                 first_kills=first_k.get(p.id, 0),
                                 first_deaths=first_d.get(p.id, 0),
                                 role=p.role,
@@ -759,6 +762,7 @@ def populate_db(
                             team1_side=r.team1_side,
                             winner_side=r.team1_side if r.winner is TeamSlot.TEAM1 else r.team1_side.other,
                             winner_team_id=m.team1_id if r.winner is TeamSlot.TEAM1 else m.team2_id,
+                            source=DataSource.SYNTHETIC,
                             end_reason=r.end_reason,
                             ct_equipment_value=r.team1_equipment if ct_is_team1 else r.team2_equipment,
                             t_equipment_value=r.team2_equipment if ct_is_team1 else r.team1_equipment,

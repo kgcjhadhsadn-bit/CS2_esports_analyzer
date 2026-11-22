@@ -2,7 +2,7 @@
 
 Revision ID: 0001
 Revises: 
-Create Date: 2026-11-22 18:13:50.692202
+Create Date: 2026-11-22 23:39:37.295344
 """
 from collections.abc import Sequence
 
@@ -43,6 +43,7 @@ def upgrade() -> None:
     )
     with op.batch_alter_table('job_runs', schema=None) as batch_op:
         batch_op.create_index(batch_op.f('ix_job_runs_job_name'), ['job_name'], unique=False)
+        batch_op.create_index('ix_job_runs_name_started', ['job_name', 'started_at'], unique=False)
         batch_op.create_index(batch_op.f('ix_job_runs_started_at'), ['started_at'], unique=False)
 
     op.create_table('model_runs',
@@ -470,6 +471,7 @@ def upgrade() -> None:
     sa.Column('is_mapped', sa.Boolean(), nullable=False),
     sa.Column('first_seen_at', cs2bot.db.base.UTCDateTime(timezone=True), nullable=False),
     sa.Column('last_seen_at', cs2bot.db.base.UTCDateTime(timezone=True), nullable=False),
+    sa.Column('extra', sa.JSON().with_variant(postgresql.JSONB(astext_type=sa.Text()), 'postgresql'), nullable=False),
     sa.ForeignKeyConstraint(['event_id'], ['bookmaker_events.id'], name=op.f('fk_bookmaker_markets_event_id_bookmaker_events'), ondelete='CASCADE'),
     sa.PrimaryKeyConstraint('id', name=op.f('pk_bookmaker_markets')),
     sa.UniqueConstraint('event_id', 'raw_name', 'external_id', name=op.f('uq_bookmaker_markets_event_id_raw_name_external_id'))
@@ -620,6 +622,7 @@ def upgrade() -> None:
     sa.Column('team1_side', sa.Enum('ct', 't', name='side', native_enum=False, length=8), nullable=False),
     sa.Column('winner_side', sa.Enum('ct', 't', name='side', native_enum=False, length=8), nullable=False),
     sa.Column('winner_team_id', sa.Integer(), nullable=True),
+    sa.Column('source', sa.Enum('pandascore', 'hltv', 'demo', 'betclic', 'liquipedia', 'manual', 'synthetic', name='datasource', native_enum=False, length=32), nullable=False),
     sa.Column('end_reason', sa.Enum('elimination', 'bomb_exploded', 'bomb_defused', 'time_expired', 'surrender', 'other', name='roundendreason', native_enum=False, length=32), nullable=False),
     sa.Column('ct_equipment_value', sa.Integer(), nullable=True),
     sa.Column('t_equipment_value', sa.Integer(), nullable=True),
@@ -649,6 +652,7 @@ def upgrade() -> None:
     sa.Column('is_mapped', sa.Boolean(), nullable=False),
     sa.Column('last_odds', sa.Numeric(precision=8, scale=3), nullable=True),
     sa.Column('last_odds_at', cs2bot.db.base.UTCDateTime(timezone=True), nullable=True),
+    sa.Column('last_seen_at', cs2bot.db.base.UTCDateTime(timezone=True), nullable=True),
     sa.Column('is_available', sa.Boolean(), nullable=False),
     sa.ForeignKeyConstraint(['market_id'], ['bookmaker_markets.id'], name=op.f('fk_bookmaker_selections_market_id_bookmaker_markets'), ondelete='CASCADE'),
     sa.PrimaryKeyConstraint('id', name=op.f('pk_bookmaker_selections')),
@@ -683,6 +687,7 @@ def upgrade() -> None:
     with op.batch_alter_table('bet_decisions', schema=None) as batch_op:
         batch_op.create_index(batch_op.f('ix_bet_decisions_decided_at'), ['decided_at'], unique=False)
         batch_op.create_index(batch_op.f('ix_bet_decisions_match_id'), ['match_id'], unique=False)
+        batch_op.create_index('ix_bet_decisions_outcome', ['match_id', 'spec_key', 'selection_key'], unique=False)
 
     op.create_table('odds_snapshots',
     sa.Column('id', sa.BigInteger().with_variant(sa.Integer(), 'sqlite'), nullable=False),
@@ -777,6 +782,7 @@ def downgrade() -> None:
 
     op.drop_table('odds_snapshots')
     with op.batch_alter_table('bet_decisions', schema=None) as batch_op:
+        batch_op.drop_index('ix_bet_decisions_outcome')
         batch_op.drop_index(batch_op.f('ix_bet_decisions_match_id'))
         batch_op.drop_index(batch_op.f('ix_bet_decisions_decided_at'))
 
@@ -909,6 +915,7 @@ def downgrade() -> None:
     op.drop_table('model_runs')
     with op.batch_alter_table('job_runs', schema=None) as batch_op:
         batch_op.drop_index(batch_op.f('ix_job_runs_started_at'))
+        batch_op.drop_index('ix_job_runs_name_started')
         batch_op.drop_index(batch_op.f('ix_job_runs_job_name'))
 
     op.drop_table('job_runs')

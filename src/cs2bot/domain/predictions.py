@@ -11,6 +11,20 @@ Dict keys are strings so everything round-trips through JSON:
 * score keys: ``"13-9"`` (team1 rounds first), ``"2-1"`` (team1 maps first)
 * pmf keys of integer-valued variables: ``"26"`` -> probability
 * scope keys for multi-map player markets: ``"map:1"``, ``"maps:1,2"``, ``"match"``
+
+Conventions shared by the simulator (producer) and the pricing engine (consumer)
+---------------------------------------------------------------------------------
+* Every distribution inside a :class:`MapSlotPrediction` is conditional on that map being played.
+* ``player_kills_by_scope``: ``"map:k"`` is conditional on map k being played (the slot's ``players``
+  dict is the primary source for single maps); ``"maps:1,2"`` is conditional on ALL listed maps being
+  played (the bet is void otherwise); ``"match"`` is unconditional (kills over the maps actually played).
+* ``top_fragger[scope]``: player id -> probability with dead heats already split evenly, same scope
+  keys as above. Team-restricted markets use ``"<scope>|team1"`` / ``"<scope>|team2"``.
+* ``p_team1_race_to["N"]`` = P(team1 is first to N rounds). For N <= 13 one team always gets there.
+  For N > 13 ``p_neither_race_to["N"]`` = P(neither team reaches N); the market is void in that case
+  and P(team2 first) = 1 - p_team1 - p_neither.
+* ``p_team1_pistol`` keys are ``"1"`` / ``"13"``; ``p_team1_half`` and ``p_half_draw`` keys are
+  ``"1"`` / ``"2"``.
 """
 
 from __future__ import annotations
@@ -58,6 +72,7 @@ class MapSlotPrediction(BaseModel):
     p_team1_half: dict[str, float] = Field(default_factory=dict)  # "1" / "2" -> P(team1 wins half)
     p_half_draw: dict[str, float] = Field(default_factory=dict)  # "1" / "2" -> P(6-6 half)
     p_team1_race_to: dict[str, float] = Field(default_factory=dict)  # "5" -> P(team1 first to 5)
+    p_neither_race_to: dict[str, float] = Field(default_factory=dict)  # "16" -> P(nobody reaches 16)
     players: dict[str, PlayerProjection] = Field(default_factory=dict)  # player id -> projection
 
 

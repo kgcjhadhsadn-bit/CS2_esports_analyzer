@@ -19,15 +19,29 @@ DEFAULT_USER_AGENT = "cs2bot/0.1 (+personal research project)"
 
 
 class RateLimiter:
-    """Thread-safe limiter enforcing a minimum (optionally jittered) gap between calls."""
+    """Thread-safe limiter enforcing a minimum (optionally jittered) gap between calls.
 
-    def __init__(self, min_interval_s: float, max_interval_s: float | None = None) -> None:
+    ``clock`` / ``sleep`` / ``rng`` are injectable so tests run instantly and deterministically.
+    """
+
+    def __init__(
+        self,
+        min_interval_s: float,
+        max_interval_s: float | None = None,
+        *,
+        clock: Callable[[], float] = time.monotonic,
+        sleep: Callable[[float], None] = time.sleep,
+        rng: random.Random | None = None,
+    ) -> None:
         if min_interval_s < 0:
             raise ValueError("min_interval_s must be >= 0")
         self.min_interval_s = min_interval_s
         self.max_interval_s = max(max_interval_s or min_interval_s, min_interval_s)
+        self._clock = clock
+        self._sleep = sleep
+        self._rng = rng or random.Random()
         self._lock = threading.Lock()
-        self._next_allowed = 0.0
+        self._next_allowed: float | None = None
 
     @classmethod
     def per_hour(cls, max_requests: int) -> RateLimiter:
@@ -36,12 +50,12 @@ class RateLimiter:
     def wait(self) -> float:
         """Block until the next call is allowed; returns seconds slept."""
         with self._lock:
-            now = time.monotonic()
-            sleep_for = max(0.0, self._next_allowed - now)
-            gap = random.uniform(self.min_interval_s, self.max_interval_s)
-            self._next_allowed = max(now, self._next_allowed) + gap
+            now = self._clock()
+            sleep_for = 0.0 if self._next_allowed is None else max(0.0, self._next_allowed - now)
+            gap = self._rng.uniform(self.min_interval_s, self.max_interval_s)
+            self._next_allowed = now + sleep_for + gap
         if sleep_for > 0:
-            time.sleep(sleep_for)
+            self._sleep(sleep_for)
         return sleep_for
 
 

@@ -131,6 +131,8 @@ class PlayerMapRecord(BaseModel):
     deaths: int
     assists: int = 0
     rounds_played: int
+    team_rounds_won: int | None = None
+    opponent_rounds_won: int | None = None
     headshots: int | None = None
     adr: float | None = None
     kast: float | None = None

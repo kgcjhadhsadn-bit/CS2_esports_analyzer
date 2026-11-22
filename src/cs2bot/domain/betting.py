@@ -6,10 +6,12 @@ from datetime import datetime
 from decimal import Decimal
 from enum import StrEnum
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from cs2bot.domain.enums import BetStatus
 from cs2bot.domain.odds import OddsQuote
 from cs2bot.domain.predictions import OutcomeProbability
+from cs2bot.utils.time import ensure_utc
 
 
 class PricedOutcome(BaseModel):
@@ -34,6 +36,9 @@ class BankrollState(BaseModel):
     open_stakes_today: Decimal  # stakes of unsettled bets placed today
     open_stakes_week: Decimal
     exposure_by_match: dict[int, Decimal] = Field(default_factory=dict)  # match id -> open stakes
+    day_start: datetime | None = None  # UTC instant of the local (Warsaw) midnight used above
+    week_start: datetime | None = None  # UTC instant of the local Monday 00:00 used above
+    reserved_stakes: Decimal = Decimal("0")  # open stakes not yet debited in the ledger
     bets_placed_today: int = 0
     kill_switch: bool = False
     paused: bool = False
@@ -44,7 +49,8 @@ class BetDecision(BaseModel):
     priced: PricedOutcome
     match_id: int
     accepted: bool
-    reasons: list[str] = Field(default_factory=list)  # why rejected (or "ok" notes)
+    reasons: list[str] = Field(default_factory=list)  # rejection reasons only (empty when accepted)
+    notes: list[str] = Field(default_factory=list)  # informational, e.g. which staking cap was binding
     stake: Decimal = Decimal("0")
     kelly_fraction_used: float = 0.0
     decided_at: datetime
@@ -98,3 +104,65 @@ class ExecutorHealth(BaseModel):
     selectors_ok: dict[str, bool] = Field(default_factory=dict)
     message: str = ""
     checked_at: datetime
+
+
+def bet_status_after_placement(status: PlacementStatus) -> BetStatus:
+    """How a placement attempt changes ``bets.status``.
+
+    * ``PLACED`` -> ``BetStatus.PLACED`` (money at risk).
+    * ``DRY_RUN_OK`` -> ``BetStatus.DRY_RUN`` (simulated; never touches the ledger or the limits).
+    * ``UNCERTAIN`` -> ``BetStatus.PLACING``: we could not confirm whether the bookmaker accepted the bet,
+      so it stays open and counts as exposure until reconciliation against the bet history resolves it.
+      It is never retried automatically.
+    * everything else -> ``BetStatus.FAILED`` (no bet exists at the bookmaker; no money at risk).
+    """
+    if status is PlacementStatus.PLACED:
+        return BetStatus.PLACED
+    if status is PlacementStatus.DRY_RUN_OK:
+        return BetStatus.DRY_RUN
+    if status is PlacementStatus.UNCERTAIN:
+        return BetStatus.PLACING
+    return BetStatus.FAILED
+
+
+class BookmakerBetStatus(StrEnum):
+    """Status of a bet as shown in the bookmaker's own bet history ("Moje zakłady")."""
+
+    OPEN = "open"
+    WON = "won"
+    LOST = "lost"
+    VOID = "void"
+    CASHOUT = "cashout"
+    UNKNOWN = "unknown"
+
+
+class BookmakerBetRecord(BaseModel):
+    """One row of the bookmaker's bet history (best effort, selector-driven scraping).
+
+    Used for reconciliation (``UNCERTAIN`` placements, balance checks) and settlement. Money and odds
+    are ``Decimal``; ``placed_at`` is UTC-aware (``None`` when the date could not be parsed).
+    ``payout`` is the amount returned to the balance (winnings incl. stake, refund or cash-out);
+    ``None`` while the bet is open or when it is not shown.
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    external_bet_id: str | None
+    placed_at: datetime | None = None
+    event_name: str = ""
+    market_name: str = ""
+    selection_name: str = ""
+    odds: Decimal | None = None
+    stake: Decimal | None = None
+    status: BookmakerBetStatus = BookmakerBetStatus.UNKNOWN
+    payout: Decimal | None = None
+    raw_text: str = ""
+
+    @field_validator("placed_at")
+    @classmethod
+    def _utc(cls, value: datetime | None) -> datetime | None:
+        if value is None:
+            return None
+        if value.tzinfo is None:
+            raise ValueError("placed_at must be timezone-aware")
+        return ensure_utc(value)
