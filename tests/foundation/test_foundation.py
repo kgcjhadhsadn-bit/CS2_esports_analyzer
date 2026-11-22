@@ -47,9 +47,20 @@ def test_settings_env_nested(monkeypatch: pytest.MonkeyPatch) -> None:
     assert s.effective_tax_rate == Decimal("0")
 
 
-def test_prod_requires_api_secrets(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_blank_env_values_are_unset(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("CS2BOT_API__PASSWORD", "")
+    monkeypatch.setenv("CS2BOT_HLTV__PROXY_URL", "  ")
+    monkeypatch.setenv("CS2BOT_PANDASCORE__API_TOKEN", "abc")
+    s = Settings()
+    assert s.api.password is None and s.hltv.proxy_url is None
+    assert s.pandascore.api_token is not None and s.pandascore.api_token.get_secret_value() == "abc"
+
+
+def test_non_loopback_api_requires_secrets(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("CS2BOT_ENVIRONMENT", "prod")
-    with pytest.raises(ValueError, match="required"):
+    assert Settings().api.is_loopback  # local-only default needs no password
+    monkeypatch.setenv("CS2BOT_API__HOST", "0.0.0.0")
+    with pytest.raises(ValueError, match="non-loopback"):
         Settings()
 
 

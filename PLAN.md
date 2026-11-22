@@ -52,7 +52,7 @@ Python 3.12 monorepo, running **entirely on the owner's PC** (Windows assumed):
 ```
 [PandaScore API]  [HLTV scraper]  [HLTV demos]  [News sources]   [Betclic odds collector]
         \               |              |              |                    |
-         +------> Ingestion workers (Prefect flows) ----------------------+
+         +------> Ingestion jobs (built-in scheduler) --------------------+
                                |
                       PostgreSQL (+ object storage for demos)
                                |
@@ -73,7 +73,7 @@ Python 3.12 monorepo, running **entirely on the owner's PC** (Windows assumed):
 |---|---|
 | Packaging | `uv`, `pyproject.toml` |
 | Database | PostgreSQL 16, SQLAlchemy 2 + Alembic |
-| Scheduling | Prefect (flows, retries, observability) |
+| Scheduling | Built-in scheduler inside `cs2bot up` (one process, no extra server); job runs are recorded in the DB, so jobs missed while the PC was off are caught up after a restart |
 | HTTP / scraping | `httpx`, Playwright (Chromium) |
 | Demo parsing | `demoparser2` (primary), `awpy` (helpers, map areas) |
 | Data / ML | polars, numpy, scipy, scikit-learn, LightGBM, PyMC |
@@ -105,7 +105,7 @@ src/cs2bot/
   engine/                   # markets.py, pricing.py, decision.py, bankroll.py
   executor/                 # betclic.py, session.py, safety.py
   backtest/                 # runner.py, metrics.py
-  flows/                    # schedules.py (Prefect deployments)
+  flows/                    # scheduler.py, jobs.py (built-in scheduler + `cs2bot up` supervisor)
   api/                      # main.py, routes/
 dashboard/                  # React app
 tests/

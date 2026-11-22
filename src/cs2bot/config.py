@@ -18,12 +18,27 @@ from datetime import date
 from decimal import Decimal
 from functools import lru_cache
 from pathlib import Path
-from typing import Literal
+from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, Field, SecretStr, model_validator
+from pydantic import BaseModel, BeforeValidator, Field, SecretStr, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 Effort = Literal["low", "medium", "high", "xhigh", "max"]
+
+
+def _blank_to_none(value: Any) -> Any:
+    """Treat empty strings from .env files (``KEY=``) as "not set"."""
+    if value is None:
+        return None
+    if isinstance(value, SecretStr):
+        return value if value.get_secret_value().strip() else None
+    if isinstance(value, str) and not value.strip():
+        return None
+    return value
+
+
+OptionalSecret = Annotated[SecretStr | None, BeforeValidator(_blank_to_none)]
+OptionalStr = Annotated[str | None, BeforeValidator(_blank_to_none)]
 
 # The CS2 Active Duty pool changes a few times per year. This is only the *default*; the meta
 # module detects the pool actually being played from recent Tier 1/2 results.
@@ -48,7 +63,7 @@ class ScopeSettings(BaseModel):
 
 
 class PandaScoreSettings(BaseModel):
-    api_token: SecretStr | None = None
+    api_token: OptionalSecret = None
     base_url: str = "https://api.pandascore.co"
     videogame: str = "csgo"  # PandaScore still serves CS2 under the csgo slug
     max_requests_per_hour: int = 1000
@@ -61,13 +76,13 @@ class HLTVSettings(BaseModel):
     fetch_mode: Literal["browser", "http"] = "browser"
     min_delay_s: float = 4.0
     max_delay_s: float = 9.0
-    proxy_url: SecretStr | None = None
+    proxy_url: OptionalSecret = None
     cache_dir: Path = Path("data/cache/hltv")
     cache_ttl_minutes: int = 360
     finished_match_cache_ttl_minutes: int = 60 * 24 * 30
-    user_agent: str | None = None
+    user_agent: OptionalStr = None
     headless: bool = True
-    chromium_executable: str | None = None
+    chromium_executable: OptionalStr = None
     navigation_timeout_s: float = 60.0
 
 
@@ -85,7 +100,7 @@ class BetclicSettings(BaseModel):
     base_url: str = "https://www.betclic.pl"
     # Listing page for CS2 events. Unverified from outside Poland - confirm on the VPS.
     cs2_listing_path: str = "/e-sport-s102"
-    offering_api_base: str | None = None
+    offering_api_base: OptionalStr = None
     site_code: str = "plpl"
     country_code: str = "pl"
     language: str = "pl"
@@ -96,19 +111,23 @@ class BetclicSettings(BaseModel):
     big_win_tax_rate: Decimal = Decimal("0.10")
     market_rules_file: Path = Path("config/betclic_markets.yaml")
     selectors_file: Path = Path("config/betclic_selectors.yaml")
-    username: SecretStr | None = None
-    password: SecretStr | None = None
+    username: OptionalSecret = None
+    password: OptionalSecret = None
+    # Where Betclic credentials come from (they are optional: the owner logs in by hand once and
+    # the persistent browser profile keeps the session). "keyring" = Windows Credential Manager.
+    credentials_source: Literal["none", "env", "keyring"] = "none"
+    keyring_service: str = "cs2bot-betclic"
     browser_profile_dir: Path = Path("data/browser/betclic")
-    chromium_executable: str | None = None
-    headless: bool = True
-    proxy_url: SecretStr | None = None
+    chromium_executable: OptionalStr = None
+    headless: bool = True  # odds collector only (public pages, no login, separate browser context)
+    proxy_url: OptionalSecret = None
     min_stake: Decimal = Decimal("2.00")
     odds_max_age_s: int = 600
 
 
 class LLMSettings(BaseModel):
     enabled: bool = True
-    api_key: SecretStr | None = None  # falls back to the SDK's own ANTHROPIC_API_KEY resolution
+    api_key: OptionalSecret = None  # falls back to the SDK's own ANTHROPIC_API_KEY resolution
     context_model: str = "claude-opus-5-5"
     triage_model: str = "claude-haiku-5-5"
     context_effort: Effort = "high"
@@ -174,21 +193,33 @@ class ExecutorSettings(BaseModel):
     action_delay_min_s: float = 1.5
     action_delay_max_s: float = 4.0
     navigation_timeout_s: float = 45.0
+    headless: bool = False  # visible browser on the owner's desktop, logged-in persistent profile
     screenshot_dir: Path = Path("data/screenshots")
     reconcile_tolerance: Decimal = Decimal("0.05")
 
 
 class APISettings(BaseModel):
-    host: str = "0.0.0.0"
+    # Local-only by default (PLAN.md: dashboard reachable only from the owner's PC).
+    host: str = "127.0.0.1"
     port: int = 8000
+    serve_dashboard: bool = True
+    dashboard_dist_dir: Path = Path("dashboard/dist")
     username: str = "admin"
-    password: SecretStr | None = None
-    session_secret: SecretStr | None = None
+    password: OptionalSecret = None
+    session_secret: OptionalSecret = None
     session_max_age_s: int = 60 * 60 * 12
     cors_origins: list[str] = Field(default_factory=lambda: ["http://localhost:5173"])
 
+    @property
+    def is_loopback(self) -> bool:
+        return self.host in ("127.0.0.1", "localhost", "::1")
+
 
 class SchedulerSettings(BaseModel):
+    """Built-in scheduler used by ``cs2bot up``. Missed runs are caught up after a restart."""
+
+    enabled: bool = True
+    tick_s: float = 5.0
     odds_poll_s: int = 180
     upcoming_sync_min: int = 30
     results_sync_min: int = 60
@@ -234,8 +265,11 @@ class Settings(BaseSettings):
             raise ValueError("bankroll.kelly_fraction must be in (0, 1]")
         if not 0 < self.decision.min_probability < 1:
             raise ValueError("decision.min_probability must be in (0, 1)")
-        if self.environment == "prod" and (self.api.password is None or self.api.session_secret is None):
-            raise ValueError("In prod, CS2BOT_API__PASSWORD and CS2BOT_API__SESSION_SECRET are required")
+        if not self.api.is_loopback and (self.api.password is None or self.api.session_secret is None):
+            raise ValueError(
+                "The API listens on a non-loopback address: set CS2BOT_API__PASSWORD and "
+                "CS2BOT_API__SESSION_SECRET (or keep CS2BOT_API__HOST=127.0.0.1)"
+            )
         return self
 
     @property

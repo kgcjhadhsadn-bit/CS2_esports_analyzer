@@ -17,8 +17,8 @@ interfaces, not against another package's internals.**
             │ engine.pricing → engine.decision → engine.bankroll    backtest        │
             └──────────────────────────────────────────────────────────────────────┘
             ┌──────────────────────────── ops plane ──────────────────────────────┐
-            │ services (glue) · flows (Prefect) · cli · executor (Playwright) · api │
-            │ dashboard (React) · deploy (Docker Compose on a Polish VPS)          │
+            │ services (glue) · flows (scheduler, `cs2bot up`) · cli · executor     │
+            │ api + dashboard (localhost) · deploy (owner's Windows PC)            │
             └──────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -95,16 +95,22 @@ Non-negotiable conventions:
 
 ### P9 · `cs2bot.executor`
 * `BetExecutor` protocol: `place(order: BetOrder) -> PlacementResult`, `get_balance()`, `health_check()`.
-* `BetclicExecutor`: Playwright, persistent profile (manual first login over VNC), selectors from `config/betclic_selectors.yaml`, odds re-check, stake entry, confirmation, bet-id + screenshot capture, `DRY_RUN`. `FakeExecutor` for tests.
+* `BetclicExecutor`: Playwright, **visible** browser with a dedicated persistent profile on the owner's PC (the owner logs in by hand once, incl. 2FA; when the session expires the bot pauses and the dashboard asks for a new login), selectors from `config/betclic_selectors.yaml`, odds re-check, stake entry, confirmation, bet-id + screenshot capture, `DRY_RUN`. `open_login_window()` for the manual login. `FakeExecutor` for tests.
 
 ### P10 · `cs2bot.api` and `dashboard/`
-* `create_app(settings, session_factory) -> FastAPI`: session-cookie auth (single user), endpoints for matches, analyses, markets/predictions vs odds, decisions, bets, bankroll, calibration, health/jobs, kill switch, pause/resume, config overrides, link review queue.
+* `create_app(settings, session_factory) -> FastAPI`: binds to `127.0.0.1` (local only); optional session-cookie auth (required only if bound to a non-loopback address); serves the built dashboard from `dashboard/dist`; endpoints for matches, analyses, markets/predictions vs odds, decisions, bets, bankroll, calibration, health/jobs, kill switch, pause/resume, config overrides, link review queue.
 * `dashboard/`: React + Vite + TypeScript + Recharts SPA consuming the API.
 
-### P11 · deployment (`deploy/`, `Dockerfile*`, `docker-compose.yml`, `.github/workflows/`)
+### P11 · local install on the owner's Windows PC (`deploy/`, `docker-compose.yml`, `.github/workflows/`, `docs/WINDOWS_SETUP.md`)
+Docker Desktop runs **only PostgreSQL**; the Python app runs natively via `uv` (so Playwright can show a real
+browser for the Betclic login). PowerShell helpers to install, start (`cs2bot up`), back up the database and
+register a Task Scheduler entry at login; power settings guidance (PC must be awake before matches); CI
+(ruff, mypy, pytest on Linux + Windows runners).
 
 ### P12 · `cs2bot.services`, `cs2bot.flows`, `cs2bot.cli` (integration, built last)
-Wires everything: sync → train → predict → price → decide → stake → execute → settle, plus CLI commands and Prefect deployments.
+Wires everything: sync → train → predict → price → decide → stake → execute → settle, plus CLI commands.
+`flows.scheduler`: built-in job scheduler (interval + daily jobs, catch-up of runs missed while the PC was off,
+based on `job_runs`). `cs2bot up`: starts the API/dashboard on `127.0.0.1` and the scheduler in one command.
 
 ## Data flow for one upcoming match
 
