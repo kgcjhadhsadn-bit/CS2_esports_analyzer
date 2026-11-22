@@ -1,0 +1,14 @@
+body { font-family: sans-serif; margin: 0; background: #f4f4f4; }
+.header { display: flex; gap: 16px; align-items: center; padding: 8px 16px; background: #e00; color: #fff; }
+.header a { color: #fff; }
+.layout { display: flex; gap: 16px; padding: 16px; }
+.main { flex: 1; min-width: 0; }
+.betslip { display: block; width: 340px; background: #fff; padding: 12px; min-height: 200px; }
+.marketBox { display: block; background: #fff; margin-bottom: 12px; padding: 8px; }
+.marketBox_lineSelection { display: flex; gap: 8px; flex-wrap: wrap; }
+sports-selections-selection { display: inline-flex; gap: 6px; padding: 6px 10px; border: 1px solid #999; cursor: pointer; }
+sports-selections-selection.is-locked { opacity: 0.5; cursor: not-allowed; }
+.betBox { border-bottom: 1px solid #ddd; padding: 6px 0; }
+.modal { position: fixed; top: 80px; left: 30%; background: #fff; border: 2px solid #333; padding: 16px; z-index: 10; }
+.myBets_item { background: #fff; margin-bottom: 8px; padding: 8px; }
+[hidden] { display: none !important; }

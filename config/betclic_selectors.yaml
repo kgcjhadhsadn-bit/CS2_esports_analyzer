@@ -1,0 +1,568 @@
+# =====================================================================================================
+# Betclic.pl DOM selectors for the bet-placement executor (cs2bot.executor)
+# =====================================================================================================
+#
+# STATUS: every selector below is an UNVERIFIED best guess (`verified: false`). Betclic.pl could not be
+# inspected while this file was written (the site is geo-blocked outside Poland). The guesses follow the
+# structure of Betclic's Angular front end (custom elements such as <sports-markets-single-market>,
+# <sports-selections-selection>, classes such as .marketBox, .oddValue, .betBox) plus generic
+# role/text locators with the Polish UI texts. Verify them on the owner's PC before betting with real
+# money: run `cs2bot executor health`, then a DRY_RUN placement (it never clicks "Postaw zakład").
+#
+# HOW IT WORKS
+#   Each element has an ORDERED list of locators; the first one that matches wins, the others are
+#   fallbacks. A locator is exactly one of:
+#     {css: "..."}                  CSS selector (optional has_text: "..." narrows it by text)
+#     {role: button, name: "..."}   ARIA role + accessible name (what screen readers announce)
+#     {text: "..."}                 visible text
+#     {xpath: "..."}                XPath (for element-scoped lookups start with ".//")
+#   name / text / has_text match case-insensitively as substrings; `exact: true` requires the whole
+#   text; write "/regex/i" for a regular expression. {event_id} placeholders are filled in by the code.
+#   `scope` documents the element a lookup runs inside (e.g. market_title is searched inside one
+#   market_container); unscoped elements are searched on the whole page.
+#   If no locator of a required element matches, the bet is aborted with SELECTOR_ERROR BEFORE any money
+#   is at risk, and a screenshot plus the page HTML (<name>.html) are saved in data/screenshots/.
+#   The log line "selector 'x' matched fallback #n" means the primary locator no longer matches.
+#
+# HOW TO UPDATE A SELECTOR (Chrome DevTools, on the owner's PC)
+#   1. Open the bot's browser: `cs2bot executor login` (the dedicated profile, already logged in), or
+#      open the saved <timestamp>_..._selector_error.html from data/screenshots/ in any browser.
+#   2. Press F12, click the "select element" arrow (Ctrl+Shift+C) and click the element on the page.
+#   3. In the Elements panel prefer STABLE hooks, in this order: data-qa / data-test attributes,
+#      aria-label, custom element names (sports-..., bcdk-...), readable BEM classes (.marketBox_...).
+#      Avoid generated attributes (_ngcontent-xyz-c123, ng-star-inserted) and long nth-child chains.
+#   4. Test it in the Console tab:  $$("sports-markets-single-market").length   (CSS)
+#                                   $x("//button[contains(., 'Postaw')]")       (XPath)
+#      For role/name locators open the "Accessibility" pane next to "Styles": it shows Role and Name.
+#   5. Add the new locator at the TOP of the element's list, keep the old ones below as fallbacks and
+#      set `verified: true`. Restart the bot (the file is read at start-up).
+#   6. Run `cs2bot executor health` and one DRY_RUN placement; check the screenshot it writes.
+#
+# The `texts` section holds Polish phrases used to classify messages (matching is accent- and
+# case-insensitive, word-prefix based: "zawieszon" matches "zawieszony"/"zawieszone"). The `patterns`
+# section holds regular expressions (group 1 = the value) for bet ids and history fields.
+# =====================================================================================================
+
+version: 1
+
+urls:
+  # Page on which the login form is opened (Betclic opens it as a modal from the header button).
+  login: "/"
+  # null = settings.betclic.cs2_listing_path (default "/e-sport-s102", unverified).
+  cs2_listing: null
+  # null = open "Moje zakłady" by clicking the header link (nav_my_bets). Set a path once verified.
+  bet_history: null
+
+behaviour:
+  # true  = clicking "Akceptuj" in the odds-changed dialog submits the bet by itself.
+  # false = accepting only acknowledges the new odds and "Postaw zakład" must be clicked again
+  #         (the executor then clicks it once more, after re-checking the odds and the kill switch).
+  # Verify on the first real odds change; with `true` and a site that needs a second click the result is
+  # UNCERTAIN (safe: reconciliation finds no bet), never a double bet.
+  odds_change_accept_places_bet: true
+  # Click "reject"/"necessary only" on a cookie banner if one appears after a page load.
+  dismiss_cookie_banner: true
+  # Close promo / reminder modals that appear after a page load (popup_close).
+  dismiss_popups: true
+
+# DOM attributes that may carry Betclic's external ids (from the odds collector). Ids are only used to
+# tell apart markets/selections with identical names, never to override a name mismatch.
+attributes:
+  market_id: ["data-market-id", "data-qa-market-id"]
+  selection_id: ["data-selection-id", "data-qa-selection-id", "data-odd-id"]
+  event_id: ["data-event-id"]
+  # CSS classes on a selection button meaning "suspended / not bettable".
+  locked_classes: ["is-locked", "is-disabled", "is-suspended", "disabled", "locked"]
+
+texts:
+  # Message classification (bet slip errors / notices). Checked in this order: pending,
+  # bet_accepted (after the click), insufficient_balance, stake_limit, odds_changed, market_suspended,
+  # login_required, rejected. Unknown messages after the final click -> UNCERTAIN.
+  pending:
+    - "przetwarzan"
+    - "trwa weryfikacja"
+    - "oczekuje na akceptację"
+    - "oczekiwanie na akceptację"
+    - "proszę czekać"
+  bet_accepted:
+    - "zakład przyjęty"
+    - "zakład został przyjęty"
+    - "kupon przyjęty"
+    - "kupon został przyjęty"
+    - "zakład postawiony"
+    - "zakład został postawiony"
+  insufficient_balance:
+    - "niewystarczające środki"
+    - "niewystarczająca ilość środków"
+    - "brak wystarczających środków"
+    - "brak środków"
+    - "za mało środków"
+    - "doładuj konto"
+  stake_limit:
+    - "maksymalna stawka"
+    - "minimalna stawka"
+    - "stawka maksymalna"
+    - "stawka minimalna"
+    - "maksymalną stawkę"
+    - "minimalną stawkę"
+    - "przekroczono limit"
+    - "limit stawki"
+    - "maksymalna wygrana"
+  odds_changed:
+    - "kurs uległ zmianie"
+    - "kursy uległy zmianie"
+    - "zmiana kursu"
+    - "zmiana kursów"
+    - "zmienił się kurs"
+    - "zmieniły się kursy"
+  market_suspended:
+    - "zawieszon"
+    - "niedostępn"
+    - "wstrzyman"
+    - "zamknięt"
+    - "nie jest już dostępn"
+    - "wycofan"
+  login_required:
+    - "zaloguj się"
+    - "sesja wygasła"
+    - "zostałeś wylogowany"
+    - "musisz być zalogowany"
+  rejected:
+    - "odrzucon"
+    - "nie został przyjęty"
+    - "nie przyjęto"
+  # Bet-history status (checked in this order: cashout, void, lost, won, open). Do not add "wygrana":
+  # open bets show "Możliwa wygrana" (potential win).
+  history_status_cashout: ["cashout", "cash out", "wypłacony", "sprzedany"]
+  history_status_void: ["zwrot", "zwrócony", "anulowany", "unieważniony", "nieważny"]
+  history_status_lost: ["przegrany", "przegrał"]
+  history_status_won: ["wygrany", "wygrał"]
+  history_status_open: ["w grze", "otwarty", "oczekujący", "nierozstrzygnięty", "aktywny", "w toku"]
+
+patterns:
+  # Group 1 = Betclic bet id on the receipt / history row (must contain a digit).
+  bet_id:
+    - '\b(?:numer|nr|id|identyfikator)\b\.?\s*(?:zakładu|zakladu|kuponu)?\s*[:#]?\s*([A-Z0-9-]*\d[A-Z0-9-]{2,})'
+    - '#\s*(\d{5,})'
+  history_date:
+    - '(\d{1,2}[./-]\d{1,2}[./-]\d{2,4}(?:,?\s+\d{1,2}:\d{2}(?::\d{2})?)?)'
+    - '((?:dzisiaj|dziś|wczoraj),?\s+\d{1,2}:\d{2})'
+  history_odds:
+    - 'kurs\w*\s*:?\s*(\d+[.,]\d+)'
+  history_stake:
+    - 'stawka\s*:?\s*(\d[\d\s ]*[.,]\d{2})'
+  history_payout:
+    - '(?:wygrana|wypłata|zwrot|cashout)\s*:?\s*(\d[\d\s ]*[.,]\d{2})'
+
+elements:
+  # ------------------------------------------------------------------------------------- header
+  login_button:
+    description: >-
+      Header button opening the login form; visible only when LOGGED OUT. If it stays visible
+      (~1.5 s) the executor reports LOGIN_REQUIRED.
+    verified: false
+    locators:
+      - {role: button, name: "Zaloguj się"}
+      - {role: link, name: "Zaloguj się"}
+      - {css: "[data-qa='header-login-button'], [data-qa='login-button']"}
+      - {text: "Zaloguj się"}
+  logged_in_indicator:
+    description: >-
+      Anything shown ONLY when logged in (the header balance or account menu). Checked before
+      login_button, so a stray "Zaloguj się" elsewhere does not matter.
+    verified: false
+    locators:
+      - {css: "[data-qa='header-balance'], [data-qa='user-balance'], [data-qa='header-account']"}
+      - {css: "bcdk-header-balance, .header_balance, .headerAccount_balance, .header_account .balance"}
+      - {css: "header", has_text: "/\\d[\\d\\s]*,\\d{2}\\s*zł/", note: "header containing an amount like 1 234,56 zł"}
+  header_balance:
+    description: >-
+      Balance in the header, e.g. "1 234,56 zł" (parsed to Decimal 1234.56). Must contain only the
+      amount (a currency suffix is fine).
+    verified: false
+    locators:
+      - {css: "[data-qa='header-balance'], [data-qa='user-balance']"}
+      - {css: "bcdk-header-balance, .header_balance, .headerAccount_balance, .header_account .balance"}
+      - {xpath: "//header//*[contains(normalize-space(.), 'zł') and not(*)]"}
+  nav_my_bets:
+    description: Header/menu link to "Moje zakłady" (bet history).
+    verified: false
+    locators:
+      - {role: link, name: "Moje zakłady"}
+      - {role: button, name: "Moje zakłady"}
+      - {css: "a[href*='moje-zaklady'], a[href*='mybets'], a[href*='my-bets']"}
+      - {text: "Moje zakłady"}
+  login_username_input:
+    description: Login form e-mail/login field (only pre-filled when credentials_source is env/keyring).
+    verified: false
+    optional: true
+    locators:
+      - {css: "input[autocomplete='username'], input[name='login'], input[name='username'], input[name='email']"}
+      - {role: textbox, name: "/e-?mail|login|nazwa użytkownika|użytkownik/i"}
+      - {css: "input[type='email']"}
+  login_password_input:
+    description: Login form password field (pre-fill only; the form is never submitted by the bot).
+    verified: false
+    optional: true
+    locators:
+      - {css: "input[autocomplete='current-password']"}
+      - {css: "input[type='password']"}
+  cookie_banner_dismiss:
+    description: Cookie banner button that rejects optional cookies (clicked only if visible after a page load).
+    verified: false
+    optional: true
+    locators:
+      - {css: "#onetrust-reject-all-handler"}
+      - {css: "#didomi-notice-disagree-button"}
+      - {role: button, name: "/^(odrzuć wszystkie|odrzuć|tylko niezbędne)$/i"}
+  popup_close:
+    description: Close button of promo / reminder modals (clicked only if visible after a page load).
+    verified: false
+    optional: true
+    locators:
+      - {css: "bcdk-modal [aria-label='Zamknij'], .modal [aria-label='Zamknij'], [role='dialog'] [aria-label='Zamknij']"}
+
+  # ------------------------------------------------------------------------------- CS2 listing
+  event_link:
+    description: Any CS2 event link on the listing page (health check). Betclic event URLs end in -m<event id>.
+    verified: false
+    locators:
+      - {css: "sports-events-event a[href*='-m'], a.cardEvent[href*='-m']"}
+      - {css: "a[href*='e-sport'][href*='-m']"}
+      - {xpath: "//a[contains(@href, 'e-sport') and contains(@href, '-m')]"}
+  event_link_by_id:
+    description: Link to ONE event by its Betclic id (used when the order has no event_url).
+    verified: false
+    locators:
+      - {css: "a[href$='-m{event_id}']"}
+      - {css: "a[href*='-m{event_id}?'], a[href*='-m{event_id}/'], a[href*='-m{event_id}#']"}
+      - {css: "[data-event-id='{event_id}'] a, a[data-event-id='{event_id}']"}
+  event_unavailable:
+    description: Message shown instead of an event that is finished, live or removed -> MARKET_UNAVAILABLE.
+    verified: false
+    optional: true
+    locators:
+      - {css: "[data-qa='event-unavailable']"}
+      - {text: "/wydarzenie (jest )?niedostępne|nie znaleziono (strony|wydarzenia)|mecz (już )?się (rozpoczął|zakończył)/i"}
+
+  # -------------------------------------------------------------------------------- event page
+  all_markets_tab:
+    description: Market filter tab showing all markets (clicked when the ordered market is not found).
+    verified: false
+    optional: true
+    locators:
+      - {role: tab, name: "/^wszystkie( zakłady)?$/i"}
+      - {css: "[data-qa='market-filter-all']"}
+      - {role: button, name: "/^wszystkie( zakłady)?$/i"}
+  market_container:
+    description: One market box on the event page (title + its selections).
+    verified: false
+    locators:
+      - {css: "sports-markets-single-market"}
+      - {css: ".marketBox"}
+      - {css: "[data-qa='market']"}
+  market_title:
+    description: Market name inside a market box, compared (normalised) with the order's market_raw_name.
+    scope: market_container
+    verified: false
+    locators:
+      - {css: ".marketBox_headTitle"}
+      - {css: "[data-qa='market-title']"}
+      - {css: ".marketBox_head h2, .marketBox_head h3, .marketBox_head .title"}
+  market_expand:
+    description: Clickable market header that expands a collapsed market.
+    scope: market_container
+    verified: false
+    optional: true
+    locators:
+      - {css: ".marketBox_head"}
+      - {css: "[data-qa='market-header']"}
+  selection_button:
+    description: One clickable outcome (label + odds) inside a market box.
+    scope: market_container
+    verified: false
+    locators:
+      - {css: "sports-selections-selection"}
+      - {css: ".btn.is-odd"}
+      - {css: "[data-qa='selection']"}
+  selection_label:
+    description: Outcome name inside a selection button, compared with the order's selection_raw_name.
+    scope: selection_button
+    verified: false
+    locators:
+      - {css: ".btn_label.is-top"}
+      - {css: "[data-qa='selection-label']"}
+      - {css: ".selectionLabel, .btn_label:not(:has(.oddValue))"}
+  selection_odds:
+    description: Odds inside a selection button, Polish decimal ("1,85").
+    scope: selection_button
+    verified: false
+    locators:
+      - {css: ".oddValue"}
+      - {css: "[data-qa='selection-odd']"}
+      - {xpath: ".//*[contains(@class, 'odd') and not(*)]"}
+  selection_locked:
+    description: Lock marker inside a suspended selection (the button's own classes are checked too).
+    scope: selection_button
+    verified: false
+    optional: true
+    locators:
+      - {css: ".icon_lock, .is-locked, [data-qa='selection-locked']"}
+      - {css: "[aria-disabled='true']"}
+
+  # ---------------------------------------------------------------------------------- bet slip
+  slip_container:
+    description: The bet slip ("Kupon"). If it is not visible, slip_open_button is clicked.
+    verified: false
+    optional: true
+    locators:
+      - {css: "sports-betting-slip, bcdk-bet-slip, bcdk-betting-slip"}
+      - {css: "[data-qa='betslip'], .betslip"}
+      - {role: complementary, name: "/kupon/i"}
+  slip_open_button:
+    description: Button opening a collapsed bet slip ("Kupon (1)").
+    verified: false
+    optional: true
+    locators:
+      - {css: "[data-qa='betslip-toggle']"}
+      - {role: button, name: "/^kupon/i"}
+  slip_item:
+    description: One selection in the bet slip. The slip must contain exactly one before placing.
+    verified: false
+    locators:
+      - {css: ".betBox"}
+      - {css: "[data-qa='betslip-selection'], [data-qa='bet-slip-selection']"}
+      - {css: "bcdk-bet-slip-selection, sports-betting-slip-selection"}
+  slip_item_selection:
+    description: Selection name inside a bet-slip item (sanity check against the order).
+    scope: slip_item
+    verified: false
+    locators:
+      - {css: ".betBox_contestantName"}
+      - {css: "[data-qa='betslip-selection-name']"}
+      - {css: ".betBox_selectionName, .betBox_label"}
+  slip_item_market:
+    description: Market name inside a bet-slip item (mismatch only logs a warning).
+    scope: slip_item
+    verified: false
+    optional: true
+    locators:
+      - {css: ".betBox_marketName"}
+      - {css: "[data-qa='betslip-market-name']"}
+  slip_item_odds:
+    description: Odds inside a bet-slip item.
+    scope: slip_item
+    verified: false
+    locators:
+      - {css: ".oddValue"}
+      - {css: "[data-qa='betslip-selection-odd']"}
+      - {css: ".betBox_odds"}
+  slip_item_remove:
+    description: Remove ("x") button of one bet-slip item (used when there is no clear-all button).
+    scope: slip_item
+    verified: false
+    locators:
+      - {css: ".betBox_close, .betBox_remove"}
+      - {css: "[data-qa='betslip-selection-remove']"}
+      - {role: button, name: "/usuń|zamknij/i"}
+  slip_clear_button:
+    description: Clear-all button of the bet slip ("Wyczyść" / "Usuń wszystko").
+    verified: false
+    locators:
+      - {role: button, name: "Wyczyść"}
+      - {role: button, name: "/usuń wszystk/i"}
+      - {css: "[data-qa='betslip-clear'], .betslip_clear"}
+      - {text: "Wyczyść"}
+  slip_clear_confirm:
+    description: Confirmation button if clearing the slip asks "are you sure?".
+    verified: false
+    optional: true
+    locators:
+      - {css: "[role='dialog'] button, [role='alertdialog'] button", has_text: "/^(tak|usuń|potwierdź|wyczyść)/i"}
+  slip_count_badge:
+    description: Selection counter of the bet slip (must read 1 before placing, when present).
+    verified: false
+    optional: true
+    locators:
+      - {css: "[data-qa='betslip-count'], .betslip_count, .betslip_badge"}
+  slip_stake_input:
+    description: Stake field of the single bet. The stake is typed Polish-style ("12,50") and read back.
+    verified: false
+    locators:
+      - {css: "[data-qa='betslip-stake-input'] input, input[data-qa='betslip-stake-input']"}
+      - {css: ".betBox_stake input, .betslip_stake input, bcdk-bet-slip-stake input"}
+      - {role: textbox, name: "/stawka/i"}
+      - {css: "input[inputmode='decimal']"}
+  slip_place_button:
+    description: The final "Postaw zakład" button. Never clicked in dry-run mode.
+    verified: false
+    locators:
+      - {role: button, name: "Postaw zakład"}
+      - {css: "[data-qa='betslip-place-bet'], [data-qa='place-bet-button']"}
+      - {role: button, name: "/^postaw/i"}
+      - {text: "Postaw zakład"}
+  slip_error:
+    description: >-
+      Error / notice message in the bet slip (insufficient balance, stake limits, suspended market,
+      odds change ...). The text is classified with the `texts` section.
+    verified: false
+    locators:
+      - {css: "[data-qa='betslip-error'], [data-qa='betslip-message-error']"}
+      - {css: ".betslip_error, .betBox_error, .betslip .alert.is-error, .betslip .notification.is-error"}
+      - {css: "sports-betting-slip [role='alert'], .betslip [role='alert']"}
+  odds_changed_notice:
+    description: Dialog / banner announcing changed odds after clicking "Postaw zakład".
+    verified: false
+    locators:
+      - {css: "[data-qa='betslip-odds-changed']"}
+      - {css: ".betslip_oddsChange, .betslip_oddsChanged, .oddsChange"}
+      - {text: "/kurs(y)? uległ(y)? zmianie|zmiana kurs(u|ów)|zmienił(y)? się kurs/i"}
+  odds_changed_new_odds:
+    description: The NEW odds inside the odds-change notice (else a single number in the notice text).
+    scope: odds_changed_notice
+    verified: false
+    optional: true
+    locators:
+      - {css: "[data-qa='new-odds'], .oddsChange_newOdds, .newOdds"}
+      - {css: ".oddValue"}
+  odds_changed_accept:
+    description: Button accepting the new odds (clicked only if new odds >= min_acceptable_odds).
+    verified: false
+    locators:
+      - {role: button, name: "/akceptuj/i"}
+      - {css: "[data-qa='betslip-accept-odds']"}
+      - {text: "/akceptuj( zmiany| nowe kursy| i postaw)?/i"}
+  odds_changed_decline:
+    description: Button rejecting the new odds ("Anuluj" / "Odrzuć").
+    verified: false
+    optional: true
+    locators:
+      - {role: button, name: "/^(anuluj|odrzuć)/i"}
+      - {css: "[data-qa='betslip-decline-odds']"}
+  bet_receipt:
+    description: Confirmation / receipt shown after a successful placement (contains the bet id).
+    verified: false
+    locators:
+      - {css: "[data-qa='bet-receipt'], [data-qa='betslip-receipt']"}
+      - {css: ".betslip_receipt, .betReceipt, .betslip_confirmation"}
+      - {text: "/zakład (został )?przyjęty|kupon (został )?przyjęty|zakład (został )?postawiony/i"}
+  receipt_bet_id:
+    description: Bet id inside the receipt (else the `patterns.bet_id` regexes run on the receipt text).
+    scope: bet_receipt
+    verified: false
+    optional: true
+    locators:
+      - {css: "[data-qa='bet-receipt-id'], .betReceipt_id, .betslip_receiptId"}
+  receipt_odds:
+    description: Accepted odds inside the receipt (else the last verified odds are reported).
+    scope: bet_receipt
+    verified: false
+    optional: true
+    locators:
+      - {css: "[data-qa='bet-receipt-odds'], .betReceipt_odds"}
+  receipt_balance:
+    description: New balance inside the receipt (else the header balance is re-read).
+    scope: bet_receipt
+    verified: false
+    optional: true
+    locators:
+      - {css: "[data-qa='bet-receipt-balance'], .betReceipt_balance"}
+  receipt_close:
+    description: Button closing the receipt (best effort).
+    verified: false
+    optional: true
+    locators:
+      - {css: "[data-qa='bet-receipt-close'], .betReceipt_close, .betslip_receiptClose"}
+      - {role: button, name: "/^(zamknij|ok|kontynuuj)$/i"}
+
+  # ----------------------------------------------------------------- bet history (Moje zakłady)
+  history_tab_all:
+    description: Filter tab showing all bets (open and settled).
+    verified: false
+    optional: true
+    locators:
+      - {role: tab, name: "/^wszystkie$/i"}
+      - {css: "[data-qa='my-bets-filter-all']"}
+  history_item:
+    description: One bet row in "Moje zakłady".
+    verified: false
+    locators:
+      - {css: "[data-qa='bet-history-item'], [data-qa='my-bets-item']"}
+      - {css: "bcdk-bet-history-item, sports-my-bets-item, .myBets_item, .betHistory_item"}
+  history_item_bet_id:
+    description: Bet id in a history row (else patterns.bet_id on the row text).
+    scope: history_item
+    verified: false
+    optional: true
+    locators:
+      - {css: "[data-qa='bet-id'], .myBets_betId, .betHistory_id"}
+  history_item_date:
+    description: Placement date/time (Warsaw time, e.g. "22.11.2026 18:30"; else patterns.history_date).
+    scope: history_item
+    verified: false
+    optional: true
+    locators:
+      - {css: "[data-qa='bet-date'], .myBets_date, .betHistory_date"}
+      - {css: "time"}
+  history_item_event:
+    description: Event name in a history row.
+    scope: history_item
+    verified: false
+    optional: true
+    locators:
+      - {css: "[data-qa='bet-event'], .myBets_event, .betHistory_event"}
+  history_item_market:
+    description: Market name in a history row.
+    scope: history_item
+    verified: false
+    optional: true
+    locators:
+      - {css: "[data-qa='bet-market'], .myBets_market, .betHistory_market"}
+  history_item_selection:
+    description: Selection name in a history row.
+    scope: history_item
+    verified: false
+    optional: true
+    locators:
+      - {css: "[data-qa='bet-selection'], .myBets_selection, .betHistory_selection"}
+  history_item_odds:
+    description: Odds in a history row (else patterns.history_odds).
+    scope: history_item
+    verified: false
+    optional: true
+    locators:
+      - {css: "[data-qa='bet-odds'], .myBets_odds, .betHistory_odds"}
+  history_item_stake:
+    description: Stake in a history row (else patterns.history_stake).
+    scope: history_item
+    verified: false
+    optional: true
+    locators:
+      - {css: "[data-qa='bet-stake'], .myBets_stake, .betHistory_stake"}
+  history_item_status:
+    description: Status label (W grze / Wygrany / Przegrany / Zwrot / Cashout), classified with texts.history_status_*.
+    scope: history_item
+    verified: false
+    optional: true
+    locators:
+      - {css: "[data-qa='bet-status'], .myBets_status, .betHistory_status"}
+  history_item_payout:
+    description: Payout of a settled bet (else patterns.history_payout); ignored for open bets.
+    scope: history_item
+    verified: false
+    optional: true
+    locators:
+      - {css: "[data-qa='bet-payout'], .myBets_payout, .betHistory_payout"}
+  history_load_more:
+    description: Button loading older bets ("Pokaż więcej").
+    verified: false
+    optional: true
+    locators:
+      - {role: button, name: "/pokaż więcej|załaduj więcej|wczytaj więcej/i"}
+      - {css: "[data-qa='my-bets-load-more']"}
+  history_empty:
+    description: Message shown when there are no bets.
+    verified: false
+    optional: true
+    locators:
+      - {text: "/brak zakładów|nie masz (jeszcze )?żadnych zakładów|nie znaleziono zakładów/i"}
