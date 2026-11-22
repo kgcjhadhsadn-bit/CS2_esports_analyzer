@@ -1,0 +1,108 @@
+{
+  "_comment": "Modelled on the historic begmedia offering REST API (offer.cdn.begmedia.com/api/pub/v4/events?application=..&countrycode=pl&language=pl&sitecode=plpl&sportIds=102): unifiedEvents -> contestants/markets/selections (see pretrehr/Sports-betting, dmartin35/pronosfoot). Names/odds are invented.",
+  "id": 102,
+  "name": "E-sport",
+  "unifiedEvents": [
+    {
+      "id": 1001234567,
+      "name": "Natus Vincere - FaZe Clan",
+      "date": "2026-11-23T17:00:00Z",
+      "isLive": false,
+      "relativeDesktopUrl": "/e-sport-s102/counter-strike-2-iem-chengdu-c9001/natus-vincere-faze-clan-m1001234567",
+      "competition": {"id": 9001, "name": "Counter-Strike 2 - IEM Chengdu", "sport": {"id": 102, "name": "E-sport"}},
+      "contestants": [
+        {"id": 31, "name": "Natus Vincere"},
+        {"id": 32, "name": "FaZe Clan"}
+      ],
+      "markets": [
+        {
+          "id": 50001,
+          "name": "Zwycięzca meczu",
+          "mtc": "Esp_Mwi",
+          "isSuspended": false,
+          "selections": [
+            {"id": 7000001, "name": "Natus Vincere", "odds": 1.62},
+            {"id": 7000002, "name": "FaZe Clan", "odds": 2.25}
+          ]
+        },
+        {
+          "id": 50002,
+          "name": "Handicap map",
+          "mtc": "Esp_Mhc",
+          "selections": [
+            {"id": 7000003, "name": "Natus Vincere (-1,5)", "odds": 2.95},
+            {"id": 7000004, "name": "FaZe Clan (+1,5)", "odds": 1.38}
+          ]
+        },
+        {
+          "id": 50003,
+          "name": "Liczba map",
+          "selections": [
+            {"id": 7000005, "name": "Powyżej 2,5", "odds": "2,10"},
+            {"id": 7000006, "name": "Poniżej 2,5", "odds": "1,68"}
+          ]
+        },
+        {
+          "id": 50004,
+          "name": "Mapa 1 - zwycięzca",
+          "isSuspended": true,
+          "selections": [
+            {"id": 7000007, "name": "Natus Vincere", "odds": 1.55},
+            {"id": 7000008, "name": "FaZe Clan", "odds": 2.40}
+          ]
+        },
+        {
+          "id": 50005,
+          "name": "Dokładny wynik",
+          "selections": [
+            {"id": 7000009, "name": "2:0", "odds": 3.10},
+            {"id": 7000010, "name": "2:1", "odds": 3.60},
+            {"id": 7000011, "name": "1:2", "odds": 4.50, "status": "suspended"},
+            {"id": 7000012, "name": "0:2", "odds": 5.25},
+            {"id": 7000013, "name": "broken", "odds": "n/a"}
+          ]
+        }
+      ]
+    },
+    {
+      "id": 1001234999,
+      "name": "G2 Esports - Team Vitality",
+      "date": 1795546800000,
+      "isLive": true,
+      "competition": {"id": 9001, "name": "Counter-Strike 2 - IEM Chengdu"},
+      "contestants": [{"name": "G2 Esports"}, {"name": "Team Vitality"}],
+      "markets": [
+        {
+          "id": 50101,
+          "name": "Zwycięzca meczu",
+          "selections": [
+            {"id": 7000101, "name": "G2 Esports", "odds": 2.8},
+            {"id": 7000102, "name": "Team Vitality", "odds": 1.42}
+          ]
+        }
+      ]
+    },
+    {
+      "id": 1001239000,
+      "name": "IEM Chengdu - zwycięzca turnieju",
+      "date": "2026-11-29T18:00:00Z",
+      "contestants": [{"name": "Natus Vincere"}, {"name": "FaZe Clan"}, {"name": "G2 Esports"}],
+      "markets": [
+        {
+          "id": 50201,
+          "name": "Zwycięzca turnieju",
+          "selections": [
+            {"id": 7000201, "name": "Natus Vincere", "odds": 4.0},
+            {"id": 7000202, "name": "FaZe Clan", "odds": 6.0},
+            {"id": 7000203, "name": "G2 Esports", "odds": 5.0}
+          ]
+        }
+      ]
+    },
+    {
+      "id": null,
+      "name": "malformed - record",
+      "markets": "not a list"
+    }
+  ]
+}

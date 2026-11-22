@@ -1,0 +1,160 @@
+<!DOCTYPE html>
+<html lang="pl">
+<head>
+  <meta charset="utf-8">
+  <title>Natus Vincere - FaZe Clan | Zakłady e-sport | Betclic</title>
+  <!-- Modelled on the Angular SSR page of a Betclic event: the server embeds its TransferState
+       (decoded gRPC responses) in <script id="ng-state" type="application/json">. Field names
+       (matchId, matchDateUtc, categories, mainSelections, selectionMatrix, betslipMarketId,
+       requestHeaders.Appversion) follow tomasmourato/bettrackr (measured 2026-09). The page also
+       carries other matches (here a football recommendation) that must not leak into CS2 data. -->
+  <script type="application/ld+json">{"@context": "https://schema.org", "@type": "SportsEvent", "name": "Natus Vincere - FaZe Clan", "startDate": "2026-11-23T17:00:00Z"}</script>
+</head>
+<body>
+<app-root><div class="match-header">Natus Vincere vs FaZe Clan</div></app-root>
+<script>window.dataLayer = window.dataLayer || []; window.__APP_CONFIG__ = {"siteCode": "plpl", "language": "pl"};</script>
+<script id="ng-state" type="application/json">{
+  "grpc:1": {
+    "requestHeaders": {"Appversion": "10.9.0-3", "X-BG-Ref-Platform": "DESKTOP", "X-BG-REGULATION": "PL", "X-BG-Ref-Brand": "BETCLIC", "Retry": 2},
+    "request": {"language": "pl", "matchId": "1001234567"}
+  },
+  "grpc:2": {
+    "response": {
+      "payload": {
+        "match": {
+          "matchId": "1001234567",
+          "name": "Natus Vincere - FaZe Clan",
+          "matchDateUtc": "2026-11-23T17:00:00Z",
+          "isLive": false,
+          "sport": {"code": "counter_strike", "name": "Counter-Strike"},
+          "competition": {"id": "9001", "name": "Counter-Strike 2 - IEM Chengdu"},
+          "contestants": [
+            {"id": "contestant:31", "name": "Natus Vincere", "shortName": "NAVI"},
+            {"id": "contestant:32", "name": "FaZe Clan", "shortName": "FaZe"}
+          ],
+          "categories": [
+            {"id": "ca_esp_top", "name": "Top"},
+            {"id": "ca_esp_maps", "name": "Mapy"},
+            {"id": "ca_esp_players", "name": "Gracze"}
+          ],
+          "topMarkets": [
+            {
+              "id": "1218288612810001",
+              "matchId": "1001234567",
+              "name": "Zwycięzca meczu",
+              "mainSelections": [
+                {"id": "1218288612811001", "name": "Natus Vincere", "odds": 1.6, "betslipMarketId": "1218288612810001"},
+                {"id": "1218288612811002", "name": "FaZe Clan", "odds": 2.3, "betslipMarketId": "1218288612810001"}
+              ]
+            }
+          ],
+          "markets": [
+            {
+              "id": "1218288612810001",
+              "matchId": "1001234567",
+              "name": "Zwycięzca meczu",
+              "hasBoostedOdds": false,
+              "mainSelections": [
+                {"id": "1218288612811001", "name": "Natus Vincere", "odds": 1.62, "betslipMarketId": "1218288612810001"},
+                {"id": "1218288612811002", "name": "FaZe Clan", "odds": 2.28, "betslipMarketId": "1218288612810001"}
+              ]
+            },
+            {
+              "id": "card-rounds-1",
+              "matchId": "1001234567",
+              "name": "Mapa 1 - liczba rund",
+              "selectionMatrix": [
+                {"cells": [
+                  {"id": "1218288612811011", "name": "Powyżej 21,5", "odds": "1,85", "betslipMarketId": "1218288612810011"},
+                  {"id": "1218288612811012", "name": "Poniżej 21,5", "odds": "1,95", "betslipMarketId": "1218288612810011"}
+                ]},
+                {"cells": [
+                  {"id": "1218288612811013", "name": "Powyżej 23,5", "odds": "2,60", "betslipMarketId": "1218288612810012"},
+                  {"id": "1218288612811014", "name": "Poniżej 23,5", "odds": "1,48", "betslipMarketId": "1218288612810012"}
+                ]}
+              ]
+            },
+            {
+              "id": "group-map-2",
+              "name": "Mapa 2",
+              "cards": [
+                {
+                  "id": "1218288612810021",
+                  "name": "Zwycięzca",
+                  "mainSelections": [
+                    {"id": "1218288612811021", "name": "Natus Vincere", "odds": 1.7, "betslipMarketId": "1218288612810021"},
+                    {"id": "1218288612811022", "name": "FaZe Clan", "odds": 2.1, "betslipMarketId": "1218288612810021"}
+                  ]
+                }
+              ]
+            },
+            {
+              "id": "1218288612810031",
+              "matchId": "1001234567",
+              "name": "Handicap rund - mapa 1",
+              "status": "SUSPENDED",
+              "selectionMatrix": [[
+                {"id": "1218288612811031", "name": "Natus Vincere (-3,5)", "odds": 1.9, "betslipMarketId": "1218288612810031"},
+                {"id": "1218288612811032", "name": "FaZe Clan (+3,5)", "odds": 1.9, "betslipMarketId": "1218288612810031"}
+              ]]
+            },
+            {
+              "id": "1218288612810041",
+              "name": "Zabójstwa gracza - mapa 1",
+              "selectionMatrix": [
+                {"label": "Powyżej", "selections": [
+                  {"id": "1218288612811041", "name": "s1mple Powyżej 19,5", "odds": 1.83, "betslipMarketId": "1218288612810041"},
+                  {"id": "1218288612811043", "name": "ropz Powyżej 16,5", "odds": 1.8, "betslipMarketId": "1218288612810042"}
+                ]},
+                {"label": "Poniżej", "selections": [
+                  {"id": "1218288612811042", "name": "s1mple Poniżej 19,5", "odds": 1.93, "betslipMarketId": "1218288612810041"},
+                  {"id": "1218288612811044", "name": "ropz Poniżej 16,5", "odds": 1.96, "betslipMarketId": "1218288612810042"}
+                ]}
+              ]
+            }
+          ]
+        }
+      }
+    }
+  },
+  "grpc:3": {
+    "response": {
+      "payload": {
+        "matches": [
+          {
+            "matchId": "2002002",
+            "name": "Lech Poznań - Legia Warszawa",
+            "matchDateUtc": "2026-11-23T19:30:00Z",
+            "sport": {"code": "football", "name": "Piłka nożna"},
+            "competition": {"name": "Ekstraklasa"},
+            "contestants": [{"name": "Lech Poznań"}, {"name": "Legia Warszawa"}],
+            "markets": [
+              {"id": "3001", "name": "Wynik meczu", "mainSelections": [
+                {"id": "3001-1", "name": "Lech Poznań", "odds": 2.05, "betslipMarketId": "3001"},
+                {"id": "3001-x", "name": "Remis", "odds": 3.4, "betslipMarketId": "3001"},
+                {"id": "3001-2", "name": "Legia Warszawa", "odds": 3.6, "betslipMarketId": "3001"}
+              ]}
+            ]
+          }
+        ]
+      }
+    }
+  },
+  "grpc:4": {
+    "response": {
+      "payload": {
+        "market": {
+          "matchId": "1001234567",
+          "id": "1218288612810051",
+          "name": "Dogrywka - mapa 1",
+          "mainSelections": [
+            {"id": "1218288612811051", "name": "Tak", "odds": 4.75, "betslipMarketId": "1218288612810051"},
+            {"id": "1218288612811052", "name": "Nie", "odds": 1.15, "betslipMarketId": "1218288612810051"}
+          ]
+        }
+      }
+    }
+  }
+}</script>
+</body>
+</html>

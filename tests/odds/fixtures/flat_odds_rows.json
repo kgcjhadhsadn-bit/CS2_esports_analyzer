@@ -1,0 +1,21 @@
+{
+  "_comment": "A flat, one-row-per-selection export (the shape many odds feeds and spreadsheet-like XHR endpoints use). Polish decimal strings on purpose.",
+  "generatedAt": "2026-11-22T12:00:00Z",
+  "rows": [
+    {"eventId": "E-77", "home": "Team Spirit", "away": "MOUZ", "startTime": "2026-11-24T14:30:00+01:00",
+     "league": "Counter-Strike - BLAST Premier World Final", "sport": "Counter-Strike",
+     "market": "Wynik meczu", "marketId": "W-1", "selection": "1", "selectionId": "S-1", "price": "1,72"},
+    {"eventId": "E-77", "home": "Team Spirit", "away": "MOUZ", "startTime": "2026-11-24T14:30:00+01:00",
+     "market": "Wynik meczu", "marketId": "W-1", "selection": "2", "selectionId": "S-2", "price": "2,05"},
+    {"eventId": "E-77", "home": "Team Spirit", "away": "MOUZ",
+     "market": "Mapa 1 - handicap rund", "marketId": "RH-1", "selection": "Team Spirit -3,5", "selectionId": "S-3", "price": "1,90"},
+    {"eventId": "E-77", "home": "Team Spirit", "away": "MOUZ",
+     "market": "Mapa 1 - handicap rund", "marketId": "RH-1", "selection": "MOUZ +3,5", "selectionId": "S-4", "price": "1,90",
+     "isSuspended": "true"},
+    {"eventId": "E-77", "home": "Team Spirit", "away": "MOUZ",
+     "market": "Mapa 1 - dogrywka", "selection": "Tak", "price": 5.5},
+    {"eventId": "E-78", "home": "Astralis"},
+    {"eventId": "E-79", "home": "HEROIC", "away": "Falcons", "market": "Wynik meczu", "selection": "1", "price": "0,95"},
+    "garbage row"
+  ]
+}
