@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+dist/
+build/
+
+# Secrets & local config
+.env
+.env.*
+!.env.example
+
+# Runtime data (demos, caches, browser profiles, model artifacts, screenshots)
+data/
+!data/.gitkeep
+
+# Node / dashboard
+node_modules/
+dashboard/dist/
+dashboard/.vite/
+
+# OS / editors
+.DS_Store
+.idea/
+.vscode/
+*.swp
