@@ -19,10 +19,15 @@ How a Betclic.pl single bet is paid out
    264 PLN withheld -> 2,376 PLN credited. The threshold is compared with the unrounded winning
    (2,280.00 is still exempt, 2,280.01 is taxed); base and tax are rounded to full złoty, half up
    (art. 63 § 1 Ordynacji podatkowej - the grosz rule of § 1a covers only art. 30a capital income).
-3. **Refunds**: a voided or pushed single returns the full GROSS stake, stake tax included.
-   ASSUMPTION: there is no published Betclic rule for this case; it follows the usual Polish
-   practice of returning the whole amount paid for a cancelled coupon. If Betclic ever refunds only
-   the net stake, ``engine.ledger.reconcile`` will flag the difference after the first void bet.
+   If Betclic turns out to withhold to the grosz instead, set
+   ``betclic.winnings_tax_rounding = "grosz"`` (10 % of the unrounded winning, half up to the grosz).
+3. **Refunds**: a voided or pushed single returns the full GROSS stake, stake tax included
+   (``betclic.void_refunds_stake_tax = True``). ASSUMPTION: there is no published Betclic rule for
+   this case; it follows the usual Polish practice of returning the whole amount paid for a
+   cancelled coupon (the stake tax is owed on accepted stakes, and a cancelled single is not one).
+   If Betclic ever refunds only the net stake, ``engine.ledger.reconcile`` flags the difference
+   after the first void bet and the owner sets ``void_refunds_stake_tax = False``: a refund then
+   returns ``stake - stake tax`` and every refunded bet costs the stake tax (see below).
 
 Expected value and Kelly
 ------------------------
@@ -41,6 +46,12 @@ odds, and it depends on the probabilities only through ``p_w / (p_w + p_l)`` (th
 winning given the bet settles): moving probability mass into refunds proportionally leaves ``f*``
 unchanged while scaling the EV. With no refunds it reduces to the classic ``(b p - (1 - p)) / b``.
 
+When refunds do NOT return the stake tax (``void_refunds_stake_tax = False``) a refund costs
+``c = t`` per unit staked: ``EV = p_w b - p_l - p_r c`` and the growth rate gains the term
+``p_r ln(1 - c f)``. ``G'(f) = p_w b / (1 + b f) - p_l / (1 - f) - p_r c / (1 - c f)`` is strictly
+decreasing, so the optimum is the unique root (found by bisection); it is still positive exactly
+when ``EV > 0`` and non-decreasing in the odds.
+
 The 10 % winnings tax depends on the stake (it only bites when the winning exceeds 2,280 PLN), so
 :func:`expected_value` takes an optional stake and :func:`big_win_stake_limit` gives the largest
 stake that keeps the winning tax-free; ``engine.bankroll.size_stake`` uses it to decide whether
@@ -53,6 +64,7 @@ import math
 from collections.abc import Iterable
 from dataclasses import dataclass
 from decimal import ROUND_DOWN, ROUND_HALF_UP, Decimal
+from typing import Literal
 
 from cs2bot.config import BetclicSettings, Settings
 from cs2bot.domain.betting import PricedOutcome
@@ -64,36 +76,49 @@ ZLOTY = Decimal("1")
 _ZERO = Decimal("0.00")
 
 
+WinTaxRounding = Literal["zloty", "grosz"]
+
+
 @dataclass(frozen=True)
 class TaxModel:
-    """The three numbers that define how a winning single is paid out."""
+    """The numbers and settlement rules that define how a single bet is paid out."""
 
     stake_tax_rate: Decimal  # deducted from every stake (0 during "bez podatku" promos)
     big_win_threshold: Decimal  # PIT exemption limit for a single winning (2,280 PLN)
     big_win_rate: Decimal  # PIT withheld from the whole winning above the threshold (10 %)
+    # ``BetclicSettings.void_refunds_stake_tax``: a void / pushed bet returns the full gross stake
+    # (True) or only ``stake - stake tax`` (False).
+    refund_stake_tax: bool = True
+    # ``BetclicSettings.winnings_tax_rounding``: PIT base and tax rounded to full zloty (art. 63 § 1
+    # Ordynacji podatkowej) or computed to the grosz.
+    win_tax_rounding: WinTaxRounding = "zloty"
 
     def __post_init__(self) -> None:
         for name in ("stake_tax_rate", "big_win_rate"):
             value = getattr(self, name)
             if not Decimal(0) <= value < Decimal(1):
                 raise ValueError(f"{name} must be in [0, 1), got {value}")
-        if self.big_win_threshold < 0:
+        if not self.big_win_threshold >= 0:
             raise ValueError("big_win_threshold must be >= 0")
+        if self.win_tax_rounding not in ("zloty", "grosz"):
+            raise ValueError(f"win_tax_rounding must be 'zloty' or 'grosz', got {self.win_tax_rounding!r}")
+
+    @property
+    def refund_loss_rate(self) -> Decimal:
+        """Share of the gross stake that is lost when a bet is refunded (0 with full refunds)."""
+        return Decimal(0) if self.refund_stake_tax else self.stake_tax_rate
 
     @classmethod
     def from_settings(cls, settings: Settings | BetclicSettings | TaxModel) -> TaxModel:
         if isinstance(settings, TaxModel):
             return settings
-        if isinstance(settings, Settings):
-            return cls(
-                stake_tax_rate=D(settings.effective_tax_rate),
-                big_win_threshold=D(settings.betclic.big_win_tax_threshold),
-                big_win_rate=D(settings.betclic.big_win_tax_rate),
-            )
+        betclic = settings.betclic if isinstance(settings, Settings) else settings
         return cls(
-            stake_tax_rate=Decimal(0) if settings.tax_free_promo else D(settings.tax_rate),
-            big_win_threshold=D(settings.big_win_tax_threshold),
-            big_win_rate=D(settings.big_win_tax_rate),
+            stake_tax_rate=Decimal(0) if betclic.tax_free_promo else D(betclic.tax_rate),
+            big_win_threshold=D(betclic.big_win_tax_threshold),
+            big_win_rate=D(betclic.big_win_tax_rate),
+            refund_stake_tax=bool(betclic.void_refunds_stake_tax),
+            win_tax_rounding=betclic.winnings_tax_rounding,
         )
 
 
@@ -134,13 +159,37 @@ def stake_tax(stake: Decimal, settings: TaxSource) -> Decimal:
 
 
 def winnings_tax(gross_win: Decimal, settings: TaxSource) -> Decimal:
-    """PIT withheld from a single winning: 10 % of the whole winning if it exceeds the threshold."""
+    """PIT withheld from a single winning: 10 % of the whole winning if it exceeds the threshold.
+
+    The threshold is compared with the unrounded winning. ``win_tax_rounding = "zloty"`` rounds the
+    base and the tax to full zloty (half up); ``"grosz"`` takes 10 % of the winning to the grosz.
+    """
     model = TaxModel.from_settings(settings)
     win = D(gross_win)
     if model.big_win_rate <= 0 or win <= model.big_win_threshold:
         return _ZERO
+    if model.win_tax_rounding == "grosz":
+        return quantize_money(win * model.big_win_rate)
     base = win.quantize(ZLOTY, rounding=ROUND_HALF_UP)
     return (base * model.big_win_rate).quantize(ZLOTY, rounding=ROUND_HALF_UP).quantize(CENT)
+
+
+def refund_amount(stake: Decimal, settings: TaxSource, *, tax: Decimal | None = None) -> Decimal:
+    """Amount returned to the balance when a bet with this GROSS stake is voided or pushed.
+
+    The full stake by default; ``stake - stake tax`` when ``void_refunds_stake_tax`` is off (``tax``
+    overrides the stake tax, e.g. the tax actually charged on the bet at placement).
+    """
+    model = TaxModel.from_settings(settings)
+    gross_stake = quantize_money(D(stake))
+    if gross_stake < 0:
+        raise ValueError("stake must be >= 0")
+    if model.refund_stake_tax:
+        return gross_stake
+    tax_amount = stake_tax(gross_stake, model) if tax is None else quantize_money(D(tax))
+    if not _ZERO <= tax_amount <= gross_stake:
+        raise ValueError(f"stake tax {tax_amount} is outside [0, stake]")
+    return gross_stake - tax_amount
 
 
 def payout_breakdown(
@@ -202,64 +251,112 @@ def big_win_stake_limit(odds: Decimal, settings: TaxSource) -> Decimal | None:
     return max(limit, _ZERO)
 
 
+def _probabilities(outcome: OutcomeProbability) -> tuple[float, float, float]:
+    """``(p_win, p_lose, p_refund)`` of an outcome (refund = push + void)."""
+    return outcome.p_win, outcome.p_lose, max(0.0, outcome.p_push) + max(0.0, outcome.p_void)
+
+
 def expected_value(
     outcome: OutcomeProbability, odds: Decimal, settings: TaxSource, stake: Decimal | None = None
 ) -> float:
-    """Expected profit per 1 unit of gross stake, after tax, refunds (push/void) worth 0.
+    """Expected profit per 1 unit of gross stake, after tax.
 
-    Without ``stake``: ``p_win (o_eff - 1) - p_lose`` (exact for small stakes, no winnings tax).
-    With ``stake``: the exact payout of that stake (grosz rounding and the 10 % winnings tax above
-    2,280 PLN) is used, so the EV can drop for large stakes.
+    Without ``stake``: ``p_win (o_eff - 1) - p_lose - p_refund c`` where ``c`` is the share of the
+    stake a refund costs (0 with full refunds, the stake tax rate otherwise); exact for small stakes
+    (no winnings tax). With ``stake``: the exact payout and refund of that stake (grosz rounding and
+    the 10 % winnings tax above 2,280 PLN) are used, so the EV can drop for large stakes.
     """
     model = TaxModel.from_settings(settings)
-    p_win, p_lose = outcome.p_win, outcome.p_lose
+    p_win, p_lose, p_refund = _probabilities(outcome)
     if stake is None:
         b = float(effective_odds(odds, tax_rate=model.stake_tax_rate)) - 1.0
-        return p_win * b - p_lose
+        return p_win * b - p_lose - p_refund * float(model.refund_loss_rate)
     if D(stake) <= 0:
         raise ValueError("stake must be positive")
     breakdown = payout_breakdown(stake, odds, model)
     if breakdown.stake <= 0:
         raise ValueError("stake rounds to 0.00")
     win_return = float(breakdown.net_payout / breakdown.stake) - 1.0
-    return p_win * win_return - p_lose
+    refund_return = float(refund_amount(breakdown.stake, model) / breakdown.stake) - 1.0
+    return p_win * win_return - p_lose + p_refund * refund_return
 
 
-def kelly_for_net_odds(p_win: float, p_lose: float, b: float) -> float:
-    """Full-Kelly fraction ``(b p_w - p_l) / (b (p_w + p_l))`` for net odds ``b``, clipped to [-1, 1].
+def kelly_for_net_odds(
+    p_win: float, p_lose: float, b: float, *, p_refund: float = 0.0, refund_loss: float = 0.0
+) -> float:
+    """Full-Kelly fraction for net odds ``b``, clipped to [-1, 1].
+
+    With full refunds (``refund_loss = 0``, the default) this is the closed form
+    ``(b p_w - p_l) / (b (p_w + p_l))``. When a refund costs ``refund_loss`` per unit staked (see the
+    module docstring) the optimum is the root of ``G'(f)``, found by bisection.
 
     A negative value only means "no edge" (a single bet cannot be shorted); it is clipped at -1 so
     the function stays non-decreasing in the odds, and ``b <= 0`` (a win cannot even return the
-    stake) gives -1. A bet that can only be refunded (``p_w + p_l = 0``) gives 0. The result is
-    positive exactly when the per-unit EV ``b p_w - p_l`` is positive.
+    stake) gives -1. A bet that can only be refunded at no cost gives 0. The result is positive
+    exactly when the per-unit EV ``b p_w - p_l - p_r c`` is positive.
     """
+    cost = p_refund * refund_loss if refund_loss > 0 and p_refund > 0 else 0.0
     settled = p_win + p_lose
-    if settled <= 0:
+    if settled <= 0 and cost <= 0:
         return 0.0
     if b <= 0:
         return -1.0
-    return max(-1.0, min(1.0, (b * p_win - p_lose) / (b * settled)))
+    edge = b * p_win - p_lose - cost
+    if cost <= 0:
+        return max(-1.0, min(1.0, edge / (b * settled)))
+    if edge <= 0:  # no edge: a negative number that still increases with the odds
+        return max(-1.0, edge / (b * (settled + cost)))
+
+    def slope(f: float) -> float:
+        return p_win * b / (1.0 + b * f) - p_lose / (1.0 - f) - cost / (1.0 - refund_loss * f)
+
+    lo, hi = 0.0, 1.0 - 1e-12
+    if slope(hi) >= 0:
+        return 1.0
+    for _ in range(80):
+        mid = (lo + hi) / 2.0
+        if slope(mid) > 0:
+            lo = mid
+        else:
+            hi = mid
+    return (lo + hi) / 2.0
 
 
 def kelly_fraction(outcome: OutcomeProbability, odds: Decimal, settings: TaxSource) -> float:
-    """Full-Kelly fraction of bankroll after the stake tax, with refunds leaving wealth unchanged.
+    """Full-Kelly fraction of bankroll after the stake tax, with refunds leaving wealth unchanged
+    (or costing the stake tax when ``void_refunds_stake_tax`` is off).
 
     Can be <= 0 (no edge). Ignores the stake-dependent winnings tax (see :func:`big_win_stake_limit`).
     """
     model = TaxModel.from_settings(settings)
     b = float(effective_odds(odds, tax_rate=model.stake_tax_rate)) - 1.0
-    return kelly_for_net_odds(outcome.p_win, outcome.p_lose, b)
+    p_win, p_lose, p_refund = _probabilities(outcome)
+    return kelly_for_net_odds(p_win, p_lose, b, p_refund=p_refund, refund_loss=float(model.refund_loss_rate))
 
 
-def expected_log_growth(p_win: float, p_lose: float, b: float, fraction: float) -> float:
-    """``G(f) = p_w ln(1 + b f) + p_l ln(1 - f)`` - expected log-growth of staking ``f`` of bankroll."""
+def expected_log_growth(
+    p_win: float,
+    p_lose: float,
+    b: float,
+    fraction: float,
+    *,
+    p_refund: float = 0.0,
+    refund_loss: float = 0.0,
+) -> float:
+    """``G(f) = p_w ln(1 + b f) + p_l ln(1 - f) + p_r ln(1 - c f)`` - expected log-growth of staking
+    ``f`` of the bankroll (``c`` = ``refund_loss``, 0 with full refunds)."""
     if fraction <= 0:
         return 0.0
+    refund_term = 0.0
+    if p_refund > 0 and refund_loss > 0:
+        if refund_loss * fraction >= 1.0:
+            return -math.inf
+        refund_term = p_refund * math.log1p(-refund_loss * fraction)
     if fraction >= 1.0:
-        return -math.inf if p_lose > 0 else p_win * math.log1p(b * fraction)
+        return -math.inf if p_lose > 0 else p_win * math.log1p(b * fraction) + refund_term
     if 1.0 + b * fraction <= 0:
         return -math.inf
-    return p_win * math.log1p(b * fraction) + p_lose * math.log1p(-fraction)
+    return p_win * math.log1p(b * fraction) + p_lose * math.log1p(-fraction) + refund_term
 
 
 def price(outcome: OutcomeProbability, quote: OddsQuote, settings: TaxSource) -> PricedOutcome:

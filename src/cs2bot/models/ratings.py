@@ -34,7 +34,7 @@ Online update of one map (both teams simultaneously, each against the other's pr
    deviation becomes ``phi_t = min(phi_0, sqrt(phi^2 + c sigma^2))`` and offsets drift with
    ``psi_t^2 = min(psi_0^2, psi^2 + c_m * map_offset_drift^2)``.
 2. **Roster continuity.** If the record's lineup replaced ``k`` players of the team's previous
-   lineup, a reset fraction ``rho = roster_reset_fractions[k]`` (default 0, .12, .3, .6, .85, 1: one
+   lineup, a reset fraction ``rho = roster_reset_fractions[k]`` (default 0, .12, .35, .7, .9, 1: one
    change is mild, three or more is close to a reset) moves ``phi^2`` toward ``phi_0^2`` by ``rho``
    and regresses ``mu`` toward ``initial_mu`` by ``rho * roster_mu_regression``; map/LAN offsets get
    the same treatment scaled by ``roster_offset_scale``.
@@ -157,7 +157,7 @@ class RatingConfig(BaseModel):
     # Optional information weight per tournament tier value ("s", "a", "b", ...); default 1.
     tier_weights: dict[str, float] = Field(default_factory=dict)
     # Roster continuity: reset fraction by number of replaced players (index = changes).
-    roster_reset_fractions: tuple[float, ...] = (0.0, 0.12, 0.3, 0.6, 0.85, 1.0)
+    roster_reset_fractions: tuple[float, ...] = (0.0, 0.12, 0.35, 0.7, 0.9, 1.0)
     roster_mu_regression: float = Field(default=0.5, ge=0.0, le=1.0)
     roster_offset_scale: float = Field(default=0.5, ge=0.0, le=1.0)
 
@@ -338,6 +338,18 @@ def _record_sort_key(r: MapResultRecord) -> tuple[datetime, int, int]:
     return ensure_utc(r.played_at), r.match_id, r.map_number
 
 
+def _roster_changes(previous: Sequence[int], current: Sequence[int]) -> int:
+    """Number of players of ``previous`` that were *replaced* in ``current``.
+
+    Lineup data can be incomplete (three known players one day, five the next), so players are only
+    counted as replacements when somebody had to make room for them:
+    ``changes = min(|current - previous|, |previous - current|)``. A lineup that merely lists fewer
+    or more of the same players is not a roster change.
+    """
+    prev, cur = set(previous), set(current)
+    return min(len(cur - prev), len(prev - cur))
+
+
 # -------------------------------------------------------------------------------------------- model
 
 
@@ -496,15 +508,17 @@ class MapRatingModel:
 
     def _apply_roster(self, team: _Team, lineup: Sequence[int]) -> tuple[_Team, int]:
         """Roster-continuity adjustment for a new lineup; returns the new state and #changes."""
-        new_lineup = tuple(int(p) for p in lineup)
+        new_lineup = tuple(dict.fromkeys(int(p) for p in lineup))
         if not new_lineup:
             return team, 0
         if not team.lineup:
             return replace(team, lineup=new_lineup), 0
-        old = set(team.lineup)
-        changes = sum(1 for p in set(new_lineup) if p not in old)
+        changes = _roster_changes(team.lineup, new_lineup)
         if changes == 0:
-            return (team if new_lineup == team.lineup else replace(team, lineup=new_lineup)), 0
+            if set(new_lineup) <= set(team.lineup):
+                # Same players, or an incomplete listing of them: keep the fuller reference lineup.
+                return team, 0
+            return replace(team, lineup=new_lineup), 0
         return self._roster_adjusted(team, changes, new_lineup), changes
 
     def _roster_adjusted(self, team: _Team, changes: int, lineup: tuple[int, ...]) -> _Team:

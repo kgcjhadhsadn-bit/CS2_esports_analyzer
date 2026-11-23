@@ -81,8 +81,11 @@ from cs2bot.config import DEFAULT_ACTIVE_MAP_POOL
 from cs2bot.domain.enums import MatchFormat, TeamSlot, VetoAction
 from cs2bot.domain.predictions import MapSequenceProbability
 from cs2bot.domain.records import VetoRecord, VetoStep
+from cs2bot.utils.logging import get_logger
 from cs2bot.utils.names import normalize_map_name
 from cs2bot.utils.time import ensure_utc, utcnow
+
+log = get_logger(__name__)
 
 __all__ = [
     "VETO_TEMPLATES",
@@ -106,6 +109,8 @@ _SECONDS_PER_DAY: Final[float] = 86_400.0
 _FORMAT_KIND: Final[str] = "cs2bot.VetoModel"
 _FORMAT_VERSION: Final[int] = 1
 _ACTIONS: Final[tuple[VetoAction, VetoAction]] = (VetoAction.BAN, VetoAction.PICK)
+#: Advantage values (logit units) are clipped to this magnitude before entering the utilities.
+_MAX_ADVANTAGE: Final[float] = 10.0
 _PICKS_BY_FORMAT: Final[dict[MatchFormat, int]] = {
     MatchFormat.BO1: 0,
     MatchFormat.BO2: 2,
@@ -281,6 +286,14 @@ _PlayedKey = tuple[tuple[str, TeamSlot | None], ...]
 _State = tuple[frozenset[str], _PlayedKey]
 
 
+def _finite(value: float) -> float:
+    """Advantage values come from another model: map NaN / inf to 0 (no information) and bound them."""
+    x = float(value)
+    if not math.isfinite(x):
+        return 0.0
+    return min(max(x, -_MAX_ADVANTAGE), _MAX_ADVANTAGE)
+
+
 def _unique(maps: Iterable[str]) -> list[str]:
     out: list[str] = []
     for m in maps:
@@ -309,6 +322,7 @@ class VetoModel:
         self._coef_adv: VetoCoefficients | None = None
         self._seen: set[int] = set()
         self._last: datetime | None = None
+        self._advantage_failures = 0
 
     @property
     def config(self) -> VetoConfig:
@@ -323,6 +337,11 @@ class VetoModel:
     def coefficients_with_advantage(self) -> VetoCoefficients | None:
         """Coefficients used with an advantage callable (``None`` if fitted without one)."""
         return self._coef_adv
+
+    @property
+    def advantage_failures(self) -> int:
+        """Veto steps of the last :meth:`fit` whose advantage lookup raised (treated as 0 advantage)."""
+        return self._advantage_failures
 
     @property
     def last_veto_time(self) -> datetime | None:
@@ -363,7 +382,9 @@ class VetoModel:
                 continue
             if st.action is not VetoAction.LEFTOVER and st.team is not None and len(remaining) >= 2:
                 team_id, opp_id = (
-                    (rec.team1_id, rec.team2_id) if st.team is TeamSlot.TEAM1 else (rec.team2_id, rec.team1_id)
+                    (rec.team1_id, rec.team2_id)
+                    if st.team is TeamSlot.TEAM1
+                    else (rec.team2_id, rec.team1_id)
                 )
                 out.append(_Decision(team_id, opp_id, st.action, tuple(remaining), m))
             remaining.remove(m)
@@ -372,12 +393,12 @@ class VetoModel:
     def _ingest(self, decisions: Sequence[_Decision], t: datetime) -> None:
         h = self._config.half_life_days
         for d in decisions:
-            self._team_stats.setdefault((d.team_id, d.action), _ChoiceStats()).add(t, d.chosen, d.remaining, h)
+            self._team_stats.setdefault((d.team_id, d.action), _ChoiceStats()).add(
+                t, d.chosen, d.remaining, h
+            )
             self._league[d.action].add(t, d.chosen, d.remaining, h)
 
-    def fit(
-        self, records: Iterable[VetoRecord], *, map_advantage: MapAdvantageFn | None = None
-    ) -> VetoModel:
+    def fit(self, records: Iterable[VetoRecord], *, map_advantage: MapAdvantageFn | None = None) -> VetoModel:
         """Reset, learn preferences from ``records`` (chronologically) and fit the softmax weights.
 
         ``map_advantage`` (optional) is queried as ``map_advantage(team_id, opponent_id, map, t)``
@@ -397,16 +418,23 @@ class VetoModel:
             for d in decisions:
                 own = tuple(self._pref(d.team_id, d.action, m, t) for m in d.remaining)
                 opp = tuple(self._pref(d.opponent_id, VetoAction.PICK, m, t) for m in d.remaining)
+                adv = (0.0,) * len(d.remaining)
                 if map_advantage is not None:
-                    adv_vals: list[float] = []
-                    for m in d.remaining:
-                        key = (d.team_id, d.opponent_id, m)
-                        if key not in adv_cache:
-                            adv_cache[key] = float(map_advantage(d.team_id, d.opponent_id, m, t))
-                        adv_vals.append(adv_cache[key])
-                    adv = tuple(adv_vals)
-                else:
-                    adv = (0.0,) * len(d.remaining)
+                    try:
+                        for m in d.remaining:
+                            key = (d.team_id, d.opponent_id, m)
+                            if key not in adv_cache:
+                                adv_cache[key] = _finite(map_advantage(d.team_id, d.opponent_id, m, t))
+                        adv = tuple(adv_cache[(d.team_id, d.opponent_id, m)] for m in d.remaining)
+                    except Exception as exc:  # one bad lookup must not abort the whole fit
+                        self._advantage_failures += 1
+                        if self._advantage_failures == 1:
+                            log.warning(
+                                "veto fit: map advantage lookup failed for match %s (%r); using 0 for "
+                                "this and any further failing step",
+                                rec.match_id,
+                                exc,
+                            )
                 rows.append(_StepRow(d.action, own, adv, opp, d.remaining.index(d.chosen)))
             self._ingest(decisions, t)
             self._seen.add(rec.match_id)
@@ -582,7 +610,7 @@ class VetoModel:
         for slot, team, opp in ((TeamSlot.TEAM1, team1_id, team2_id), (TeamSlot.TEAM2, team2_id, team1_id)):
             adv = dict.fromkeys(pool, 0.0)
             if use_adv and map_advantage is not None:
-                adv = {m: float(map_advantage(team, opp, m, t_adv)) for m in pool}
+                adv = {m: _finite(map_advantage(team, opp, m, t_adv)) for m in pool}
             opp_pick = {m: self._pref(opp, VetoAction.PICK, m, t_pref) for m in pool}
             for action in _ACTIONS:
                 a, b, c = coef.for_action(action)
@@ -621,14 +649,14 @@ class VetoModel:
         ordered = [known[i] for i in sorted(known)]
         picks = [(m, team) for action, team, m in ordered if action is VetoAction.PICK]
         n_picks = _PICKS_BY_FORMAT[fmt]
-        if fmt is MatchFormat.BO2:
-            if len(picks) >= 2:
-                chosen = picks[:2]
-                return MapSequenceProbability(
-                    maps=[m for m, _ in chosen], pickers=[t for _, t in chosen], probability=1.0
-                )
-            return None
-        if len(picks) != n_picks:
+        if len(picks) >= fmt.n_maps:
+            # Enough picked maps to fill every slot (always the case for a finished BO2 veto; also
+            # covers organisers whose BO1/BO3/BO5 maps are all picked): played in pick order.
+            chosen = picks[: fmt.n_maps]
+            return MapSequenceProbability(
+                maps=[m for m, _ in chosen], pickers=[t for _, t in chosen], probability=1.0
+            )
+        if fmt is MatchFormat.BO2 or len(picks) != n_picks:
             return None
         leftover = [m for action, _, m in ordered if action is VetoAction.LEFTOVER]
         if not leftover:
@@ -653,7 +681,8 @@ class VetoModel:
     ) -> list[tuple[VetoAction, TeamSlot | None]]:
         base = list(template) if template is not None else list(veto_template(fmt, n_pool))
         plan: list[tuple[VetoAction, TeamSlot | None]] = [
-            (st.action, None if st.actor is None else (first if st.actor == 0 else first.other)) for st in base
+            (st.action, None if st.actor is None else (first if st.actor == 0 else first.other))
+            for st in base
         ]
         mismatch = False
         for i, (action, team, _) in known.items():

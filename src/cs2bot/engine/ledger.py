@@ -10,10 +10,16 @@ Money conventions (see :mod:`cs2bot.engine.ev` for the tax research):
   part of it), ``bets.tax = stake x stake tax rate``;
 * a winning bet credits ``ev.net_payout`` (stake tax and the 10 % winnings tax above 2,280 PLN
   already deducted) via :func:`record_payout`;
-* a void / pushed bet refunds the full gross stake (:func:`record_refund`);
+* a void / pushed bet refunds the full gross stake (:func:`record_refund`), or ``stake - stake tax``
+  when ``betclic.void_refunds_stake_tax`` is off (pass ``amount=`` from :func:`settle_amounts`);
 * dry-run bets never touch the ledger (every ``record_*`` returns ``None`` for them);
 * entries are idempotent per bet and kind: recording the same stake / payout / refund twice
-  returns the existing row instead of moving money twice.
+  returns the existing row instead of moving money twice;
+* a bet is either paid out or refunded, never both: the second call raises
+  :class:`LedgerConflictError` instead of crediting the balance twice.
+
+:func:`settle_bet` applies a settlement outcome to a bet in one step (status, payout, pnl,
+``settled_at`` and the ledger entries) and is the recommended entry point for the settlement service.
 """
 
 from __future__ import annotations
@@ -30,7 +36,8 @@ from cs2bot.config import BankrollSettings, Settings
 from cs2bot.db import state
 from cs2bot.db.models import BankrollLedger, Bet
 from cs2bot.domain.enums import BetStatus, LedgerKind
-from cs2bot.engine.ev import TaxModel, TaxSource, payout_breakdown, stake_tax
+from cs2bot.domain.results import SettlementOutcome
+from cs2bot.engine.ev import TaxModel, TaxSource, payout_breakdown, refund_amount, stake_tax
 from cs2bot.utils.logging import get_logger
 from cs2bot.utils.money import D, quantize_money
 from cs2bot.utils.time import utcnow
@@ -41,6 +48,11 @@ SettleOutcome = Literal["won", "lost", "void", "push"]
 _ZERO = Decimal("0.00")
 #: ``bets.extra`` key holding the stake tax rate charged at placement (string, e.g. "0.12").
 STAKE_TAX_RATE_KEY = "stake_tax_rate"
+
+
+class LedgerConflictError(ValueError):
+    """The requested entry contradicts what the ledger already holds for this bet (e.g. a payout for
+    a bet that was already refunded). Nothing is written; resolve it by hand (``record_adjustment``)."""
 
 
 @dataclass(frozen=True)
@@ -172,7 +184,16 @@ def record_payout(
     bet_id = _persisted_id(session, bet)
     existing = _bet_entry(session, bet_id, LedgerKind.PAYOUT)
     if existing is not None:
+        if D(existing.amount) != amount:
+            logger.warning(
+                "bet %s: payout %s already recorded, ignoring a second payout of %s",
+                bet_id,
+                existing.amount,
+                amount,
+            )
         return existing
+    if _bet_entry(session, bet_id, LedgerKind.REFUND) is not None:
+        raise LedgerConflictError(f"bet {bet_id} was already refunded - it cannot also be paid out")
     if _bet_entry(session, bet_id, LedgerKind.STAKE) is None:
         logger.warning("bet %s settled without a recorded stake - recording the stake first", bet_id)
         record_stake(session, bet)
@@ -186,10 +207,15 @@ def record_payout(
     )
 
 
-def record_refund(session: Session, bet: Bet, *, at: datetime | None = None) -> BankrollLedger | None:
+def record_refund(
+    session: Session, bet: Bet, *, amount: Decimal | None = None, at: datetime | None = None
+) -> BankrollLedger | None:
     """Refund the debited stake of a void / pushed / failed bet (idempotent).
 
-    Nothing is written for dry runs or when the stake was never debited (no money left the balance).
+    ``amount`` defaults to the whole debited stake (a bet that never existed at the bookmaker, or a
+    void with full refunds); pass the refund from :func:`settle_amounts` when the bookmaker keeps the
+    stake tax on voided bets. Nothing is written for dry runs or when the stake was never debited (no
+    money left the balance). Raises :class:`LedgerConflictError` if the bet was already paid out.
     """
     if is_dry_run(bet):
         return None
@@ -200,10 +226,18 @@ def record_refund(session: Session, bet: Bet, *, at: datetime | None = None) -> 
     existing = _bet_entry(session, bet_id, LedgerKind.REFUND)
     if existing is not None:
         return existing
+    if _bet_entry(session, bet_id, LedgerKind.PAYOUT) is not None:
+        raise LedgerConflictError(f"bet {bet_id} was already paid out - it cannot also be refunded")
+    debited = -D(stake_entry.amount)
+    value = debited if amount is None else quantize_money(D(amount))
+    if not _ZERO <= value <= debited:
+        raise ValueError(f"refund {value} for bet {bet_id} is outside [0, debited stake {debited}]")
+    if value == 0:
+        return None
     return _append(
         session,
         kind=LedgerKind.REFUND,
-        amount=-D(stake_entry.amount),
+        amount=value,
         bet_id=bet_id,
         note=f"refund {bet.spec_key}#{bet.selection_key}",
         at=at or bet.settled_at,
@@ -322,23 +356,102 @@ def bet_money_fields(stake: Decimal, odds: Decimal, settings: TaxSource) -> dict
     }
 
 
-def settle_amounts(bet: Bet, outcome: SettleOutcome | str, settings: TaxSource) -> tuple[Decimal, Decimal]:
+def _outcome_kind(outcome: SettlementOutcome | SettleOutcome | str) -> str:
+    kind = (outcome.value if isinstance(outcome, SettlementOutcome) else str(outcome)).strip().lower()
+    if kind not in ("won", "lost", "void", "push"):
+        raise ValueError(f"unknown settlement outcome {outcome!r} (expected won / lost / void / push)")
+    return kind
+
+
+def settle_amounts(
+    bet: Bet, outcome: SettlementOutcome | SettleOutcome | str, settings: TaxSource
+) -> tuple[Decimal, Decimal]:
     """``(payout, pnl)`` of a settled bet, consistent with :func:`cs2bot.engine.ev.net_payout`.
 
     * ``won``: payout = (stake - stake tax) x odds minus the winnings tax; pnl = payout - stake;
     * ``lost``: (0, -stake);
-    * ``void`` / ``push``: the full gross stake is refunded: (stake, 0).
+    * ``void`` / ``push``: the gross stake is refunded: (stake, 0) - or, when
+      ``betclic.void_refunds_stake_tax`` is off, (stake - stake tax, -stake tax).
 
-    Odds are ``placed_odds`` (falling back to ``requested_odds``).
+    Odds are ``placed_odds`` (falling back to ``requested_odds``). ``SettlementOutcome.UNKNOWN`` (or
+    any other value) raises ``ValueError``: an undecided bet has no amounts.
     """
     stake = quantize_money(D(bet.stake))
-    kind = outcome.strip().lower()
+    kind = _outcome_kind(outcome)
     if kind == "won":
         odds = bet.placed_odds if bet.placed_odds is not None else bet.requested_odds
         breakdown = payout_breakdown(stake, D(odds), settings, tax=bet_stake_tax(bet, settings))
         return breakdown.net_payout, breakdown.net_payout - stake
     if kind == "lost":
         return _ZERO, -stake
-    if kind in ("void", "push"):
-        return stake, _ZERO
-    raise ValueError(f"unknown settlement outcome {outcome!r} (expected won / lost / void / push)")
+    refund = refund_amount(stake, settings, tax=bet_stake_tax(bet, settings))
+    return refund, refund - stake
+
+
+_SETTLED_STATUS: dict[str, BetStatus] = {
+    "won": BetStatus.WON,
+    "lost": BetStatus.LOST,
+    "void": BetStatus.VOID,
+    "push": BetStatus.VOID,
+}
+#: ``bets.extra`` key holding the settlement outcome applied by :func:`settle_bet` ("won" / "lost" /
+#: "void" / "push"; ``bets.status`` cannot tell a push from a void).
+SETTLED_OUTCOME_KEY = "settled_outcome"
+
+
+def settle_bet(
+    session: Session,
+    bet: Bet,
+    outcome: SettlementOutcome | SettleOutcome | str,
+    settings: TaxSource,
+    *,
+    at: datetime | None = None,
+) -> tuple[Decimal, Decimal]:
+    """Apply a settlement outcome to a bet: status, ``payout``, ``pnl``, ``settled_at`` and the
+    ledger entries, in one step. Returns ``(payout, pnl)``.
+
+    * real bets: WON -> PAYOUT entry; LOST -> nothing (the stake was debited at placement, and is
+      debited now if it never was); VOID / PUSH -> REFUND entry and status ``VOID``;
+    * dry-run bets keep status ``DRY_RUN`` and never touch the ledger; the hypothetical ``payout`` /
+      ``pnl`` / ``settled_at`` are stored for the dashboard (``compute_state`` ignores them);
+    * idempotent: settling an already settled bet with the same outcome changes nothing; a different
+      outcome raises :class:`LedgerConflictError` (re-grading must be done by hand);
+    * only bets the bookmaker holds can be settled: PENDING / FAILED / CANCELLED bets raise
+      ``ValueError`` (PLACING - an unconfirmed placement - must be reconciled to PLACED first).
+
+    Flushes, never commits. ``SettlementOutcome.UNKNOWN`` raises ``ValueError``.
+    """
+    kind = _outcome_kind(outcome)
+    when = at or utcnow()
+    if when.tzinfo is None:
+        raise ValueError("at must be timezone-aware")
+    payout, pnl = settle_amounts(bet, kind, settings)
+    dry = is_dry_run(bet)
+    previous = (bet.extra or {}).get(SETTLED_OUTCOME_KEY)
+    if bet.status.is_settled or (dry and previous is not None):
+        same = previous == kind or (previous is None and bet.status is _SETTLED_STATUS[kind])
+        if not same:
+            raise LedgerConflictError(
+                f"bet {bet.id} is already settled as {previous or bet.status.value}; refusing to "
+                f"re-settle it as {kind}"
+            )
+        return (
+            quantize_money(D(bet.payout)) if bet.payout is not None else payout,
+            quantize_money(D(bet.pnl)) if bet.pnl is not None else pnl,
+        )
+    if not dry and bet.status is not BetStatus.PLACED:
+        raise ValueError(f"bet {bet.id} has status {bet.status.value}; only PLACED bets can be settled")
+    bet.payout, bet.pnl, bet.settled_at = payout, pnl, when
+    bet.extra = {**(bet.extra or {}), SETTLED_OUTCOME_KEY: kind}
+    if not dry:
+        if kind in ("void", "push"):
+            if _bet_entry(session, _persisted_id(session, bet), LedgerKind.STAKE) is None:
+                record_stake(session, bet)
+            record_refund(session, bet, amount=payout, at=when)
+        elif kind == "won":
+            record_payout(session, bet, payout, at=when)
+        else:
+            record_stake(session, bet)  # no-op when the stake was debited at placement
+        bet.status = _SETTLED_STATUS[kind]
+    session.flush()
+    return payout, pnl

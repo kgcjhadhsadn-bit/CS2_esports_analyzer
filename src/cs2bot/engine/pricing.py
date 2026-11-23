@@ -15,10 +15,17 @@ Conventions used here (see also :mod:`cs2bot.domain.markets` and :mod:`cs2bot.do
   ``margin_team1 + line > 0``, selection ``team2`` when ``margin_team1 + line < 0``; equality
   (only possible on integer lines) is a push. Totals: ``over`` wins when ``value > line``, ``under``
   when ``value < line``, equality pushes.
-* Round markets include overtime (the final ``score_pmf`` includes OT scores). The totals family
-  (``TOTAL_ROUNDS``, ``TEAM_TOTAL_ROUNDS``, ``TOTAL_ROUNDS_ODD_EVEN``) can be priced on regulation
-  time only (``include_overtime_in_totals=False``): in MR12 a map that reaches overtime was 12-12
-  after regulation, so its regulation total is 24 and each team's regulation rounds are 12.
+* Round markets include overtime (the final ``score_pmf`` includes OT scores). The round-count
+  family (``TOTAL_ROUNDS``, ``TEAM_TOTAL_ROUNDS``, ``TOTAL_ROUNDS_ODD_EVEN`` and ``ROUND_HANDICAP``)
+  can be priced on regulation time only (``include_overtime_in_totals=False``, i.e.
+  ``BetclicSettings.totals_include_overtime``): in MR12 a map that reaches overtime was 12-12 after
+  regulation, so its regulation total is 24, each team's regulation rounds are 12 and the regulation
+  margin is 0. Map winner, correct score, overtime yes/no and race-to markets always use the final
+  score.
+* Bookmaker settlement rules come from :class:`cs2bot.config.BetclicSettings` unless given
+  explicitly: ``include_overtime_in_totals=None`` -> ``totals_include_overtime``, ``h2h_tie=None`` ->
+  ``h2h_tie_rule`` (``betclic=`` overrides the process settings). :mod:`cs2bot.engine.settlement`
+  resolves finished bets with exactly the same rules (:func:`market_rules`).
 * Player markets choose their scope from the spec: ``map_number=k`` -> ``"map:k"`` (the slot's
   ``players`` first, then ``player_kills_by_scope["map:k"]``), ``maps_scope=(1, 2)`` ->
   ``"maps:1,2"``, neither -> ``"match"``. Distributions of a ``"map:k"`` scope are conditional on map
@@ -28,6 +35,10 @@ Conventions used here (see also :mod:`cs2bot.domain.markets` and :mod:`cs2bot.do
 * Top-fragger probabilities are read as given (they are expected to already include the
   bookmaker's dead-heat treatment of ties). A team-specific top-fragger market (``spec.team``) reads
   the table stored under ``"<scope>|<team>"``, e.g. ``top_fragger["match|team1"]``.
+* Race to N rounds: ``p_team1_race_to["N"]`` is P(team1 is first to N). For N <= 13 one team always
+  gets there. For N > 13 the map can end first; that case is void and its probability is
+  ``p_neither_race_to["N"]`` when the prediction carries it, else P(max final score < N) from the
+  slot's ``score_pmf``.
 
 Uncertainty
 -----------
@@ -59,6 +70,7 @@ from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field
 from typing import Literal
 
+from cs2bot.config import BetclicSettings, get_settings
 from cs2bot.domain.enums import MatchFormat
 from cs2bot.domain.markets import (
     SELECTION_DRAW,
@@ -151,24 +163,50 @@ _Handler = Callable[[MarketSpec, str, PredictionCore, _Ctx], OutcomeSplit]
 # ----------------------------------------------------------------------------------------------
 
 
+def market_rules(
+    include_overtime_in_totals: bool | None = None,
+    h2h_tie: str | None = None,
+    betclic: BetclicSettings | None = None,
+) -> tuple[bool, H2HTie]:
+    """Resolve the bookmaker settlement rules shared by pricing and settlement.
+
+    Explicit arguments win; ``None`` falls back to ``betclic`` (default: the process settings,
+    ``get_settings().betclic``): ``totals_include_overtime`` and ``h2h_tie_rule``. Raises
+    ``ValueError`` for an ``h2h_tie`` other than ``"push"`` / ``"lose"``.
+    """
+    if include_overtime_in_totals is None or h2h_tie is None:
+        rules = betclic if betclic is not None else get_settings().betclic
+        if include_overtime_in_totals is None:
+            include_overtime_in_totals = rules.totals_include_overtime
+        if h2h_tie is None:
+            h2h_tie = rules.h2h_tie_rule
+    if h2h_tie == "push":
+        return bool(include_overtime_in_totals), "push"
+    if h2h_tie == "lose":
+        return bool(include_overtime_in_totals), "lose"
+    raise ValueError(f"h2h_tie must be 'push' or 'lose', got {h2h_tie!r}")
+
+
 def price_outcome(
     spec: MarketSpec,
     selection: str,
     prediction: MatchPrediction,
     *,
     sigma_floor: float,
-    include_overtime_in_totals: bool = True,
-    h2h_tie: str = "push",
+    include_overtime_in_totals: bool | None = None,
+    h2h_tie: str | None = None,
+    betclic: BetclicSettings | None = None,
 ) -> OutcomeProbability:
     """Price one outcome from ``prediction.central`` with an uncertainty from ``low`` / ``high``.
 
-    ``h2h_tie`` decides how a tie in a head-to-head kills market settles: ``"push"`` (stake
-    refunded) or ``"lose"``. Raises :class:`UnpriceableMarket` when the prediction cannot support
-    the outcome and ``ValueError`` for invalid arguments.
+    ``include_overtime_in_totals`` (round totals / handicaps count overtime rounds) and ``h2h_tie``
+    (a level head-to-head kills market is a ``"push"`` - stake refunded - or a ``"lose"``) default to
+    the Betclic settlement rules in the settings (:func:`market_rules`). Raises
+    :class:`UnpriceableMarket` when the prediction cannot support the outcome and ``ValueError`` for
+    invalid arguments.
     """
-    ctx = _context(prediction.format, include_overtime_in_totals, h2h_tie)
-    if not math.isfinite(sigma_floor) or sigma_floor < 0:
-        raise ValueError(f"sigma_floor must be a non-negative number, got {sigma_floor!r}")
+    ctx = _context(prediction.format, include_overtime_in_totals, h2h_tie, betclic)
+    _check_sigma_floor(sigma_floor)
     central = _split(spec, selection, prediction.central, ctx)
     sigma = _outcome_sigma(spec, selection, prediction, ctx, central, sigma_floor)
     return OutcomeProbability(
@@ -187,11 +225,12 @@ def price_core(
     core: PredictionCore,
     *,
     fmt: MatchFormat,
-    include_overtime_in_totals: bool = True,
-    h2h_tie: str = "push",
+    include_overtime_in_totals: bool | None = None,
+    h2h_tie: str | None = None,
+    betclic: BetclicSettings | None = None,
 ) -> OutcomeSplit:
     """Price one outcome under a single scenario (no uncertainty). Used by backtests and tests."""
-    return _split(spec, selection, core, _context(fmt, include_overtime_in_totals, h2h_tie))
+    return _split(spec, selection, core, _context(fmt, include_overtime_in_totals, h2h_tie, betclic))
 
 
 def price_quotes_report(
@@ -199,10 +238,17 @@ def price_quotes_report(
     quotes: Iterable[OddsQuote],
     *,
     sigma_floor: float,
-    include_overtime_in_totals: bool = True,
-    h2h_tie: str = "push",
+    include_overtime_in_totals: bool | None = None,
+    h2h_tie: str | None = None,
+    betclic: BetclicSettings | None = None,
 ) -> PricingReport:
-    """Price every quote; unpriceable quotes are logged and returned in ``skipped`` with the reason."""
+    """Price every quote; unpriceable quotes are logged and returned in ``skipped`` with the reason.
+
+    One broken quote never aborts the batch: besides :class:`UnpriceableMarket`, any unexpected error
+    while pricing a single quote is logged and reported as skipped.
+    """
+    include_ot, tie = market_rules(include_overtime_in_totals, h2h_tie, betclic)
+    _check_sigma_floor(sigma_floor)  # a bad argument is the caller's bug, not a property of a quote
     report = PricingReport()
     for quote in quotes:
         try:
@@ -211,8 +257,8 @@ def price_quotes_report(
                 quote.selection_key,
                 prediction,
                 sigma_floor=sigma_floor,
-                include_overtime_in_totals=include_overtime_in_totals,
-                h2h_tie=h2h_tie,
+                include_overtime_in_totals=include_ot,
+                h2h_tie=tie,
             )
         except UnpriceableMarket as exc:
             logger.info(
@@ -227,6 +273,17 @@ def price_quotes_report(
             )
             report.skipped.append((quote, str(exc)))
             continue
+        except (ArithmeticError, LookupError, TypeError, ValueError) as exc:
+            logger.warning(
+                "match %s: error while pricing %s#%s (bookmaker selection %s): %r",
+                prediction.match_id,
+                quote.spec.key(),
+                quote.selection_key,
+                quote.selection_id,
+                exc,
+            )
+            report.skipped.append((quote, f"pricing error: {exc!r}"))
+            continue
         report.priced.append((outcome, quote))
     return report
 
@@ -236,8 +293,9 @@ def price_quotes(
     quotes: Iterable[OddsQuote],
     *,
     sigma_floor: float,
-    include_overtime_in_totals: bool = True,
-    h2h_tie: str = "push",
+    include_overtime_in_totals: bool | None = None,
+    h2h_tie: str | None = None,
+    betclic: BetclicSettings | None = None,
 ) -> list[tuple[OutcomeProbability, OddsQuote]]:
     """Price every quote, skipping (and logging) the unpriceable ones."""
     return price_quotes_report(
@@ -246,6 +304,7 @@ def price_quotes(
         sigma_floor=sigma_floor,
         include_overtime_in_totals=include_overtime_in_totals,
         h2h_tie=h2h_tie,
+        betclic=betclic,
     ).priced
 
 
@@ -297,12 +356,16 @@ def _outcome_sigma(
 # ----------------------------------------------------------------------------------------------
 
 
-def _context(fmt: MatchFormat, include_ot: bool, h2h_tie: str) -> _Ctx:
-    if h2h_tie == "push":
-        return _Ctx(fmt, include_ot, "push")
-    if h2h_tie == "lose":
-        return _Ctx(fmt, include_ot, "lose")
-    raise ValueError(f"h2h_tie must be 'push' or 'lose', got {h2h_tie!r}")
+def _check_sigma_floor(sigma_floor: float) -> None:
+    if not math.isfinite(sigma_floor) or sigma_floor < 0:
+        raise ValueError(f"sigma_floor must be a non-negative number, got {sigma_floor!r}")
+
+
+def _context(
+    fmt: MatchFormat, include_ot: bool | None, h2h_tie: str | None, betclic: BetclicSettings | None = None
+) -> _Ctx:
+    include, tie = market_rules(include_ot, h2h_tie, betclic)
+    return _Ctx(fmt, include, tie)
 
 
 def _split(spec: MarketSpec, selection: str, core: PredictionCore, ctx: _Ctx) -> OutcomeSplit:
@@ -412,14 +475,20 @@ def _on_slot(slot: MapSlotPrediction, cond: OutcomeSplit) -> OutcomeSplit:
     return _condition(_prob(slot.p_played, f"map {slot.map_number} p_played"), cond)
 
 
-def _compare(value: float, line: float) -> int:
-    """+1 if ``value > line``, -1 if ``value < line``, 0 if equal (a push on integer lines)."""
+def compare_to_line(value: float, line: float) -> int:
+    """+1 if ``value > line``, -1 if ``value < line``, 0 if equal (a push on integer lines).
+
+    Shared with :mod:`cs2bot.engine.settlement`, so pricing and settlement agree on every line.
+    """
     diff = value - line
     if diff > _EPS:
         return 1
     if diff < -_EPS:
         return -1
     return 0
+
+
+_compare = compare_to_line
 
 
 def _over_under(items: Iterable[tuple[float, float]], line: float, selection: str) -> OutcomeSplit:
@@ -472,13 +541,22 @@ def _is_overtime(team1_rounds: int, team2_rounds: int) -> bool:
     return team1_rounds + team2_rounds > REGULATION_ROUNDS
 
 
-def _rounds_value(a: int, b: int, ctx: _Ctx, *, team: str | None = None) -> int:
-    """Total rounds (``team=None``) or one team's rounds, regulation-only if configured."""
-    if not ctx.include_ot and _is_overtime(a, b):
+def rounds_value(
+    team1_rounds: int, team2_rounds: int, *, include_overtime: bool, team: str | None = None
+) -> int:
+    """Total rounds (``team=None``) or one team's rounds of a final map score, as the round-count
+    markets settle them: with ``include_overtime=False`` a map that went to overtime counts as its
+    12-12 regulation score. Shared with :mod:`cs2bot.engine.settlement`."""
+    if not include_overtime and _is_overtime(team1_rounds, team2_rounds):
         return REGULATION_ROUNDS if team is None else REGULATION_ROUNDS // 2
     if team is None:
-        return a + b
-    return a if team == SELECTION_TEAM1 else b
+        return team1_rounds + team2_rounds
+    return team1_rounds if team == SELECTION_TEAM1 else team2_rounds
+
+
+def _rounds_value(a: int, b: int, ctx: _Ctx, *, team: str | None = None) -> int:
+    """Total rounds (``team=None``) or one team's rounds, regulation-only if configured."""
+    return rounds_value(a, b, include_overtime=ctx.include_ot, team=team)
 
 
 def is_final_round_score(team1_rounds: int, team2_rounds: int) -> bool:
@@ -575,7 +653,11 @@ def _round_handicap(spec: MarketSpec, selection: str, core: PredictionCore, ctx:
     slot = _slot(core, _require_map_number(spec), ctx.fmt)
     line = _require_line(spec)
     pmf = _slot_scores(slot)
-    return _on_slot(slot, _handicap(((a - b, p) for (a, b), p in pmf.items()), line, selection))
+    margins = (
+        (_rounds_value(a, b, ctx, team=SELECTION_TEAM1) - _rounds_value(a, b, ctx, team=SELECTION_TEAM2), p)
+        for (a, b), p in pmf.items()
+    )
+    return _on_slot(slot, _handicap(margins, line, selection))
 
 
 def _total_rounds(spec: MarketSpec, selection: str, core: PredictionCore, ctx: _Ctx) -> OutcomeSplit:
@@ -636,7 +718,8 @@ def _pistol_round(spec: MarketSpec, selection: str, core: PredictionCore, ctx: _
 
 def _race_to_rounds(spec: MarketSpec, selection: str, core: PredictionCore, ctx: _Ctx) -> OutcomeSplit:
     """First team to N rounds. If N > 13 the map can end before anyone reaches N: the bet is then
-    void, and P(neither reaches N) = P(max(final score) < N) must be known from the score pmf."""
+    void. P(neither reaches N) is ``p_neither_race_to["N"]`` when the prediction carries it, else
+    P(max(final score) < N) from the score pmf (0 for N <= 13: the map winner always gets there)."""
     slot = _slot(core, _require_map_number(spec), ctx.fmt)
     line = _require_line(spec)
     if not line.is_integer() or line < 1:
@@ -646,13 +729,16 @@ def _race_to_rounds(spec: MarketSpec, selection: str, core: PredictionCore, ctx:
     if raw is None:
         raise UnpriceableMarket(f"no race-to-{target} probability for map {slot.map_number}")
     p1 = _prob(raw, f"map {slot.map_number} race to {target}")
-    if target <= ROUNDS_TO_WIN_REGULATION:
+    raw_neither = slot.p_neither_race_to.get(str(target))
+    if raw_neither is not None:
+        p_neither = _prob(raw_neither, f"map {slot.map_number} neither reaches {target}")
+    elif target <= ROUNDS_TO_WIN_REGULATION:
         p_neither = 0.0  # the map winner always reaches 13 >= N
     else:
         if not slot.score_pmf:
             raise UnpriceableMarket(
                 f"race to {target}: cannot tell how often neither team reaches {target} "
-                f"(map {slot.map_number} has no score pmf)"
+                f"(map {slot.map_number} has neither p_neither_race_to nor a score pmf)"
             )
         pmf = _slot_scores(slot)
         p_neither = math.fsum(p for (a, b), p in pmf.items() if max(a, b) < target)
