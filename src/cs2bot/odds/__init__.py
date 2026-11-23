@@ -23,6 +23,7 @@ from cs2bot.odds.collector import (
     collect_once,
     original_market_external_id,
     remap_event,
+    series_draw_possible,
 )
 from cs2bot.odds.event_matching import (
     LinkCandidate,
@@ -32,8 +33,10 @@ from cs2bot.odds.event_matching import (
     store_betclic_aliases,
 )
 from cs2bot.odds.market_mapping import (
+    MarketGuards,
     MarketMapper,
     PlayerResolver,
+    SettlementRules,
     lineup_player_resolver,
     list_unmapped,
     list_unmapped_selections,
@@ -64,12 +67,14 @@ __all__ = [
     "LinkCandidate",
     "LinkConfig",
     "LinkResult",
+    "MarketGuards",
     "MarketMapper",
     "OddsSource",
     "PayloadKeys",
     "PlayerResolver",
     "RawPayloadReplaySource",
     "RawPayloadStore",
+    "SettlementRules",
     "StaticOddsSource",
     "SupportsFetchInfo",
     "closing_odds",
@@ -87,5 +92,6 @@ __all__ = [
     "original_market_external_id",
     "remap_event",
     "run_coroutine_blocking",
+    "series_draw_possible",
     "store_betclic_aliases",
 ]

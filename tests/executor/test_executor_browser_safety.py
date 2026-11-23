@@ -167,11 +167,46 @@ def test_potential_win_cross_check_catches_a_misread_stake(
     assert dry.status is PlacementStatus.SELECTOR_ERROR
 
 
-def test_placement_works_without_a_potential_win_line(
+def test_no_bet_without_a_readable_potential_win_unless_the_owner_opted_out(
     site: MockBetclicServer, make_executor: ExecutorFactory, make_order: OrderFactory
 ) -> None:
+    """The potential win is the only check of what the site understood from the typed stake: without
+    it nothing is placed (and the dry run fails too), unless the selector file says otherwise."""
     site.state.show_potential_win = False
-    assert make_executor().place(make_order()).status is PlacementStatus.PLACED
+    strict = make_executor(tuning=replace(FAST_TUNING, element_timeout_s=0.8))
+    for order in (make_order(), make_order(dry_run=True)):
+        result = strict.place(order)
+        assert result.status is PlacementStatus.SELECTOR_ERROR, result.message
+        assert "slip_potential_win" in result.message and "require_potential_win" in result.message
+    assert site.state.place_calls == [] and site.state.slip == []
+    strict.close()
+    relaxed = make_executor(selectors=_selectors_with(require_potential_win=False))
+    assert relaxed.place(make_order()).status is PlacementStatus.PLACED
+
+
+def test_potential_win_text_without_a_single_amount_is_not_trusted(
+    site: MockBetclicServer,
+    make_executor: ExecutorFactory,
+    make_order: OrderFactory,
+    executor_settings: Settings,
+) -> None:
+    """ "Możliwa wygrana (po podatku 12%): 20,35 zł" holds two numbers: the locator must be narrowed."""
+
+    def decorate(page: Any) -> bool:
+        if page.locator("#slipWinnings").count() == 0:
+            return False
+        page.evaluate(
+            "() => { const el = document.getElementById('slipWinnings'); el.removeAttribute('id'); "
+            "el.textContent = 'Możliwa wygrana (po podatku 12%): 20,35 zł'; }"
+        )
+        return True
+
+    tuning = replace(FAST_TUNING, slip_update_timeout_s=0.8)
+    executor = _hooked_executor(make_executor, executor_settings, decorate, tuning=tuning)
+    result = executor.place(make_order())
+    assert result.status is PlacementStatus.SELECTOR_ERROR, result.message
+    assert "cannot read one amount" in result.message
+    assert site.state.place_calls == []
 
 
 def test_number_input_stake_field_gets_the_canonical_value(
@@ -425,7 +460,7 @@ def test_crash_right_after_the_click_blocks_the_key_after_a_restart(
     order = make_order()
     executor = make_executor()
 
-    def crash(_button: Any) -> None:
+    def crash(_button: Any, _attempt: Any) -> None:
         raise KeyboardInterrupt  # stands in for the process dying right at the click
 
     executor._click_place_button = crash  # type: ignore[method-assign]

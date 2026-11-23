@@ -41,6 +41,21 @@
 # The `texts` section holds Polish phrases used to classify messages (matching is accent- and
 # case-insensitive, word-prefix based: "zawieszon" matches "zawieszony"/"zawieszone"). The `patterns`
 # section holds regular expressions (group 1 = the value) for bet ids and history fields.
+#
+# BETCLIC ACCOUNT SETTINGS THE BOT RELIES ON (check them once, by hand, in the bot's browser)
+#   * Odds changes: the account must ASK before a bet is taken at changed odds (no "accept all odds
+#     changes automatically" option). With automatic acceptance Betclic takes a bet at lower odds
+#     without showing the dialog; the bot can then only report it afterwards (a WARNING on the result).
+#   * No quick-bet / one-click betting mode: clicking an outcome must only add it to the bet slip. If a
+#     bet appears right after the bot clicks an outcome, the attempt is reported as UNCERTAIN.
+#   * The DRY_RUN smoke test goes through every step except the final click: it adds the outcome to
+#     the slip, types the stake, LOCATES the "Postaw zakład" button and clears the slip again. Run it
+#     with a funded account (with a stake above the balance the site may hide or disable the button:
+#     the dry run then ends as INSUFFICIENT_BALANCE).
+#
+# AFTER THE FINAL CLICK the bot trusts a rejection message only if nothing contradicts it: when a
+# receipt shows up after all, or the header balance dropped below its value from before the click, the
+# result is UNCERTAIN (never "definitely not placed") and the bet is reconciled via "Moje zakłady".
 # =====================================================================================================
 
 version: 1
@@ -74,6 +89,13 @@ behaviour:
   #         Set to false only if the page keeps hidden duplicates of the visible slip (check the saved
   #         <...>_selector_error.html), or better: make slip_item more specific.
   count_hidden_slip_items: true
+  # true  = no bet (and no successful dry run) unless the potential win shown in the slip
+  #         (slip_potential_win) can be read and fits stake x odds. This is the only check of what
+  #         Betclic UNDERSTOOD from the typed stake (the field may show "12,50" while the site computes
+  #         with 1250). If the attempt stops with "the potential win is not shown ...", fix the
+  #         slip_potential_win locator. Set to false only if the slip really has no such line, after
+  #         checking by hand (type 12,50 and compare the potential win / the balance after one bet).
+  require_potential_win: true
 
 # DOM attributes that may carry Betclic's external ids (from the odds collector). Ids are only used to
 # tell apart markets/selections with identical names, never to override a name mismatch.
@@ -260,6 +282,17 @@ elements:
       - {text: "/wydarzenie (jest )?niedostępne|nie znaleziono (strony|wydarzenia)|mecz (już )?się (rozpoczął|zakończył)/i"}
 
   # -------------------------------------------------------------------------------- event page
+  event_live_indicator:
+    description: >-
+      Marker shown in the event header ONLY while the match is in play (live scoreboard, "Na żywo"
+      badge). The bot places pre-match bets only: when it is visible the bet is aborted with
+      MARKET_UNAVAILABLE before anything is added to the slip. Scope it to the event header - a
+      "Na żywo" link in the site navigation must NOT match (every bet would be refused).
+    verified: false
+    optional: true
+    locators:
+      - {css: "[data-qa='scoreboard-live'], [data-qa='event-live-badge']"}
+      - {css: "sports-match-header .is-live, sports-events-event-header .is-live, .scoreboard.is-live, .scoreboard_live"}
   all_markets_tab:
     description: Market filter tab showing all markets (clicked when the ordered market is not found).
     verified: false
@@ -415,9 +448,10 @@ elements:
     description: >-
       Potential payout shown in the slip ("Możliwa wygrana: 20,35 zł"), containing exactly one amount.
       Cross-check that Betclic understood the typed stake: it must lie between 70% and 105% of
-      stake x odds (0.88 after the 12% tax), otherwise the bet is aborted. Skipped when not found.
+      stake x odds (0.88 after the 12% tax), otherwise the bet is aborted. REQUIRED for betting while
+      behaviour.require_potential_win is true (not found / unreadable -> SELECTOR_ERROR, nothing is
+      placed); skipped when missing only if that flag is false.
     verified: false
-    optional: true
     locators:
       - {css: "[data-qa='betslip-potential-win'], [data-qa='betslip-winnings'], [data-qa='potential-winnings']"}
       - {css: ".betslip_winnings, .betslip_potentialWin, .betBox_winnings, .betslip_gain"}
@@ -456,18 +490,26 @@ elements:
       - {css: "[data-qa='new-odds'], .oddsChange_newOdds, .newOdds"}
       - {css: ".oddValue"}
   odds_changed_accept:
-    description: Button accepting the new odds (clicked only if new odds >= min_acceptable_odds).
+    description: >-
+      Button accepting the new odds. Clicked only if the new odds are >= min_acceptable_odds, and at
+      most ONCE per dialog. It is looked up INSIDE odds_changed_notice first, then inside the bet slip
+      (slip_container); several matches -> nothing is accepted (ODDS_MOVED). Keep the name anchored
+      (whole text): a cookie banner's "Akceptuj wszystkie" or an "Akceptuj zmiany kursów" setting must
+      never match. If the real button is worded differently, add its exact text here.
     verified: false
     locators:
-      - {role: button, name: "/akceptuj/i"}
+      - {role: button, name: "/^akceptuj( (zmian[ęy]|now[ey] kursy?|kursy?))?( i postaw( zakład)?)?$/i"}
       - {css: "[data-qa='betslip-accept-odds']"}
-      - {text: "/akceptuj( zmiany| nowe kursy| i postaw)?/i"}
+      - css: "button, [role='button'], .btn"
+        has_text: "/^\\s*akceptuj( (zmian[ęy]|now[ey] kursy?|kursy?))?( i postaw( zakład)?)?\\s*$/i"
   odds_changed_decline:
-    description: Button rejecting the new odds ("Anuluj" / "Odrzuć").
+    description: >-
+      Button rejecting the new odds ("Anuluj" / "Odrzuć"). Looked up like odds_changed_accept (inside
+      the notice, then inside the bet slip; never a look-alike elsewhere such as "Odrzuć wszystkie").
     verified: false
     optional: true
     locators:
-      - {role: button, name: "/^(anuluj|odrzuć)/i"}
+      - {role: button, name: "/^(anuluj|odrzuć)( zmian[ęy])?$/i"}
       - {css: "[data-qa='betslip-decline-odds']"}
   bet_receipt:
     description: Confirmation / receipt shown after a successful placement (contains the bet id).

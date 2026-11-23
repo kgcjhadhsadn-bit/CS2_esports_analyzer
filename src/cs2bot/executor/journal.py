@@ -20,8 +20,13 @@ profile = one journal); the profile lock guarantees a single writer. It is JSON 
 
 It never contains credentials, stakes or account data. Records older than ``retention_days`` are ignored
 and dropped by :meth:`PlacementJournal.compact` (pre-match bets cannot be re-sent weeks later: the match
-is over). A malformed line is skipped: a ``click`` record is complete (fsync) before the click happens,
-so a torn line can only belong to an attempt that never clicked.
+is over); only the process holding the profile lock may compact. A malformed line is skipped: a ``click``
+record is complete (fsync) before the click happens, so a torn line can only belong to an attempt that
+never clicked.
+
+Every record is one line of its own, whatever came before and whatever the key contains: an append first
+terminates a torn last line, the JSON is ASCII-only (``\\uXXXX`` escapes) and the reader splits on
+``\\n`` alone. A ``click`` record that could not be read back would silently unblock its key.
 """
 
 from __future__ import annotations
@@ -69,7 +74,10 @@ class JournalEntry:
         data = {"event": self.event, "key": self.key, "bet_id": self.bet_id, "at": self.at.isoformat()}
         if self.status is not None:
             data["status"] = self.status
-        return json.dumps(data, ensure_ascii=False)
+        # ASCII only: a raw U+2028 / U+0085 (or any other Unicode line break) inside a key would split
+        # the record in two for a line-based reader, and a "click" record that cannot be read back
+        # blocks nothing.
+        return json.dumps(data, ensure_ascii=True)
 
     @classmethod
     def from_json(cls, line: str) -> JournalEntry | None:
@@ -91,6 +99,12 @@ class JournalEntry:
             )
         except (ValueError, KeyError, TypeError):
             return None
+
+
+def _lines(text: str) -> list[str]:
+    """Records are separated by ``\\n`` only (``str.splitlines`` would also split on U+2028, U+0085 ...
+    inside a record written by an older version with raw non-ASCII keys)."""
+    return [line.rstrip("\r") for line in text.split("\n")]
 
 
 class PlacementJournal:
@@ -126,7 +140,7 @@ class PlacementJournal:
         cutoff = self._clock() - self.retention
         out: list[JournalEntry] = []
         skipped = 0
-        for line in text.splitlines():
+        for line in _lines(text):
             if not line.strip():
                 continue
             entry = JournalEntry.from_json(line)
@@ -169,14 +183,30 @@ class PlacementJournal:
     def _append(self, entry: JournalEntry) -> None:
         try:
             self.path.parent.mkdir(parents=True, exist_ok=True)
-            with open(self.path, "a", encoding="utf-8", newline="\n") as fh:
-                fh.write(entry.to_json() + "\n")
+            # A torn last line (the process died inside an earlier write) has no newline: without one
+            # of our own the new record would be glued to it and skipped as malformed - a "click"
+            # record that does not block is exactly what this journal must never produce.
+            prefix = b"" if self._ends_with_newline() else b"\n"
+            with open(self.path, "ab") as fh:
+                fh.write(prefix + entry.to_json().encode("utf-8") + b"\n")
                 fh.flush()
                 os.fsync(fh.fileno())
-        except OSError as exc:
+        except (OSError, ValueError) as exc:  # ValueError: a key that cannot be encoded as UTF-8
             raise JournalError(
                 f"could not write the placement journal {self.path} ({type(exc).__name__})"
             ) from exc
+
+    def _ends_with_newline(self) -> bool:
+        """Whether the journal file is empty / missing or ends with a line break (raises ``OSError``)."""
+        try:
+            with open(self.path, "rb") as fh:
+                fh.seek(0, os.SEEK_END)
+                if fh.tell() == 0:
+                    return True
+                fh.seek(-1, os.SEEK_END)
+                return fh.read(1) == b"\n"
+        except FileNotFoundError:
+            return True
 
     def compact(self) -> int:
         """Drop expired / malformed lines (atomic rewrite); returns the number of lines removed.
@@ -184,7 +214,7 @@ class PlacementJournal:
         Best effort: problems are logged, never raised (the journal keeps working uncompacted).
         """
         try:
-            raw_lines = [ln for ln in self.path.read_text(encoding="utf-8").splitlines() if ln.strip()]
+            raw_lines = [ln for ln in _lines(self.path.read_text(encoding="utf-8")) if ln.strip()]
         except FileNotFoundError:
             return 0
         except (OSError, UnicodeDecodeError) as exc:

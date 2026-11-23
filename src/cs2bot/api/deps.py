@@ -175,7 +175,7 @@ class PageParams:
 def page_params(
     ctx: Ctx,
     limit: Annotated[int | None, Query(ge=1, description="Page size")] = None,
-    offset: Annotated[int, Query(ge=0, description="Rows to skip")] = 0,
+    offset: Annotated[int, Query(ge=0, le=2**31 - 1, description="Rows to skip")] = 0,
 ) -> PageParams:
     size = ctx.options.default_page_size if limit is None else min(limit, ctx.options.max_page_size)
     return PageParams(limit=size, offset=offset)

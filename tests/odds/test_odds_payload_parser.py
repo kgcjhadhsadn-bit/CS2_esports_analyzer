@@ -325,3 +325,44 @@ def test_market_named_like_a_match_with_a_date_is_not_a_nested_event() -> None:
     (only,) = extract_events([payload])
     assert [m.raw_name for m in only.markets] == ["Mapa 1 - liczba rund"]
     assert only.url is None  # image URLs are not event URLs
+
+
+def test_prefixed_market_names_keep_their_page_title_and_group() -> None:
+    """The map group is prefixed for the mapper; the title the page shows is not lost."""
+    from cs2bot.odds.payload_parser import extract_event_records
+
+    html = (FIXTURES / "betclic_event_page.html").read_text(encoding="utf-8")
+    records = {r.external_id: r for r in extract_event_records(extract_json_documents(html))}
+    meta = records["1001234567"].market_meta()
+    assert meta[("Mapa 2 - Zwycięzca", "1218288612810021")] == {"page_name": "Zwycięzca", "group": "Mapa 2"}
+    # names that already carry their map are stored as shown: no meta
+    assert not any(key[0] == "Handicap rund - mapa 1" for key in meta)
+
+
+def test_polish_display_dates_are_day_first_local_time() -> None:
+    def start(value: object) -> datetime | None:
+        payload = {
+            "id": 1,
+            "contestants": [{"name": "A"}, {"name": "B"}],
+            "startDate": value,
+            "markets": [{"name": "Zwycięzca meczu", "selections": [{"name": "A", "odds": "1,85"}]}],
+        }
+        (found,) = extract_events([payload])
+        return found.starts_at
+
+    # 5 November (not 11 May), 18:00 in Warsaw = 17:00 UTC in winter
+    assert start("05.11.2026 18:00") == datetime(2026, 11, 5, 17, tzinfo=UTC)
+    assert start("5/7/2026 20:30") == datetime(2026, 7, 5, 18, 30, tzinfo=UTC)  # summer time: UTC+2
+    # ISO timestamps keep their meaning: offset respected, none = UTC
+    assert start("2026-11-05T18:00:00") == datetime(2026, 11, 5, 18, tzinfo=UTC)
+    assert start("2026-11-05T18:00:00+01:00") == datetime(2026, 11, 5, 17, tzinfo=UTC)
+    assert start("31.31.2026 18:00") is None and start("soon") is None
+
+
+def test_category_ids_must_be_a_list() -> None:
+    doc = {"matchId": 1, "categories": [1, None, {"id": 5}, {"id": "ca_x"}], "categoryIds": "abc"}
+    assert find_match_categories([doc], "1") == ["ca_x"]
+    assert find_match_categories([{"id": 1, "categoryIds": ["ca_a", 3, "ca_a", "ca_b"]}], "1") == [
+        "ca_a",
+        "ca_b",
+    ]

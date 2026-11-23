@@ -12,7 +12,15 @@ from typing import Any
 from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session, selectinload
 
-from cs2bot.api.ev import breakeven_odds, effective_odds, ev_after_tax, fair_odds
+from cs2bot.api.analytics import OPEN_STATUSES, bet_result, effective_status
+from cs2bot.api.ev import (
+    TaxTerms,
+    breakeven_odds,
+    effective_odds,
+    ev_after_tax,
+    fair_odds,
+    p_win_given_settled,
+)
 from cs2bot.api.formatting import (
     age_seconds,
     describe_outcome,
@@ -363,13 +371,13 @@ def unmapped_selection_count(session: Session, match_id: int) -> int:
     return int(session.scalar(stmt) or 0)
 
 
-def _ev_for(pred: PredRow, sel: SelRow, tax_rate: Decimal) -> float | None:
+def _ev_for(pred: PredRow, sel: SelRow, tax: TaxTerms) -> float | None:
     if sel.odds is None or sel.odds <= 0:
         return None
-    return ev_after_tax(pred.p_win, sel.odds, tax_rate, p_push=pred.p_push, p_void=pred.p_void)
+    return ev_after_tax(pred.p_win, sel.odds, tax, p_push=pred.p_push, p_void=pred.p_void)
 
 
-def best_ev_by_match(session: Session, match_ids: Collection[int], tax_rate: Decimal) -> dict[int, float]:
+def best_ev_by_match(session: Session, match_ids: Collection[int], tax: TaxTerms) -> dict[int, float]:
     """Highest after-tax EV among available, pre-match bookmaker prices that have a model price."""
     preds = latest_predictions(session, match_ids)
     sels = mapped_selections(session, match_ids)
@@ -382,7 +390,7 @@ def best_ev_by_match(session: Session, match_ids: Collection[int], tax_rate: Dec
             pred = by_key.get((sel.spec_key, sel.selection_key))
             if pred is None:
                 continue
-            ev = _ev_for(pred, sel, tax_rate)
+            ev = _ev_for(pred, sel, tax)
             if ev is not None and (match_id not in out or ev > out[match_id]):
                 out[match_id] = ev
     return out
@@ -413,12 +421,12 @@ def analysed_match_ids(session: Session, match_ids: Collection[int]) -> set[int]
     return {int(r) for r in rows}
 
 
-def match_summaries(session: Session, matches: Sequence[Match], tax_rate: Decimal) -> list[MatchSummary]:
+def match_summaries(session: Session, matches: Sequence[Match], tax: TaxTerms) -> list[MatchSummary]:
     ids = [m.id for m in matches]
     events = events_by_match(session, ids)
     counts = accepted_outcome_counts(session, ids)
     analysed = analysed_match_ids(session, ids)
-    best = best_ev_by_match(session, ids, tax_rate)
+    best = best_ev_by_match(session, ids, tax)
     out: list[MatchSummary] = []
     for m in matches:
         primary = primary_event(events.get(m.id, []))
@@ -494,10 +502,18 @@ def decision_brief(row: BetDecisionRow) -> DecisionBrief:
     )
 
 
+def bet_effective_status(bet: Bet) -> BetStatus:
+    """won / lost / void also for a settled paper bet (see :func:`cs2bot.api.analytics.effective_status`)."""
+    return effective_status(
+        bet.status, extra=bet.extra, pnl=to_decimal(bet.pnl), settled_at=utc(bet.settled_at)
+    )
+
+
 def bet_brief(bet: Bet) -> BetBrief:
     return BetBrief(
         id=bet.id,
         status=bet.status,
+        result=bet_result(bet_effective_status(bet)),
         dry_run=bool(bet.dry_run),
         stake=money_str0(bet.stake),
         requested_odds=odds_str(bet.requested_odds),
@@ -561,6 +577,7 @@ def bet_out(
     t1, t2 = team_names(match)
     spec = parse_spec_key(bet.spec_key)
     has_screenshot = bool(bet.screenshot_path)
+    effective = bet_effective_status(bet)
     return BetOut(
         id=bet.id,
         match_id=bet.match_id,
@@ -582,6 +599,8 @@ def bet_out(
         tax=money_str0(bet.tax),
         potential_payout=money_str(bet.potential_payout),
         status=bet.status,
+        result=bet_result(effective),
+        is_open=effective in OPEN_STATUSES,
         dry_run=bool(bet.dry_run),
         external_bet_id=bet.external_bet_id,
         has_screenshot=has_screenshot,
@@ -608,7 +627,7 @@ def build_market_rows(
     session: Session,
     match: Match,
     *,
-    tax_rate: Decimal,
+    tax: TaxTerms,
     now: datetime,
     odds_max_age_s: float,
     extra_players: Mapping[int, str] | None = None,
@@ -663,10 +682,13 @@ def build_market_rows(
                 p_push=round_or_none(pred.p_push),
                 p_void=round_or_none(pred.p_void),
                 p_lose=round_or_none(max(0.0, 1.0 - pred.p_win - pred.p_push - pred.p_void)),
+                p_win_settled=round_or_none(
+                    p_win_given_settled(pred.p_win, p_push=pred.p_push, p_void=pred.p_void)
+                ),
                 sigma=round_or_none(pred.sigma),
                 fair_odds=odds_str(fair_odds(pred.p_win, p_push=pred.p_push, p_void=pred.p_void)),
                 breakeven_odds=odds_str(
-                    breakeven_odds(pred.p_win, tax_rate, p_push=pred.p_push, p_void=pred.p_void)
+                    breakeven_odds(pred.p_win, tax, p_push=pred.p_push, p_void=pred.p_void)
                 ),
             )
         if sel is not None:
@@ -677,7 +699,7 @@ def build_market_rows(
                 market_raw=sel.market_raw,
                 selection_raw=sel.selection_raw,
                 odds=odds_str(sel.odds),
-                effective_odds=odds_str(effective_odds(sel.odds, tax_rate)) if sel.odds is not None else None,
+                effective_odds=odds_str(effective_odds(sel.odds, tax)) if sel.odds is not None else None,
                 odds_captured_at=sel.odds_at,
                 odds_age_s=age,
                 odds_stale=(age is None or age > odds_max_age_s),
@@ -685,7 +707,7 @@ def build_market_rows(
                 event_is_live=sel.event_is_live,
             )
         if pred is not None and sel is not None:
-            row["ev"] = round_or_none(_ev_for(pred, sel, tax_rate))
+            row["ev"] = round_or_none(_ev_for(pred, sel, tax))
         decision = decisions.get(key)
         if decision is not None:
             row["decision"] = decision_brief(decision)

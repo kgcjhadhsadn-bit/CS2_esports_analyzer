@@ -36,6 +36,9 @@ class InputModel(BaseModel):
 
 AlertLevel = Literal["critical", "warning", "info"]
 BankrollMode = Literal["real", "dry_run"]
+# Settlement result of a bet. Paper bets keep ``status = "dry_run"`` after settlement, so clients
+# should read ``result`` (``None`` = not settled) rather than ``status`` to tell won / lost / void.
+BetResult = Literal["won", "lost", "void"]
 
 # --------------------------------------------------------------------------------------------
 # shared references
@@ -203,6 +206,7 @@ class DecisionBrief(BaseModel):
 class BetBrief(BaseModel):
     id: int
     status: BetStatus
+    result: BetResult | None = None
     dry_run: bool
     stake: str
     requested_odds: str | None = None
@@ -227,6 +231,7 @@ class MarketRow(BaseModel):
     p_push: float | None = None
     p_void: float | None = None
     p_lose: float | None = None
+    p_win_settled: float | None = None
     sigma: float | None = None
     fair_odds: str | None = None
     breakeven_odds: str | None = None
@@ -310,6 +315,8 @@ class BetOut(BaseModel):
     tax: str
     potential_payout: str | None = None
     status: BetStatus
+    result: BetResult | None = None
+    is_open: bool = False
     dry_run: bool
     external_bet_id: str | None = None
     has_screenshot: bool = False
@@ -411,6 +418,7 @@ class LossLimitOut(BaseModel):
     open_stakes: str
     worst_case_pnl: str
     remaining: str
+    stake_allowance: str
     used_fraction: float
     reached: bool
 
@@ -471,6 +479,7 @@ class BankrollOut(BaseModel):
     as_of: datetime
     balance: str
     balance_source: Literal["ledger", "starting_bankroll", "paper"]
+    available_balance: str
     open_exposure: str
     open_bets: int
     bankroll_reference: str
@@ -636,7 +645,7 @@ class ReviewPage(BaseModel):
 
 class ReviewActionIn(InputModel):
     action: Literal["confirm", "reject", "relink"]
-    match_id: int | None = None
+    match_id: int | None = Field(default=None, ge=1, le=2**31 - 1)
     teams_swapped: bool | None = None
 
 
@@ -785,6 +794,29 @@ class JobHealth(BaseModel):
     consecutive_failures: int
     expected_interval_s: float | None = None
     stale: bool
+    # from the built-in scheduler (``None`` when the API has no scheduler status)
+    scheduled: bool | None = None
+    next_due_at: datetime | None = None
+    scheduler_failures: int | None = None
+
+
+class SchedulerJobOut(BaseModel):
+    """One job of the built-in scheduler (``cs2bot.flows.scheduler.Scheduler.status``)."""
+
+    name: str
+    lane: str | None = None
+    enabled: bool = True
+    last_run_at: datetime | None = None
+    next_due_at: datetime | None = None
+    due_in_s: float | None = None  # negative = that many seconds past its due time
+    failures: int = 0  # consecutive failed runs (drives the scheduler's back-off)
+    running: bool = False
+    overdue: bool = False
+
+
+class SchedulerOut(BaseModel):
+    ok: bool  # False: the status provider raised
+    jobs: list[SchedulerJobOut] = Field(default_factory=list)
 
 
 class ExecutorHealthOut(BaseModel):
@@ -829,6 +861,7 @@ class HealthOut(BaseModel):
     dry_run: bool
     executor: ExecutorHealthOut
     jobs: list[JobHealth] = Field(default_factory=list)
+    scheduler: SchedulerOut | None = None  # None: no scheduler runs in this process
     freshness: FreshnessOut | None = None
     pending_link_reviews: int | None = None
     alerts: list[HealthAlert] = Field(default_factory=list)

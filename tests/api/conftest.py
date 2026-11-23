@@ -42,6 +42,7 @@ def app_factory(session_factory: sessionmaker[Session], tmp_path: Path) -> AppFa
         login_launcher: Callable[[], None] | None = None,
         executor_health_provider: Any = None,
         event_remapper: Any = None,
+        scheduler_status_provider: Any = None,
         options: ApiOptions | None = None,
         now: datetime = NOW,
         **sections: Any,
@@ -52,6 +53,7 @@ def app_factory(session_factory: sessionmaker[Session], tmp_path: Path) -> AppFa
             login_launcher=login_launcher,
             executor_health_provider=executor_health_provider,
             event_remapper=event_remapper,
+            scheduler_status_provider=scheduler_status_provider,
             options=options,
         )
         app.state.cs2bot.clock = lambda: now

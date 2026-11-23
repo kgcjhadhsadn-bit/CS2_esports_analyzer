@@ -44,11 +44,18 @@ section of the YAML):
 * **three-way markets** - when the sibling selections of a two-way market type contain a draw
   (``"Remis"``, ``"X"``), the market is a regulation-time / European-handicap variant and stays
   unmapped; a head-to-head kills market listing a draw is mapped only when ``h2h_tie_rule`` is
-  ``"lose"`` (with ``"push"`` the pricing engine would treat a tie as a refund);
+  ``"lose"`` (with ``"push"`` the pricing engine would treat a tie as a refund); a match-winner
+  market listing a draw is mapped only when the series can end level (``draw_possible``: the
+  collector passes ``False`` unless the linked match is a BO2 - in a BO1/BO3/BO5 a "1 X 2" market
+  is a regulation-time market, where the team selections lose on an overtime); an over/under
+  market that also lists an "exactly N" outcome (``"Dokładnie 21"``) is three-way too (the
+  two-way spec would price a result on the line as a refund);
 * **selection residue** - an over/under, yes/no or odd/even selection carrying anything else (a
   team, a second condition) is a combined outcome and stays unmapped;
 * **scope** - player kill lines need an explicit scope (a map, several maps or the whole match)
   and a name referring to several maps (``"Mapa 1+2"``) is never read as a single map;
+* **team as player** - a "player" that is really one of the event's teams (``"Liczba zabójstw -
+  Natus Vincere"`` is a TEAM kills market) is never resolved to a player;
 * **line bounds** - lines outside what the market type can offer (a map handicap of 4.5) are a
   sign of a mis-read market and stay unmapped.
 
@@ -181,11 +188,16 @@ _HALF_RES = (
 _HALF_ORDINAL_RE = re.compile(r"\b(pierwsz|drug|first|second)[a-z]*\s+(?:polow|half)")
 # an explicit whole-match scope ("Zabójstwa gracza - mecz", "... w meczu", "match")
 _MATCH_SCOPE_RE = re.compile(r"\bmecz(?:u|em)?\b|\bmatch\b")
-_MATCH_SCOPE_SEGMENT_RE = re.compile(r"^(?:(?:w|na|in the|whole|full|entire|caly|calym)\s+)*(?:mecz(?:u|em)?|match)$")
+_MATCH_SCOPE_SEGMENT_RE = re.compile(
+    r"^(?:(?:w|na|in the|whole|full|entire|caly|calym)\s+)*(?:mecz(?:u|em)?|match)$"
+)
 # words that may accompany a line in an over/under selection without changing its meaning
 _UNIT_WORDS_RE = re.compile(
-    r"(?<![a-z0-9])(?:rund\w*|rounds?|map\w*|zabojstw\w*|kills?|frag\w*|w|na|in|of|lub wiecej|or more)(?![a-z0-9])"
+    r"(?<![a-z0-9])(?:rund\w*|rounds?|map\w*|zabojstw\w*|kills?|frag\w*|w|na|in|of|lub wiecej|or more)"
+    r"(?![a-z0-9])"
 )
+# a third outcome next to over/under: "Dokładnie 21", "Exactly 21", "Równo 21"
+_EXACT_OUTCOME_RE = re.compile(r"(?<![a-z0-9])(?:dokladnie|exactly|rowno|equal(?:s| to)?)(?![a-z0-9])")
 _MAP_REF_ANY_RE = re.compile(r"\bmap[a-z]*\s*(?:nr\.?\s*)?\d|(?<![\d.,])\d\s*\.?\s*map[a-z]*\b|\bmap[a-z]*$")
 _SEGMENT_SPLIT_RE = re.compile(r"\s+-\s+|:|\(|\)|\||/|,|;")
 # "Natus Vincere / Remis", "NAVI i Tak", "NAVI & Powyżej 2,5": combined outcomes, never a plain team
@@ -206,7 +218,11 @@ DEFAULT_WORDS: dict[str, tuple[str, ...]] = {
 # --- guards (see the module docstring); YAML section "guards:" overrides these defaults -------------
 DEFAULT_EXCLUDES_OVERTIME: tuple[str, ...] = (
     r"\(?\s*bez (?:dogrywki|dogrywek|dogrywka|ot)\b\s*\)?",
+    # "nie wliczając dogrywki" must be consumed before the "wliczając dogrywkę" (included) pattern
+    r"\(?\s*(?:nie wliczajac|nie liczac|z wylaczeniem|wylaczajac|z pominieciem|pomijajac) "
+    r"(?:dogrywk\w+|ot)\b\s*\)?",
     r"\(?\s*(?:tylko )?(?:w )?(?:regulaminow|podstawow)\w* czas\w*(?: gry)?\s*\)?",
+    r"\(?\s*(?:tylko )?(?:w )?czas\w*(?: gry)? (?:regulaminow|podstawow)\w*\s*\)?",
     r"\(?\s*(?:regular|regulation|normal) time\s*\)?",
     r"\(?\s*\bregulation\b\s*\)?",
     r"\(?\s*(?:excl(?:\.|uding)?|without|no|w/o) (?:overtime|ot)\b\s*\)?",
@@ -421,6 +437,7 @@ class _Raw:
     score: tuple[int, int] | None = None  # bookmaker team1 first
     sel_player: str | None = None
     match_scope: bool = False  # the name states the whole match ("... w meczu")
+    rule_id: str = ""  # id of the YAML rule that produced this mapping
 
     def signature(self) -> str:
         players = sorted(p for p in (self.player, self.opponent) if p)
@@ -534,9 +551,7 @@ class MarketMapper:
             raise ValueError(f"{resolved}: top level must be a mapping")
         return cls.from_dict(data, source=str(resolved), settlement=settlement)
 
-    def with_settlement(
-        self, *, totals_include_overtime: bool, h2h_tie_rule: str
-    ) -> MarketMapper:
+    def with_settlement(self, *, totals_include_overtime: bool, h2h_tie_rule: str) -> MarketMapper:
         """This mapper bound to the given settlement assumptions (``self`` when nothing changes)."""
         if h2h_tie_rule not in get_args(H2HTieRule):
             raise ValueError(f"h2h_tie_rule must be 'push' or 'lose', got {h2h_tie_rule!r}")
@@ -613,21 +628,46 @@ class MarketMapper:
         swapped: bool,
         player_resolver: PlayerResolver | None = None,
         sibling_selections: Sequence[str] | None = None,
+        draw_possible: bool | None = None,
     ) -> MappedSelection | None:
         """Map one selection; ``None`` = unknown market/selection (stored unmapped, never bet).
 
         ``event`` supplies the bookmaker team names; ``swapped`` is
         ``bookmaker_events.teams_swapped``; ``sibling_selections`` (all selection names of the
-        market) lets head-to-head markets find the opponent when the market name omits it.
+        market) lets head-to-head markets find the opponent when the market name omits it and
+        drives the three-way guards. ``draw_possible`` says whether the linked series can end
+        level (``True`` only for a BO2; ``None`` = unknown, no check): with ``False`` a
+        match-winner market that lists a draw stays unmapped (see the module docstring).
         """
         try:
-            raw = self._match_raw(market_raw, selection_raw, event, sibling_selections)
+            raw = self._match_raw(market_raw, selection_raw, event, sibling_selections, draw_possible)
             if raw is None:
                 return None
             return self._orient(raw, swapped, player_resolver)
         except Exception:  # defensive: a weird label must never break a collection run
             logger.debug("mapping failed for %r / %r", market_raw, selection_raw, exc_info=True)
             return None
+
+    def mapping_rule(
+        self,
+        market_raw: str,
+        selection_raw: str,
+        *,
+        event: CollectedEvent,
+        sibling_selections: Sequence[str] | None = None,
+        draw_possible: bool | None = None,
+    ) -> str | None:
+        """Id of the rule that maps this selection (before player resolution), else ``None``.
+
+        Unlike :meth:`match_rule` (first rule whose patterns fit the *name*), this is the rule
+        that actually produced the mapping: ``"Liczba rund - mapa 1"`` first fits
+        ``team_total_rounds`` but is mapped by ``total_rounds``.
+        """
+        try:
+            raw = self._match_raw(market_raw, selection_raw, event, sibling_selections, draw_possible)
+        except Exception:
+            return None
+        return raw.rule_id if raw is not None else None
 
     def group_key(
         self,
@@ -655,6 +695,7 @@ class MarketMapper:
         selection_raw: str,
         event: CollectedEvent,
         siblings: Sequence[str] | None,
+        draw_possible: bool | None = None,
     ) -> _Raw | None:
         folded_selection = fold_text(selection_raw)
         prepared = self.guards.prepare(fold_text(market_raw))
@@ -667,9 +708,10 @@ class MarketMapper:
             m = rule.market_matches(folded_market)
             if m is None:
                 continue
-            raw = self._apply(rule, m, folded_market, folded_selection, event, siblings)
+            raw = self._apply(rule, m, folded_market, folded_selection, event, siblings, draw_possible)
             if raw is None:
                 continue
+            raw.rule_id = rule.id
             # A recognised market that fails a guard stays unmapped: never fall through to a
             # more generic rule that would read it as something else.
             if not self._settlement_ok(raw.market_type, overtime):
@@ -705,6 +747,7 @@ class MarketMapper:
         fs: str,
         event: CollectedEvent,
         siblings: Sequence[str] | None,
+        draw_possible: bool | None = None,
     ) -> _Raw | None:
         raw = _Raw(rule.market_type)
         groups = {k: v for k, v in m.groupdict().items() if v is not None}
@@ -766,8 +809,12 @@ class MarketMapper:
             if pair is not None:
                 raw.player, raw.opponent = pair
         # ---- selection
-        if not self._parse_selection(rule, raw, fs, event, market_line, siblings):
+        if not self._parse_selection(rule, raw, fs, event, market_line, siblings, draw_possible):
             return None
+        # ---- a "player" that is one of the event's teams: a team market, not a player market
+        for name in (raw.player, raw.opponent, raw.sel_player):
+            if name is not None and self._is_event_team(name, event):
+                return None
         # ---- requirements
         checks = {
             "map": raw.map_number is not None,
@@ -791,6 +838,7 @@ class MarketMapper:
         event: CollectedEvent,
         market_line: Decimal | None,
         siblings: Sequence[str] | None,
+        draw_possible: bool | None = None,
     ) -> bool:
         kind = rule.selection
         vocab = self.vocabulary
@@ -799,6 +847,15 @@ class MarketMapper:
         if kind in ("team", "team_line") and self._has_draw_sibling(siblings):
             # a two-way market type offered three-way (regulation time / European handicap): the
             # team selections lose on the draw, which the two-way spec would price as a win or push
+            return False
+        if (
+            kind == "team_draw"
+            and raw.market_type is MarketType.MATCH_WINNER
+            and draw_possible is False
+            and (vocab.is_draw(fs) or self._has_draw_sibling(siblings))
+        ):
+            # "1 X 2" on a series that cannot end level (BO1 / BO3 / BO5): a regulation-time
+            # market - the team selections lose when the deciding map goes to overtime
             return False
         if kind in ("team", "team_draw"):
             if kind == "team_draw" and vocab.is_draw(fs):
@@ -817,6 +874,8 @@ class MarketMapper:
                 return False
             if _COMBO_RE.search(fs):
                 return False  # "Powyżej 2,5 i Natus Vincere": a combined outcome
+            if any(_EXACT_OUTCOME_RE.search(fold_text(s)) for s in siblings or ()):
+                return False  # over / exactly / under: a result on the line loses, it is no refund
             word, line, before, after = found
             raw.sel = word
             if line is None:
@@ -1008,6 +1067,18 @@ class MarketMapper:
         if s_best - s_other >= self.vocabulary.team_margin or r_best - r_other >= self.vocabulary.team_margin:
             return best
         return None
+
+    @staticmethod
+    def _is_event_team(name: str, event: CollectedEvent) -> bool:
+        """Is ``name`` exactly one of the event's teams (after normalisation / known aliases)?
+
+        Deliberately exact: team-prefixed nicknames (``"NAVI s1mple"``) are still players.
+        """
+        target = normalize_team_name(name)
+        return bool(target) and target in (
+            normalize_team_name(event.team1_raw),
+            normalize_team_name(event.team2_raw),
+        )
 
     def _team_in_text(self, folded: str, event: CollectedEvent) -> int | None:
         """Slot of the single event team whose name appears in a (folded) market name."""

@@ -26,11 +26,24 @@ Contents: [Conventions](#conventions) · [Security](#security) · [Auth](#auth) 
 | `from` / `to` | inclusive bounds |
 | Errors | `{"detail": "..."}`; validation errors (422) use FastAPI's shape `{"detail": [{"loc": [...], "msg": "...", "type": "..."}]}` |
 | Status codes | 400 bad Host header · 401 not logged in · 403 CSRF check failed · 404 not found · 409 conflict · 422 invalid input · 429 too many failed logins · 501 not configured · 503 database unavailable |
+| Ids | 32-bit integers; an id outside that range in the path, query or body is a 422 (never a 500) |
 
 **EV** shown by the API is per 1 unit of gross stake after the Polish stake tax
 (`settings.effective_tax_rate`, 0.12, or 0 during a "bez podatku" promo), with pushes / voids
-refunded: `EV = p_win * (1 - tax) * odds + p_push + p_void - 1`. The 10% tax on wins above 2280 PLN
+refunded: `EV = p_win * (1 - tax) * odds + (p_push + p_void) * (1 - c) - 1`, where `c` is 0 by
+default and the stake tax rate when `betclic.void_refunds_stake_tax` is off (a refund then costs
+the tax). This is the engine's formula for a small stake; the 10% tax on wins above 2280 PLN
 depends on the stake and is not included in the displayed EV.
+
+**Probabilities are unconditional.** `p_win + p_push + p_void + p_lose = 1`; a market on a map that
+may not be played (e.g. the winner of map 3) carries that chance in `p_void`. `p_win_settled =
+p_win / (1 - p_push - p_void)` is the probability of winning given the bet is not refunded - the
+number the decision engine compares with `min_probability`, and the one used for calibration.
+
+**Paper (dry-run) bets** keep `status: "dry_run"` for their whole life: the settlement job stores
+the paper result on the row instead of changing the status. Read **`result`** (`"won"` / `"lost"` /
+`"void"` / `null` = not settled) and `is_open` rather than `status` to show how a bet ended; every
+statistic of the API (bankroll, P&L, hit rate, calibration, per-market performance) already does.
 
 ---
 
@@ -39,7 +52,8 @@ depends on the stake and is not included in the displayed EV.
 The API is meant for the local machine only. Every request passes, in order:
 
 1. **Host allow-list (DNS rebinding).** The `Host` header must be `127.0.0.1`, `localhost` or
-   `[::1]` (or the configured `api.host` when it is not loopback), either without a port, with
+   `[::1]` (or the configured `api.host` when it is not loopback, or a name listed in
+   `api.allowed_hosts`), either without a port, with
    `api.port`, or with the port of an entry in `api.cors_origins` (so a Vite dev proxy that keeps
    `Host: localhost:5173` works). Anything else gets **400** `{"detail": "invalid host header"}`.
 2. **CORS** only for `api.cors_origins` (default `http://localhost:5173`), credentials allowed,
@@ -78,7 +92,9 @@ endpoint is then open and `/api/auth/me` says `auth_enabled: false`. When a pass
 The session cookie `cs2bot_session` is an `itsdangerous`-signed token (`api.session_secret`; a
 random per-process secret if unset), `HttpOnly`, `SameSite=Strict`, `Path=/`,
 `Max-Age=api.session_max_age_s` (12 h). Changing the username or password invalidates all sessions.
-5 failed logins per client within 5 minutes (20 overall) -> **429** with `Retry-After`.
+`api.login_max_failures` (5) failed logins per client within `api.login_window_s` (300 s), or
+`api.login_global_max_failures` (20) overall, -> **429** with `Retry-After`. The OpenAPI schema and
+`/api/docs` are public too (they contain no data).
 
 ### `GET /api/auth/me`
 
@@ -113,21 +129,33 @@ Unauthenticated liveness probe: `{"status": "ok"}`.
 
 ### `GET /api/health`
 
-DB check, job runs (`job_runs`), data freshness, executor health, trading state and alerts. It
-never fails with 5xx because of the database: `db.ok` becomes `false` instead.
+DB check, job runs (`job_runs`), scheduler status, data freshness, executor health, trading state
+and alerts. It never fails with 5xx because of the database: `db.ok` becomes `false` instead.
 
 * `status`: `ok` | `warning` | `critical` (worst alert level; `info` alerts keep `ok`).
 * `executor.source`: `provider` (live callback given to `create_app`), `system_state`
   (`system_state["executor_health"]` written by the executor) or `none`.
-* `jobs[]`: one entry per job name: last run, last success, consecutive failures, `kind` (classified
-  from the name: `odds`, `predict`, `settle`, `bet`, `results`, `news`, `demos`, `rankings`,
-  `retrain`, `backup`, `reconcile`, `upcoming`), the expected interval from `SchedulerSettings`,
-  and `stale` (last success older than `2 x interval + 10 min`).
+* `jobs[]`: one entry per job name found in `job_runs`: last run, last success, consecutive
+  failures, `kind` (classified from the name: `odds`, `predict`, `settle`, `bet`, `results`, `news`,
+  `demos`, `rankings`, `retrain`, `backup`, `reconcile`, `upcoming`), the expected interval from
+  `SchedulerSettings`, and `stale` (last success older than `2 x interval + 10 min`).
+  With a scheduler (below) each entry also has `scheduled` (the scheduler runs it and it is
+  enabled), `next_due_at` and `scheduler_failures`; a job that is **not** scheduled is never `stale`.
+  Without a scheduler these three fields are `null`.
+* `scheduler`: `null` when no scheduler runs in the API's process (e.g. `cs2bot api` on its own).
+  Otherwise `{"ok", "jobs": [...]}` from `Scheduler.status()` - one entry per scheduler job, also
+  those that never ran: `lane`, `enabled`, `last_run_at`, `next_due_at`, `due_in_s` (negative =
+  past due), `failures` (consecutive failed runs, drives the back-off), `running` (a live run is
+  recorded in `job_runs`) and `overdue` (enabled, due more than 15 min ago, and nothing is running
+  in its lane - the scheduler thread is probably dead). `ok: false` = the status call failed.
 * Alert codes: `db_unreachable`, `db_error`, `kill_switch_on`, `trading_paused`,
   `loss_limit_reached`, `betclic_login_required`, `executor_unhealthy`, `executor_selectors_failing`,
   `executor_health_stale`, `executor_health_unknown`, `executor_health_error`, `executor_disabled`,
   `dry_run_on`, `odds_collector_stale`, `odds_collector_never_ran`, `job_stale`, `job_failing`,
-  `job_stuck`, `link_review_pending`, `bankroll_unavailable`. Sorted critical -> warning -> info.
+  `job_stuck`, `scheduler_job_overdue`, `scheduler_job_disabled`, `scheduler_status_error`,
+  `link_review_pending`, `bankroll_unavailable`. Sorted critical -> warning -> info.
+  `dry_run_on`, `executor_disabled`, `executor_health_unknown`, `scheduler_job_disabled` and
+  `link_review_pending` are `info` (paper trading is the default mode and does not degrade `status`).
 
 ```json
 {
@@ -153,9 +181,25 @@ never fails with 5xx because of the database: `db.ok` becomes `false` instead.
       "last_started_at": "2026-11-20T11:58:00Z", "last_finished_at": "2026-11-20T11:59:00Z",
       "age_s": 120.0, "duration_s": 60.0, "items": 3, "error": null,
       "last_success_at": "2026-11-20T11:59:00Z", "last_success_age_s": 60.0,
-      "consecutive_failures": 0, "expected_interval_s": 180.0, "stale": false
+      "consecutive_failures": 0, "expected_interval_s": 180.0, "stale": false,
+      "scheduled": true, "next_due_at": "2026-11-20T12:01:00Z", "scheduler_failures": 0
     }
   ],
+  "scheduler": {
+    "ok": true,
+    "jobs": [
+      {
+        "name": "odds_collect", "lane": "fast", "enabled": true,
+        "last_run_at": "2026-11-20T11:58:00Z", "next_due_at": "2026-11-20T12:01:00Z",
+        "due_in_s": 60.0, "failures": 0, "running": false, "overdue": false
+      },
+      {
+        "name": "predict_upcoming", "lane": "fast", "enabled": true,
+        "last_run_at": "2026-11-20T09:00:00Z", "next_due_at": "2026-11-20T09:15:00Z",
+        "due_in_s": -9900.0, "failures": 0, "running": false, "overdue": true
+      }
+    ]
+  },
   "freshness": {
     "last_odds_snapshot_at": "2026-11-20T11:00:00Z", "last_odds_snapshot_age_s": 3600.0,
     "last_event_seen_at": "2026-11-20T11:58:00Z", "last_event_seen_age_s": 120.0,
@@ -167,8 +211,9 @@ never fails with 5xx because of the database: `db.ok` becomes `false` instead.
   "pending_link_reviews": 2,
   "alerts": [
     {"level": "critical", "code": "betclic_login_required", "message": "Betclic login required: open the login window and sign in"},
-    {"level": "warning", "code": "dry_run_on", "message": "Dry-run mode is ON: bets are simulated, no real money is placed"},
+    {"level": "warning", "code": "scheduler_job_overdue", "message": "Job 'predict_upcoming' is overdue by 2.8 h - is the scheduler running?"},
     {"level": "warning", "code": "job_failing", "message": "Job 'settle_bets' failing (3 consecutive failures): RuntimeError: boom"},
+    {"level": "info", "code": "dry_run_on", "message": "Dry-run mode is ON: bets are simulated, no real money is placed"},
     {"level": "info", "code": "link_review_pending", "message": "2 Betclic event(s) need link review (never bet until confirmed)"}
   ]
 }
@@ -246,9 +291,12 @@ Everything for the match page. 404 if unknown.
 * `markets`: one row per outcome. Latest predictions (`is_latest`) are joined on
   `(spec_key, selection_key)` with the mapped selections of **auto/confirmed** events. A
   prediction without a price has `odds: null`; a price without a model probability has
-  `p_win: null`. `fair_odds` = break-even odds without tax, `breakeven_odds` = smallest odds with
-  `EV >= 0` after tax, `odds_stale` = price older than `betclic.odds_max_age_s`. `decision` is the
-  latest decision for the outcome, `bet` the most relevant bet. Sorted by market taxonomy order.
+  `p_win: null`. `p_win` / `p_push` / `p_void` / `p_lose` are unconditional; `p_win_settled` =
+  P(win | not refunded) is what the engine compares with `min_probability`. `fair_odds` =
+  break-even odds without tax, `breakeven_odds` = smallest odds with `EV >= 0` after tax,
+  `odds_stale` = price older than `betclic.odds_max_age_s`. `decision` is the latest decision for
+  the outcome, `bet` the most relevant bet (`{id, status, result, dry_run, stake, ...}`; `result`
+  as in [Bets](#bets)). Sorted by market taxonomy order.
 * `unmapped_selections`: Betclic selections of linked events not mapped to our taxonomy yet.
 * `tax_rate`: tax used for the EV column.
 
@@ -301,7 +349,7 @@ Everything for the match page. 404 if unknown.
       "selection_key": "team1",
       "label": "Match winner: Synth Team 1",
       "prediction_id": 2, "model_version": "test-1", "predicted_at": "2026-11-20T11:40:00Z",
-      "p_win": 0.8, "p_push": 0.0, "p_void": 0.0, "p_lose": 0.2, "sigma": 0.03,
+      "p_win": 0.8, "p_push": 0.0, "p_void": 0.0, "p_lose": 0.2, "p_win_settled": 0.8, "sigma": 0.03,
       "fair_odds": "1.25", "breakeven_odds": "1.42",
       "selection_id": 1, "bookmaker_event_id": 1, "market_raw": "Zwycięzca meczu", "selection_raw": "Synth Team 1",
       "odds": "1.95", "effective_odds": "1.716", "odds_captured_at": "2026-11-20T11:59:00Z",
@@ -309,7 +357,7 @@ Everything for the match page. 404 if unknown.
       "ev": 0.3728,
       "decision": {"id": 2, "accepted": true, "reasons": ["ok"], "decided_at": "2026-11-20T11:30:00Z", "odds": "1.95",
                    "p_win": 0.8, "sigma": 0.03, "ev": 0.3728, "kelly_fraction": 0.05, "proposed_stake": "15.00"},
-      "bet": {"id": 3, "status": "placed", "dry_run": false, "stake": "15.00", "requested_odds": "1.95",
+      "bet": {"id": 3, "status": "placed", "result": null, "dry_run": false, "stake": "15.00", "requested_odds": "1.95",
               "placed_odds": "1.95", "placed_at": "2026-11-20T11:30:00Z", "pnl": null}
     },
     {
@@ -365,14 +413,19 @@ Snapshots are written only when the price/availability changes, so draw them as 
 
 | Param | Type | Notes |
 |---|---|---|
-| `status` | list of `pending`, `placing`, `placed`, `won`, `lost`, `void`, `failed`, `cancelled`, `dry_run` | |
+| `status` | list of `pending`, `placing`, `placed`, `won`, `lost`, `void`, `failed`, `cancelled`, `dry_run` | matches the stored status **or** the `result`: `won` also returns paper bets that won; `dry_run` returns every paper row |
 | `dry_run` | bool | omitted = real and paper bets |
 | `from`, `to` | datetime | on `placed_at` (falls back to `created_at`) |
 | `match_id` | int | |
 | `limit`, `offset` | int | newest first |
 
 `summary` covers the whole filtered set (not just the page): `stake` excludes failed/cancelled
-bets, `pnl` sums settled bets, `open` counts pending/placing/placed/dry-run bets.
+bets, `pnl` sums settled bets, `open` counts pending/placing/placed bets and unsettled paper bets;
+`won` / `lost` / `void` count results (settled paper bets included).
+
+Per bet: `status` is the stored status; **`result`** is `"won"` / `"lost"` / `"void"` once the bet
+is settled (also for paper bets, whose `status` stays `"dry_run"`), else `null`; `is_open` is true
+while money (or paper money) is still at stake.
 
 ```json
 {
@@ -406,6 +459,8 @@ bets, `pnl` sums settled bets, `open` counts pending/placing/placed/dry-run bets
       "tax": "1.80",
       "potential_payout": null,
       "status": "placed",
+      "result": null,
+      "is_open": true,
       "dry_run": false,
       "external_bet_id": null,
       "has_screenshot": true,
@@ -433,7 +488,7 @@ rationale of the match. 404 if unknown.
 
 ```json
 {
-  "bet": {"id": 1, "status": "won", "stake": "20.00", "pnl": "13.44", "clv": 0.03, "...": "BetOut as above"},
+  "bet": {"id": 1, "status": "won", "result": "won", "is_open": false, "stake": "20.00", "pnl": "13.44", "clv": 0.03, "...": "BetOut as above"},
   "decision": {
     "id": 4, "match_id": 1, "match": {"id": 1, "...": "MatchBrief"}, "prediction_id": null, "selection_id": null,
     "market_type": "match_winner", "spec_key": "match_winner", "selection_key": "team1",
@@ -469,23 +524,35 @@ screenshot"` / `"screenshot not found"`).
 | `dry_run` | bool, default `false` | `false`: real-money bets + ledger; `true`: paper bets |
 | `max_points` | int 10..20000, default 2000 | per curve |
 
-* `balance`: latest ledger `balance_after` (`balance_source: "ledger"`); without ledger rows the
-  effective starting bankroll adjusted by realized P&L (`"starting_bankroll"`); paper mode:
-  starting bankroll + paper P&L - open paper stakes (`"paper"`).
-* `open_exposure` / `open_bets`: pending, placing, placed (and open paper) bets.
-  `bankroll_reference` = balance + stakes already in play.
+The numbers follow the staking engine (`cs2bot.engine.bankroll`), so the page shows what the bot
+actually enforces:
+
+* `balance`: `balance_after` of the most recently **written** ledger row (`balance_source:
+  "ledger"`; back-dated rows never change it); without ledger rows the effective starting bankroll
+  adjusted by realized P&L (`"starting_bankroll"`); paper mode: starting bankroll + paper P&L - open
+  paper stakes (`"paper"`).
+* `open_exposure` / `open_bets`: pending, placing, placed bets (paper mode: unsettled paper bets).
+  `bankroll_reference` = balance + open stakes already debited (cash + money at risk; stakes and
+  limits are sized from it). `available_balance` = balance - open stakes **not** debited yet
+  (pending bets and placements the bookmaker has not confirmed) = cash free for new stakes.
 * `daily` / `weekly`: loss limits with the **effective** bankroll settings (defaults + dashboard
-  overrides) and Warsaw day/week boundaries. `start_bankroll` = balance at the period start +
-  stakes in play at that instant; `limit_amount = start_bankroll * limit_fraction`;
-  `reached` when realized P&L <= -limit. `open_stakes` = stakes of bets opened in the period that
-  are still open; `worst_case_pnl` = realized - open stakes.
+  overrides) and Warsaw day/week boundaries.
+  `start_bankroll` = `bankroll_reference` - realized P&L of the period (a deposit or withdrawal
+  made during the period counts as if made at its start);
+  `limit_amount` = `start_bankroll * limit_fraction`, rounded **down** to the grosz;
+  `reached` when the realized loss of the period >= `limit_amount` (the bot pauses itself);
+  `remaining` = limit - realized loss; `open_stakes` = **all** stakes currently at risk;
+  `worst_case_pnl` = realized - open stakes; `stake_allowance` = limit - (realized loss + open
+  stakes), floored at 0: what the engine's daily / weekly guard still lets it stake.
+  In paper mode the limits are shown for information only (the engine applies them to real money).
 * `stats`: `turnover` (stakes of won+lost bets), `realized_pnl`, `roi` = realized P&L / capital
   base (ledger deposits, else starting bankroll), `yield_rate` = realized P&L / turnover,
   `hit_rate` = won / (won + lost), `avg_odds`, `avg_clv` (bets with CLV), `max_drawdown` = largest
   fall of cumulative realized P&L from its peak (settlement order), `max_drawdown_pct` = that fall /
   (capital base + peak).
-* `equity_curve`: ledger balance after every entry (paper mode: start + one point per settlement).
-  `pnl_curve`: cumulative realized P&L per settlement.
+* `equity_curve`: one point per ledger entry in time order with the running balance (re-accumulated
+  in that order, so a back-dated entry cannot make the curve jump; the last point is `balance`).
+  Paper mode: start + one point per settlement. `pnl_curve`: cumulative realized P&L per settlement.
 * `pnl_by_day` / `pnl_by_week` (ISO week, `start` = Monday) / `pnl_by_month`: settled bets
   grouped by local settlement date; only periods with settlements are listed.
 * `settings`: the effective bankroll settings.
@@ -497,6 +564,7 @@ screenshot"` / `"screenshot not found"`).
   "as_of": "2026-11-20T12:00:00Z",
   "balance": "968.44",
   "balance_source": "ledger",
+  "available_balance": "968.44",
   "open_exposure": "15.00",
   "open_bets": 1,
   "bankroll_reference": "983.44",
@@ -504,12 +572,14 @@ screenshot"` / `"screenshot not found"`).
   "daily": {
     "period": "day", "period_start": "2026-11-19T23:00:00Z", "start_bankroll": "1013.44",
     "limit_fraction": 0.05, "limit_amount": "50.67", "realized_pnl": "-30.00", "open_stakes": "15.00",
-    "worst_case_pnl": "-45.00", "remaining": "20.67", "used_fraction": 0.592066, "reached": false
+    "worst_case_pnl": "-45.00", "remaining": "20.67", "stake_allowance": "5.67",
+    "used_fraction": 0.592066, "reached": false
   },
   "weekly": {
     "period": "week", "period_start": "2026-11-15T23:00:00Z", "start_bankroll": "1000.00",
     "limit_fraction": 0.1, "limit_amount": "100.00", "realized_pnl": "-16.56", "open_stakes": "15.00",
-    "worst_case_pnl": "-31.56", "remaining": "83.44", "used_fraction": 0.1656, "reached": false
+    "worst_case_pnl": "-31.56", "remaining": "83.44", "stake_allowance": "68.44",
+    "used_fraction": 0.1656, "reached": false
   },
   "trading_halted": false,
   "halt_reason": null,
@@ -556,10 +626,16 @@ screenshot"` / `"screenshot not found"`).
 | `mode` | `all` (default) / `real` / `dry_run` | which bets |
 | `from`, `to` | datetime | bets: `settled_at`; predictions: match `scheduled_at` |
 
-* `bets`: settled won/lost bets, predicted probability = the decision's `p_win`.
+Calibration compares probabilities with won / lost results only, so the probability used is always
+`P(win | not refunded) = p_win / (1 - p_push - p_void)` (see [Conventions](#conventions)).
+
+* `bets`: won / lost bets that have a decision (settled paper bets included in `all` / `dry_run`);
+  probability = the decision's `p_win`, conditioned with the `p_push` / `p_void` of the prediction
+  the decision was made from (when the decision still links to it).
 * `predictions`: latest (`is_latest`) match-winner and map-winner predictions of **finished**
   matches, one selection per market (team1's row when present, so complementary rows are not
-  double counted); unplayed maps are skipped. `predictions_by_market` splits them by market type.
+  double counted); unplayed maps are skipped. No look-ahead: a prediction written at or after the
+  match's `scheduled_at` is ignored. `predictions_by_market` splits them by market type.
 * Each set: `n`, `base_rate`, `mean_predicted`, `brier`, `log_loss`, `ece`, `bins[]` (`count`,
   `mean_predicted`, `observed_rate`, 95% Wilson `ci_low` / `ci_high`) and `brier_by_month`.
 
@@ -726,7 +802,8 @@ Body: `{"decision": {...} | null, "bankroll": {...} | null}`.
   section). Fields equal to the default are dropped. `market_overrides` replaces the whole dict.
 
 Validation (422 with one item per problem, nothing is stored): unknown sections / fields, wrong
-types, and ranges: `min_probability` (0, 1); `min_ev` [0, 1]; `max_sigma` (0, 0.5];
+types, non-finite numbers (`NaN` / `Infinity`, which Python's JSON parser would otherwise accept and
+which would silently disable a threshold), and ranges: `min_probability` (0, 1); `min_ev` [0, 1]; `max_sigma` (0, 0.5];
 `min_data_completeness`, `min_event_link_confidence` [0, 1]; `min_odds` >= 1 and
 `min_odds` < `max_odds` <= 1000; `min_minutes_before_start` [0, 10080];
 `max_hours_before_start` (0, 720]; `market_overrides` keys must be market types with thresholds in
@@ -819,7 +896,7 @@ is set, so no selection keyed for the old orientation can be priced or bet. If t
 with an `event_remapper` (the odds collector's `remap_event`), the markets are re-mapped right away
 (`remapped: true`; `false` if the re-mapper failed, in which case the mappings stay cleared);
 otherwise `remapped` is `null` and the collector re-maps them on its next poll (it re-maps every
-market on every pass). `open_bets` warns about bets already open on the event.
+market on every pass). `open_bets` warns about unsettled bets (real or paper) on the event.
 404 if the event does not exist.
 
 ```json
@@ -934,7 +1011,8 @@ app = create_app(
     session_factory,
     login_launcher=executor.open_login_window,
     executor_health_provider=lambda: cached_health,
-    event_remapper=lambda session, event: remap_event(session, event, mapper),
+    event_remapper=lambda session, event: remap_event(session, event, mapper, settings=settings),
+    scheduler_status_provider=scheduler.status,
 )
 
 # uvicorn.Server: call server.run() in a thread, set server.should_exit = True to stop it
@@ -952,5 +1030,16 @@ run(settings)
 * `executor_health_provider: Callable[[], ExecutorHealth | None]` - must be fast (return a cached
   value); `None` falls back to `system_state["executor_health"]`
   (`ExecutorHealth.model_dump(mode="json")`).
-* `ApiOptions` - login rate limits, cookie name, `extra_allowed_hosts` (e.g. a LAN host name when
-  binding to `0.0.0.0`), page sizes, review window, health thresholds.
+* `scheduler_status_provider: Callable[[], Sequence[Mapping[str, object]]]` - optional;
+  `cs2bot.flows.scheduler.Scheduler.status` (one dict per job: `name`, `lane`, `enabled`,
+  `last_run`, `next_due`, `failures`). Shown under `/api/health` (`scheduler`, plus `scheduled` /
+  `next_due_at` / `scheduler_failures` on each job). Must be fast; a failure only raises the
+  `scheduler_status_error` alert.
+* Settings read from `settings.api`: `host`, `port`, `cors_origins`, `allowed_hosts` (extra Host
+  names, e.g. a LAN name when binding to `0.0.0.0`), `username`, `password`, `session_secret`,
+  `session_max_age_s`, `login_max_failures`, `login_global_max_failures`, `login_window_s`,
+  `serve_dashboard`, `dashboard_dist_dir`.
+* `ApiOptions` - tunables without a setting: cookie name, page sizes, review window, health
+  thresholds (`stuck_job_after_s`, `executor_health_stale_s`, `failing_job_threshold`,
+  `scheduler_overdue_grace_s`). Its `login_*` fields (default `None` = use the settings) and
+  `extra_allowed_hosts` (added to `api.allowed_hosts`) override the settings, mainly for tests.

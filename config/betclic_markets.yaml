@@ -56,7 +56,11 @@
 #   * draw-no-bet, double chance and combined markets ("Zwycięzca meczu i liczba map") are never mapped.
 #   * a two-way market type listing a draw selection ("Remis", "X") is a three-way (regulation time /
 #     European handicap) market and stays unmapped; a head-to-head kills market listing a draw is mapped
-#     only when CS2BOT_BETCLIC__H2H_TIE_RULE=lose.
+#     only when CS2BOT_BETCLIC__H2H_TIE_RULE=lose; a match-winner market listing a draw is mapped only
+#     when the linked match is a BO2 (the only format that can end level); an over/under market that
+#     also lists "Dokładnie N" / "Exactly N" stays unmapped.
+#   * a "player" that is one of the event's teams ("Liczba zabójstw - Natus Vincere") is a team market
+#     and stays unmapped.
 #   * over/under, yes/no and odd/even selections carrying anything else ("Powyżej 2,5 i NAVI") stay unmapped.
 #   * lines outside `guards.line_bounds` (e.g. a map handicap of 4,5) stay unmapped.
 #
@@ -84,7 +88,10 @@ settings:
 guards:
   excludes_overtime:
     - '\(?\s*bez (?:dogrywki|dogrywek|dogrywka|ot)\b\s*\)?'
+    # "nie wliczając dogrywki" must come before the "wliczając dogrywkę" (included) pattern
+    - '\(?\s*(?:nie wliczajac|nie liczac|z wylaczeniem|wylaczajac|z pominieciem|pomijajac) (?:dogrywk\w+|ot)\b\s*\)?'
     - '\(?\s*(?:tylko )?(?:w )?(?:regulaminow|podstawow)\w* czas\w*(?: gry)?\s*\)?'
+    - '\(?\s*(?:tylko )?(?:w )?czas\w*(?: gry)? (?:regulaminow|podstawow)\w*\s*\)?'
     - '\(?\s*(?:regular|regulation|normal) time\s*\)?'
     - '\(?\s*\bregulation\b\s*\)?'
     - '\(?\s*(?:excl(?:\.|uding)?|without|no|w/o) (?:overtime|ot)\b\s*\)?'
@@ -117,6 +124,8 @@ excludes:
   pistol: &pistol ['pistolet', '\bpistol\b']
   players: &players ['zabojstw', '\bkills?\b', '\bfrag', '\bgracz', '\bplayer', 'headshot', 'asyst', 'zgon', 'smierc']
   odd_even: &odd_even ['parzyst', '\bodd\b', '\beven\b']
+  # a single map is named ("mapa 1", "1. mapa") - never part of a whole-series market
+  map_ref: &map_ref ['\bmap[a-z]*\s*(?:nr\.?\s*)?\d(?![\d]|[.,]\d)', '(?<![\d.,])\d\s*\.?\s*map[a-z]*\b']
 
 rules:
   # ---------------------------------------------------------------- round-level / map props
@@ -214,7 +223,7 @@ rules:
       - '\bcorrect (?:map )?score\b'
       - '\bexact (?:map )?score\b'
       - '\bmap score\b'
-    exclude: [*half, *pistol, 'rund', '\bmap[a-z]*\s*(?:nr\.?\s*)?\d(?![\d]|[.,]\d)', '(?<![\d.,])\d\s*\.?\s*map[a-z]*\b']
+    exclude: [*half, *pistol, 'rund', *map_ref]
     selection: map_score
 
   - id: round_handicap
@@ -244,7 +253,7 @@ rules:
       - '\b(?:team )?total rounds\b'
       - '\brounds (?:won|total)\b'
       - 'liczba rund druzyny (?P<team>[12])\b'
-    exclude: [*half, *pistol, *odd_even, 'handicap', *players]
+    exclude: [*half, *pistol, *odd_even, 'handicap', *players, 'w dogrywce', '\bin overtime\b']
     team_in_market: required
     extract: [map]
     requires: [map, team, line]
@@ -260,7 +269,8 @@ rules:
       - '\btotal rounds\b'
       - '\brounds total\b'
       - '\bover/under rounds\b'
-    exclude: [*half, *pistol, *odd_even, 'handicap', 'druzyn', 'zespol', '\bteam\b', 'wygranych', *players]
+    exclude: [*half, *pistol, *odd_even, 'handicap', 'druzyn', 'zespol', '\bteam\b', 'wygranych', *players,
+              'w dogrywce', '\bin overtime\b']
     extract: [map]
     requires: [map, line]
     selection: over_under
@@ -276,17 +286,17 @@ rules:
       - '\btotal maps\b'
       - '\bmaps total\b'
       - '\bnumber of maps\b'
-    exclude: ['rund', *players]
+    exclude: ['rund', *players, *map_ref]
     requires: [line]
     selection: over_under
 
   - id: both_teams_win_a_map
     market_type: both_teams_win_a_map
+    # the name must say "map": "Obie drużyny wygrają rundę pistoletową" is a different market
     patterns:
-      - 'obie druzyny wygraja'
-      - 'obie druzyny wygra\w* (?:co najmniej )?(?:jedna )?map'
-      - 'kazda z druzyn wygra'
-      - '\bboth teams (?:to )?win (?:a|at least one) map\b'
+      - '(?:obie druzyny|kazda z druzyn|kazda druzyna) (?:wygra\w*|zdobed\w*|ugra\w*) (?:co najmniej |przynajmniej |po )?(?:jedn\w+ |1 )?map'
+      - '\bboth teams (?:to )?win (?:a|at least one|at least 1) map\b'
+    exclude: ['rund', *half, *pistol, *players, *map_ref]
     selection: yes_no
 
   - id: map_handicap
@@ -300,7 +310,9 @@ rules:
       - 'handicap \(maps\)'
     # A bare "Handicap" is deliberately NOT here: in a BO1 (or inside a map tab) it is a ROUND
     # handicap, and a round line read as a map handicap looks like a certain winner to the model.
-    exclude: [*half, *pistol, 'rund', *players]
+    # For the same reason a name with a map number ("Handicap map 1", "Mapa 1 - handicap map") is
+    # never a map handicap.
+    exclude: [*half, *pistol, 'rund', *players, *map_ref]
     requires: [line]
     selection: team_line
 

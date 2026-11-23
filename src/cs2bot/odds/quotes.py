@@ -6,8 +6,10 @@ Only selections that are safe to bet are quoted (:func:`latest_quotes`):
   are never bet on - PLAN.md section 4.4), it is not live and its start time (if known) is still
   in the future;
 * the market and the selection are mapped and the selection is currently available;
-* the price is fresh: ``last_odds_at >= now - max_age_s`` (``last_odds_at`` is refreshed on every
-  collection pass that saw the selection, not only when the price changed).
+* the price is fresh: ``last_odds_at >= now - max_age_s``. ``last_odds_at`` means "price last
+  confirmed at": the collector refreshes it on every pass that saw the selection *available*
+  (not only when the price changed), stamped with the time the source captured the payload - not
+  the time the pass ran. ``last_seen_at`` (any sighting, also suspended) is not used for freshness.
 """
 
 from __future__ import annotations

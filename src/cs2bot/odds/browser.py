@@ -375,6 +375,8 @@ class _CrawlRun:
         self.tasks: set[asyncio.Task[None]] = set()
         self.grpc_headers: dict[str, str] = {}
         self.visited_ok: set[str] = set()
+        # visited, but some market categories could not be fetched: the market list is incomplete
+        self.incomplete: set[str] = set()
         self.link_ids: dict[str, str] = {}
         self._seen_bodies: set[int] = set()
         self._hooked: list[tuple[str, bytes]] = []  # (url, first frames) captured by the page hook
@@ -600,9 +602,18 @@ class _CrawlRun:
         return [(eid, url) for _, _, eid, url in reversed(soonest)]
 
     async def _fetch_categories(self, page: Page, event_id: str, docs: list[Any]) -> int:
+        """Fetch every market category of an event; returns how many were captured.
+
+        When a category that the page announces cannot be fetched the event is recorded in
+        ``self.incomplete``: its market list is then known to be partial and the collector must
+        not mark the markets it did not see as unavailable.
+        """
         if not event_id.isdigit():
             return 0
-        categories = find_match_categories(docs, event_id)[: self.cfg.max_categories_per_event]
+        found = find_match_categories(docs, event_id)
+        categories = found[: self.cfg.max_categories_per_event]
+        if len(found) > len(categories):
+            self.incomplete.add(event_id)
         if not categories:
             return 0
         bs = self.settings.betclic
@@ -626,12 +637,16 @@ class _CrawlRun:
                 )
             except Exception as exc:
                 self.info.errors.append(f"category {category} of {event_id}: {type(exc).__name__}")
+                self.incomplete.add(event_id)
                 break
             if not isinstance(result, dict) or result.get("error") or int(result.get("status") or 0) >= 400:
                 detail = result.get("error") or result.get("status") if isinstance(result, dict) else result
                 self.info.errors.append(f"category {category} of {event_id}: {detail}")
+                self.incomplete.add(event_id)
                 continue
             data = base64.b64decode(result.get("body") or "")
+            if not data:
+                self.incomplete.add(event_id)
             if data:
                 # page.on("response") sees this request too: register it so that copy is dropped
                 self._hooked.append((url, data))
@@ -704,7 +719,13 @@ class _CrawlRun:
         allowed = set(self.link_ids) | self.visited_ok
         kept = select_cs2(parsed.records, pattern=self.source._cs2_re, allowed_ids=allowed)
         parsed.fill_info(self.info, kept)
-        self.info.partial_event_ids = {r.external_id for r in kept if r.external_id not in self.visited_ok}
+        self.info.partial_event_ids = {
+            r.external_id
+            for r in kept
+            if r.external_id not in self.visited_ok or r.external_id in self.incomplete
+        }
+        if self.incomplete:
+            self.info.notes["events_incomplete"] = len(self.incomplete)
         self.info.finished_at = utcnow()
         self.info.notes["events_found"] = len(kept)
         self.source._info = self.info

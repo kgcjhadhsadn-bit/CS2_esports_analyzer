@@ -13,7 +13,9 @@ from typing import Any
 
 from cs2bot.config import Settings
 
-#: ``ExecutorTuning`` fields copied 1:1 from the ``ExecutorSettings`` field of the same name.
+#: ``ExecutorTuning`` fields that ``ExecutorSettings`` carries today (copied 1:1, same name). Any tuning
+#: field added to ``ExecutorSettings`` later under the same name is picked up automatically by
+#: :meth:`ExecutorTuning.from_settings`; this tuple documents (and tests pin down) the current set.
 SETTINGS_FIELDS: tuple[str, ...] = (
     "element_timeout_s",
     "optional_timeout_s",
@@ -105,14 +107,18 @@ class ExecutorTuning:
     def from_settings(cls, settings: Settings, **overrides: Any) -> ExecutorTuning:
         """Tuning with the knobs of ``settings.executor`` (see :data:`SETTINGS_FIELDS`).
 
-        ``overrides`` win over the settings (any :class:`ExecutorTuning` field). Raises ``ValueError``
-        for inconsistent values (e.g. a lock heartbeat longer than half the stale age) so that a bad
-        ``.env`` is reported at start-up, not at the first bet.
+        Every :class:`ExecutorTuning` field that ``settings.executor`` also has (same name) is copied;
+        the other fields keep their defaults. ``overrides`` win over the settings (any
+        :class:`ExecutorTuning` field). Raises ``ValueError`` for inconsistent values (e.g. a lock
+        heartbeat longer than half the stale age) so that a bad ``.env`` is reported at start-up, not at
+        the first bet.
         """
         known = {f.name for f in fields(cls)}
         unknown = sorted(set(overrides) - known)
         if unknown:
             raise TypeError(f"unknown ExecutorTuning field(s): {unknown}")
-        values: dict[str, Any] = {name: getattr(settings.executor, name) for name in SETTINGS_FIELDS}
+        values: dict[str, Any] = {
+            name: getattr(settings.executor, name) for name in known if hasattr(settings.executor, name)
+        }
         values.update(overrides)
         return cls(**values)

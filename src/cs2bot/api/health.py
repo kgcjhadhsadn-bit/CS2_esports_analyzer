@@ -4,13 +4,18 @@ Job names are owned by the scheduler; they are classified by keywords (``odds``,
 ``result``, ``news``, ``predict``, ``settle``, ``demo``, ``ranking``, ``train`` ...) to find the
 expected run interval in :class:`cs2bot.config.SchedulerSettings`. A job is *stale* when its last
 successful run is older than ``2 x interval + 10 min``.
+
+When the integration layer passes ``scheduler_status_provider`` (``Scheduler.status``), every job
+also shows its next due time and the scheduler's failure count, jobs the scheduler does not run
+(removed, disabled, or started by hand from the CLI) are no longer reported as stale, and a job
+that stays due while its lane is idle raises ``scheduler_job_overdue`` (the scheduler thread died).
 """
 
 from __future__ import annotations
 
 import re
 import time
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime
 from typing import Any, Literal
 
@@ -31,6 +36,8 @@ from cs2bot.api.schemas import (
     HealthAlert,
     HealthOut,
     JobHealth,
+    SchedulerJobOut,
+    SchedulerOut,
     SyncJobFreshness,
     TradingStateOut,
 )
@@ -49,7 +56,7 @@ from cs2bot.db.models import (
 from cs2bot.domain.betting import ExecutorHealth
 from cs2bot.domain.enums import JobStatus, LinkStatus
 from cs2bot.utils.logging import get_logger
-from cs2bot.utils.time import ensure_utc
+from cs2bot.utils.time import ensure_utc, parse_datetime
 
 log = get_logger(__name__)
 
@@ -247,6 +254,115 @@ def _job_alerts(jobs: Sequence[JobHealth], ctx: ApiContext, alerts: _Alerts) -> 
 
 
 # --------------------------------------------------------------------------------------------
+# scheduler
+# --------------------------------------------------------------------------------------------
+
+
+def _as_datetime(value: object) -> datetime | None:
+    if isinstance(value, datetime):
+        return ensure_utc(value)
+    if isinstance(value, str) and value.strip():
+        try:
+            return parse_datetime(value)
+        except (ValueError, OverflowError):
+            return None
+    return None
+
+
+def scheduler_status(ctx: ApiContext, now: datetime, alerts: _Alerts) -> SchedulerOut | None:
+    """The scheduler's own view of its jobs (``None`` when no provider is wired).
+
+    The provider belongs to another package: a failure or a malformed entry never breaks /health.
+    """
+    provider = ctx.scheduler_status_provider
+    if provider is None:
+        return None
+    try:
+        raw = list(provider())
+    except Exception as exc:
+        log.warning("scheduler status provider failed: %s", type(exc).__name__)
+        alerts.add(
+            "warning", "scheduler_status_error", f"Scheduler status unavailable ({type(exc).__name__})"
+        )
+        return SchedulerOut(ok=False)
+    jobs: list[SchedulerJobOut] = []
+    for item in raw:
+        if not isinstance(item, Mapping):
+            continue
+        name = item.get("name")
+        if not isinstance(name, str) or not name:
+            continue
+        lane = item.get("lane")
+        failures = item.get("failures")
+        next_due = _as_datetime(item.get("next_due"))
+        jobs.append(
+            SchedulerJobOut(
+                name=name,
+                lane=str(lane) if lane is not None else None,
+                enabled=bool(item.get("enabled", True)),
+                last_run_at=_as_datetime(item.get("last_run")),
+                next_due_at=next_due,
+                due_in_s=round((next_due - now).total_seconds(), 1) if next_due is not None else None,
+                failures=max(0, failures)
+                if isinstance(failures, int) and not isinstance(failures, bool)
+                else 0,
+            )
+        )
+    return SchedulerOut(ok=True, jobs=jobs)
+
+
+def apply_scheduler(
+    jobs: Sequence[JobHealth], sched: SchedulerOut | None, ctx: ApiContext, alerts: _Alerts
+) -> None:
+    """Merge the scheduler's view into the job list (in place) and raise scheduler alerts.
+
+    * a job the scheduler does not run (unknown to it or disabled) is not *stale*: nobody is
+      supposed to run it;
+    * a job is *overdue* when it is enabled, its due time passed more than
+      ``options.scheduler_overdue_grace_s`` ago and nothing is running in its lane (a lane runs its
+      jobs one at a time, so jobs queued behind a long run are late but fine; a hung run is
+      reported by ``job_stuck``).
+    """
+    if sched is None or not sched.ok:
+        return
+    by_name = {j.name: j for j in sched.jobs}
+    # A RUNNING row older than the scheduler's own last run of that job is a leftover of a crashed
+    # process (the scheduler restores ``last_run`` from job_runs at start-up), not a live run.
+    running: set[str] = set()
+    for job in jobs:
+        known = by_name.get(job.name)
+        if job.status is not JobStatus.RUNNING or known is None:
+            continue
+        if known.last_run_at is None or job.last_started_at > known.last_run_at:
+            running.add(job.name)
+    for job in jobs:
+        info = by_name.get(job.name)
+        job.scheduled = info is not None and info.enabled
+        if info is not None:
+            job.next_due_at = info.next_due_at
+            job.scheduler_failures = info.failures
+        if not job.scheduled:
+            job.stale = False
+    busy_lanes = {j.lane for j in sched.jobs if j.name in running}
+    grace = ctx.options.scheduler_overdue_grace_s
+    for info in sched.jobs:
+        info.running = info.name in running
+        late_s = -info.due_in_s if info.due_in_s is not None else 0.0
+        info.overdue = info.enabled and not info.running and info.lane not in busy_lanes and late_s > grace
+        if info.overdue:
+            alerts.add(
+                "warning",
+                "scheduler_job_overdue",
+                f"Job '{info.name}' is overdue by {_fmt_duration(late_s)} - is the scheduler running?",
+            )
+    disabled = sorted(j.name for j in sched.jobs if not j.enabled)
+    if disabled:
+        alerts.add(
+            "info", "scheduler_job_disabled", f"Disabled scheduler job(s): {', '.join(disabled)}"[:300]
+        )
+
+
+# --------------------------------------------------------------------------------------------
 # executor
 # --------------------------------------------------------------------------------------------
 
@@ -377,8 +493,10 @@ def freshness(session: Session, jobs: Sequence[JobHealth], now: datetime) -> Fre
 def _odds_collector_alerts(
     jobs: Sequence[JobHealth], fresh: FreshnessOut, ctx: ApiContext, alerts: _Alerts
 ) -> None:
-    if any(j.kind == "odds" for j in jobs):
+    if any(j.kind == "odds" and j.scheduled is not False for j in jobs):
         return  # handled per job
+    # No odds job is being tracked (never ran, or the scheduler does not run one): judge the
+    # collector by the data itself - stale prices matter whoever was supposed to refresh them.
     limit = stale_after_s(float(ctx.settings.scheduler.odds_poll_s))
     if fresh.last_event_seen_age_s is None:
         alerts.add(
@@ -419,7 +537,7 @@ def _loss_limit_alerts(session: Session, ctx: ApiContext, now: datetime, alerts:
                 "critical",
                 "loss_limit_reached",
                 f"{label} loss limit reached: P&L {limit.realized_pnl} {bankroll.currency} "
-                f"(limit -{limit.limit_amount})",
+                f"(limit: a loss of {limit.limit_amount})",
             )
 
 
@@ -428,7 +546,9 @@ def compute_health(ctx: ApiContext) -> HealthOut:
     settings = ctx.settings
     alerts = _Alerts()
     if settings.executor.dry_run:
-        alerts.add("warning", "dry_run_on", "Dry-run mode is ON: bets are simulated, no real money is placed")
+        # informational: paper trading is the default mode and must not hide a healthy "ok" status
+        alerts.add("info", "dry_run_on", "Dry-run mode is ON: bets are simulated, no real money is placed")
+    sched = scheduler_status(ctx, now, alerts)
 
     db = DbHealth(ok=False)
     trading: TradingStateOut | None = None
@@ -446,6 +566,7 @@ def compute_health(ctx: ApiContext) -> HealthOut:
         trading = trading_state(session)
         _trading_alerts(trading, alerts)
         jobs = job_health(session, settings.scheduler, now)
+        apply_scheduler(jobs, sched, ctx, alerts)
         _job_alerts(jobs, ctx, alerts)
         fresh = freshness(session, jobs, now)
         _odds_collector_alerts(jobs, fresh, ctx, alerts)
@@ -490,6 +611,7 @@ def compute_health(ctx: ApiContext) -> HealthOut:
         dry_run=settings.executor.dry_run,
         executor=exec_out,
         jobs=jobs,
+        scheduler=sched,
         freshness=fresh,
         pending_link_reviews=pending_reviews,
         alerts=alerts.sorted(),

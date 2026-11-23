@@ -1,4 +1,10 @@
-"""Model calibration and per-market performance."""
+"""Model calibration and per-market performance.
+
+Calibration compares probabilities with won / lost results only (refunded bets and maps that were
+not played carry no information), so the probability used is ``P(win | not refunded) = p_win /
+(1 - p_push - p_void)``: the stored ``p_win`` is unconditional and e.g. the winner of map 3 of a BO3
+includes the chance that the map is never played.
+"""
 
 from __future__ import annotations
 
@@ -16,11 +22,13 @@ from cs2bot.api.analytics import (
     bet_stats,
     brier_by_month,
     calibration_set,
+    effective_status,
     group_by_market,
 )
-from cs2bot.api.bankroll import load_bet_facts
+from cs2bot.api.bankroll import load_bet_facts, paper_clause
 from cs2bot.api.deps import DB, Ctx, require_auth
-from cs2bot.api.formatting import money_str0, odds_str, parse_spec_key, round_or_none, utc
+from cs2bot.api.ev import p_win_given_settled
+from cs2bot.api.formatting import money_str0, odds_str, parse_spec_key, round_or_none, to_decimal, utc
 from cs2bot.api.params import FromParam, ToParam, as_utc
 from cs2bot.api.schemas import CalibrationOut, MarketPerfOut, MarketPerfRow
 from cs2bot.db.models import Bet, BetDecisionRow, MapPlayed, Match, Prediction
@@ -70,10 +78,14 @@ def _winner_outcome(row: Any, maps: dict[tuple[int, int], int | None]) -> int | 
 def prediction_samples(
     session: Session, lower: datetime | None, upper: datetime | None
 ) -> dict[str, list[tuple[float, int, datetime | None]]]:
-    """(p_win, outcome, match time) of the latest pre-match winner predictions of finished matches.
+    """(P(win | settled), outcome, match time) of the latest pre-match winner predictions of
+    finished matches.
 
-    Only one selection per binary market is used (team1 when present) so complementary rows do
-    not double-count the same event.
+    * Only one selection per binary market is used (team1 when present) so complementary rows do
+      not double-count the same event.
+    * No look-ahead: a prediction written at or after the scheduled start (a predictor that kept
+      running while the match was live, a re-run after the result) is ignored - and so is a
+      finished match without a start time, for which that cannot be checked.
     """
     stmt = (
         select(
@@ -83,6 +95,8 @@ def prediction_samples(
             Prediction.spec_key,
             Prediction.selection_key,
             Prediction.p_win,
+            Prediction.p_push,
+            Prediction.p_void,
             Prediction.created_at,
             Match.team1_id,
             Match.team2_id,
@@ -96,6 +110,7 @@ def prediction_samples(
             Match.status == MatchStatus.FINISHED,
             Prediction.is_latest.is_(True),
             Prediction.market_type.in_(WINNER_MARKETS),
+            Prediction.created_at < Match.scheduled_at,
         )
     )
     map_stmt = (
@@ -128,8 +143,53 @@ def prediction_samples(
     out: dict[str, list[tuple[float, int, datetime | None]]] = defaultdict(list)
     for row in chosen.values():
         outcome = _winner_outcome(row, maps)
-        if outcome is not None:
-            out[str(row.market_type)].append((float(row.p_win), outcome, utc(row.scheduled_at)))
+        p = p_win_given_settled(
+            float(row.p_win), p_push=float(row.p_push or 0.0), p_void=float(row.p_void or 0.0)
+        )
+        if outcome is not None and p is not None:
+            out[str(row.market_type)].append((p, outcome, utc(row.scheduled_at)))
+    return out
+
+
+def bet_samples(
+    session: Session, mode: Mode, lower: datetime | None, upper: datetime | None
+) -> list[tuple[float, int, datetime | None]]:
+    """(P(win | settled), outcome, settled at) of won / lost bets that have a decision.
+
+    The decision's ``p_win`` is unconditional; the refund probability comes from the prediction the
+    decision was made from (when it is still linked). Paper bets settled by the engine keep
+    ``status = dry_run``, so the result is the bet's effective status.
+    """
+    stmt = (
+        select(
+            Bet.status,
+            Bet.settled_at,
+            Bet.pnl,
+            Bet.extra,
+            BetDecisionRow.p_win,
+            Prediction.p_push,
+            Prediction.p_void,
+        )
+        .join(BetDecisionRow, Bet.decision_id == BetDecisionRow.id)
+        .outerjoin(Prediction, BetDecisionRow.prediction_id == Prediction.id)
+        .where(Bet.status.in_([BetStatus.WON, BetStatus.LOST, BetStatus.DRY_RUN]))
+    )
+    dry = _dry_run_filter(mode)
+    if dry is not None:
+        stmt = stmt.where(paper_clause() if dry else ~paper_clause())
+    if lower is not None:
+        stmt = stmt.where(Bet.settled_at >= lower)
+    if upper is not None:
+        stmt = stmt.where(Bet.settled_at <= upper)
+    out: list[tuple[float, int, datetime | None]] = []
+    for status, settled, pnl, extra, p_win, p_push, p_void in session.execute(stmt):
+        settled_at = utc(settled)
+        result = effective_status(status, extra=extra, pnl=to_decimal(pnl), settled_at=settled_at)
+        if result not in (BetStatus.WON, BetStatus.LOST) or p_win is None:
+            continue
+        p = p_win_given_settled(float(p_win), p_push=float(p_push or 0.0), p_void=float(p_void or 0.0))
+        if p is not None:
+            out.append((p, 1 if result is BetStatus.WON else 0, settled_at))
     return out
 
 
@@ -144,22 +204,7 @@ def calibration(
 ) -> CalibrationOut:
     tz = ctx.settings.timezone
     lower, upper = as_utc(from_), as_utc(to)
-    stmt = (
-        select(Bet.status, Bet.settled_at, BetDecisionRow.p_win)
-        .join(BetDecisionRow, Bet.decision_id == BetDecisionRow.id)
-        .where(Bet.status.in_([BetStatus.WON, BetStatus.LOST]))
-    )
-    dry = _dry_run_filter(mode)
-    if dry is not None:
-        stmt = stmt.where(Bet.dry_run.is_(dry))
-    if lower is not None:
-        stmt = stmt.where(Bet.settled_at >= lower)
-    if upper is not None:
-        stmt = stmt.where(Bet.settled_at <= upper)
-    bet_rows = [
-        (float(p), 1 if status is BetStatus.WON else 0, utc(settled))
-        for status, settled, p in db.execute(stmt)
-    ]
+    bet_rows = bet_samples(db, mode, lower, upper)
     by_market = prediction_samples(db, lower, upper)
     all_preds = [s for samples in by_market.values() for s in samples]
 

@@ -45,7 +45,8 @@ CORS = {
 class FakeBetclic:
     """Serves the listing page, the XHR JSON, an event page with ng-state and the gRPC API."""
 
-    def __init__(self) -> None:
+    def __init__(self, *, failing_categories: tuple[str, ...] = ()) -> None:
+        self.failing_categories = failing_categories
         self.start = (utcnow() + timedelta(hours=3)).replace(microsecond=0)
         self.grpc_requests: list[dict[int, Any]] = []
         self.paths: list[str] = []
@@ -230,6 +231,9 @@ class FakeBetclic:
             parsed = {f.number: f.value for f in fields or []}
             self.grpc_requests.append(parsed)
             category = parsed.get(3)
+            if isinstance(category, bytes) and category.decode() in self.failing_categories:
+                await route.fulfill(status=503, headers=CORS, body="")
+                return
             await route.fulfill(
                 status=200,
                 headers={**CORS, "Content-Type": "application/grpc-web+proto"},
@@ -340,3 +344,28 @@ def test_blocked_listing_raises_with_diagnostics(browser_settings: Settings) -> 
     with pytest.raises(BetclicSourceError, match="403"):
         source.fetch_cs2_events()
     assert source.last_fetch_info().pages_visited == 1
+
+
+def test_event_with_a_failed_category_fetch_is_reported_as_partial(
+    browser_settings: Settings, session
+) -> None:
+    """An incomplete market list must never make the collector mark the unseen markets unavailable."""
+    navi, faze = make_team(session, "Natus Vincere"), make_team(session, "FaZe Clan")
+    mapper = MarketMapper.from_yaml(project_root() / "config" / "betclic_markets.yaml")
+    healthy = FakeBetclic()
+    make_match(session, navi, faze, healthy.start)
+    first = collect_once(session, make_source(browser_settings, healthy), mapper, settings=browser_settings)
+    assert first.events_partial == 0 and first.errors == []
+    rounds = session.scalar(select(BookmakerMarket).where(BookmakerMarket.raw_name == "Mapa 1 - liczba rund"))
+    assert rounds is not None and all(s.is_available for s in rounds.selections)
+
+    broken = FakeBetclic(failing_categories=("ca_esp_maps",))
+    broken.start = healthy.start
+    source = make_source(browser_settings, broken)
+    second = collect_once(session, source, mapper, settings=browser_settings)
+    info = source.last_fetch_info()
+    assert info.partial_event_ids == {str(EVENT_ID)} and info.notes["events_incomplete"] == 1
+    assert any("ca_esp_maps" in err for err in info.errors)
+    assert second.events_partial == 1 and second.selections_marked_unavailable == 0
+    session.refresh(rounds)
+    assert all(s.is_available for s in rounds.selections)  # not seen this time, but not "gone" either

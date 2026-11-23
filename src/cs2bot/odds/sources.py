@@ -61,6 +61,7 @@ from cs2bot.odds.payload_parser import (
     merge_parsed_events,
     sport_matches,
 )
+from cs2bot.odds.source_config import is_other_game, url_section
 from cs2bot.utils.paths import resolve_path
 from cs2bot.utils.time import ensure_utc, utcnow
 
@@ -97,6 +98,10 @@ class FetchInfo:
     # match winner); stamping every market with the event's latest payload would make the markets
     # that were NOT refreshed look fresher than they are.
     captured_at_by_market: dict[str, dict[tuple[str, str], datetime]] = field(default_factory=dict)
+    # event id -> {(market raw_name, market external_id) -> {"page_name", "group"}} for markets whose
+    # raw_name was built by the parser ("Mapa 1 - Liczba rund" = group "Mapa 1" + title "Liczba
+    # rund"): the collector stores it in ``bookmaker_markets.extra`` (the page shows the title only)
+    market_meta_by_event: dict[str, dict[tuple[str, str], dict[str, str]]] = field(default_factory=dict)
     # events whose market list is known to be incomplete (e.g. seen on the listing only): the
     # collector must not mark their missing markets unavailable
     partial_event_ids: set[str] = field(default_factory=set)
@@ -247,6 +252,10 @@ class CapturedParse:
         info.captured_at_by_market = {
             eid: self.market_times[eid] for eid in ids if self.market_times.get(eid)
         }
+        by_id = {r.external_id: r for r in self.records}
+        info.market_meta_by_event = {
+            eid: meta for eid in ids if eid in by_id and (meta := by_id[eid].market_meta())
+        }
 
 
 def parse_captured_full(
@@ -301,10 +310,18 @@ def select_cs2(
     allowed_ids: set[str] | None = None,
     keep_unknown: bool = False,
 ) -> list[ParsedEvent]:
-    """Keep CS2 events: ids discovered from CS2 links, or sport/competition/url hints matching."""
+    """Keep CS2 events: ids discovered from CS2 links, or sport/competition/url hints matching.
+
+    An event whose own sport label, competition or URL section names ANOTHER e-sport (and not CS2)
+    is dropped even when its id is in ``allowed_ids``: when the listing has no CS2-looking links
+    the whole e-sport section is crawled, and a League of Legends "G2 - Fnatic" must never reach
+    the linker as a CS2 event (see :func:`cs2bot.odds.source_config.is_other_game`).
+    """
     regex = re.compile(pattern) if isinstance(pattern, str) else pattern
     kept: list[ParsedEvent] = []
     for rec in records:
+        if is_other_game([rec.sport_raw, rec.competition_raw, url_section(rec.url)], cs2_pattern=regex):
+            continue
         if allowed_ids is not None and rec.external_id in allowed_ids:
             kept.append(rec)
             continue
@@ -399,9 +416,9 @@ class RawPayloadReplaySource:
         ]
 
     @staticmethod
-    def _index_times(directory: Path, cache: dict[Path, dict[str, tuple[datetime, str | None]]]) -> dict[
-        str, tuple[datetime, str | None]
-    ]:
+    def _index_times(
+        directory: Path, cache: dict[Path, dict[str, tuple[datetime, str | None]]]
+    ) -> dict[str, tuple[datetime, str | None]]:
         """``file name -> (captured_at, page url)`` from the directory's ``index.jsonl`` (if any)."""
         if directory not in cache:
             entries: dict[str, tuple[datetime, str | None]] = {}

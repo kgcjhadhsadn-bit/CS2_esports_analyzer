@@ -2,7 +2,7 @@
 
 > Written by the engineer who implemented the package. Reviewers update it when the public API changes.
 
-**Tests:** `.venv/bin/python -m pytest tests/executor -q -n 2` (browser tests use PLAYWRIGHT_CHROMIUM_EXECUTABLE, default /opt/pw-browsers/chromium, and are skipped if it is missing; `-m "not browser"` runs only the 193 unit tests) - 274 passed, 0 failed (lint/type clean: True). About 1 min 25 s with `-n 2`, 2 min 25 s serially on this machine.
+**Tests:** `.venv/bin/python -m pytest tests/executor -q -n 2` (browser tests use PLAYWRIGHT_CHROMIUM_EXECUTABLE, default /opt/pw-browsers/chromium, and are skipped if it is missing; `-m "not browser"` runs only the 235 unit tests) - 343 passed, 0 failed (lint/type clean: True). About 1 min 55 s with `-n 2`, 2 min 55 s serially on this machine.
 
 ## Summary
 
@@ -11,19 +11,23 @@ P9 `cs2bot.executor` is built: it places single pre-match bets on Betclic.pl thr
 What is in the package:
 - **Contracts.** `BetExecutor` (place / get_balance / health_check / close) and `AccountExecutor`, which adds is_logged_in, open_login_window and fetch_bet_history. Also `BookmakerBetRecord` / `BookmakerBetStatus` (history rows, defined in `cs2bot.domain.betting`) and an error hierarchy.
 - **BetclicExecutor.** Runs this flow:
-  - refuse a key whose final button was already clicked (memory + placement journal), halt check, then open the event (by URL or found on the CS2 listing by id; a redirect to another page is detected), then check login, then clear stale slip selections;
-  - find market and selection by exact normalised name, never guessing (ids only break ties; an id that sits on a different name counts as a conflict);
+  - refuse a key whose final button was already clicked (memory + placement journal) before anything else, then validate the order, halt check, then open the event (by URL or found on the CS2 listing by id; a redirect to another page is detected), then check login, then clear stale slip selections;
+  - find market and selection by exact normalised name, never guessing (ids only break ties; an id that sits on a different name counts as a conflict); an event that shows the live marker is refused (pre-match only);
   - read the Polish odds; refuse if below `min_acceptable_odds` or implausibly far above the requested odds;
   - after the human-like pause, read the chosen market title, selection name and odds again (the elements are addressed by position and a live page may re-render), then click;
-  - verify the slip holds exactly that one selection (hidden ones count), showing the ordered selection and market;
-  - type the stake as "12,50" and read it back; cross-check the potential win when the slip shows one;
+  - verify the slip holds exactly that one selection (hidden ones count), showing the ordered selection and market; if instead a receipt appears or the balance drops (a quick-bet mode placed a bet on the click), the result is UNCERTAIN;
+  - type the stake as "12,50" and read it back; cross-check the potential win shown in the slip (required by default: no readable potential win, no bet);
+  - locate the one final button (also in a dry run) and require it to be enabled;
   - dry run stops here: screenshot, clear the slip, never click the final button;
-  - just before the click: re-read the slip odds and the stake field, make sure the button is clickable (trial click), write the journal record, then the halt check again;
-  - click "Postaw zakład". Odds-change dialog: accept only at or above the minimum (the lower of the dialog's and the slip's price counts), otherwise decline. Parse the receipt (bet id, new balance). Known errors map to their status. Anything unclear after the click returns UNCERTAIN and is never retried.
+  - just before the click: make sure the button is clickable (trial click), then re-read the slip odds, the stake field, the potential win and the messages, write the journal record, then the halt check again;
+  - click "Postaw zakład". Odds-change dialog: accept only at or above the minimum (the lower of the dialog's and the slip's price counts, read again right before the accept click), at most once per dialog, otherwise decline. Parse the receipt (bet id, new balance). Known errors map to their status, but only if neither a receipt nor a balance drop contradicts them. Anything unclear after the click returns UNCERTAIN and is never retried.
 - **Extra safety beyond the brief:**
   - real bets need both `order.dry_run` and `settings.executor.dry_run` to be false;
   - a receipt or confirmation message left over from an earlier bet is closed first, and if it can't be closed the bot refuses to click, so an old bet id is never reported for the new bet;
-  - an idempotency key that was PLACED or UNCERTAIN is refused (as UNCERTAIN) if it comes again, also after a restart or crash (write-ahead placement journal in the profile directory); definite rejections can be retried;
+  - an idempotency key that was PLACED or UNCERTAIN is refused (as UNCERTAIN) if it comes again, also after a restart or crash (write-ahead placement journal in the profile directory) and whatever else is wrong with the order by then; definite rejections can be retried;
+  - a rejection read off the page after the final click is watched for a few seconds: a receipt or a lower balance turns it into UNCERTAIN;
+  - the accept / decline buttons of the odds-change dialog are taken from inside the notice or the bet slip, never "the first match on the page";
+  - an order that carries a kick-off time (`event_starts_at`, not in `BetOrder` yet) is refused once the event has started, also right before the final click;
   - minimum gap between bets (default 20 s);
   - the bot never opens non-Betclic URLs with the logged-in profile;
   - a lost profile lock stops placements (and closes the browser if another process holds the profile);
@@ -31,8 +35,8 @@ What is in the package:
   - "matched fallback" warnings are logged once per element.
 - **Profile lock.** A lock file created exclusively, holding PID, host, a token and a heartbeat thread. It counts as stale when the heartbeat is older than a set age, or immediately if it is on this machine and the PID is dead. Release only deletes our own file. The Windows PID check uses ctypes.
 - **Login.** `open_login_window` pre-fills credentials from env or keyring (keyring imported lazily) but never submits the form or automates 2FA, then waits for the owner. Credentials are never logged (a test checks this).
-- **Other methods.** `fetch_bet_history` parses "Moje zakłady": id, Warsaw dates, odds, stake, status open/won/lost/void/cashout, payout, with "Pokaż więcej" paging. `health_check` covers browser start, login, balance, key selectors on the listing and on one event page, and the placement journal. `get_balance` parses "1 234,56 zł".
-- **Selectors.** Pydantic-validated `SelectorSet` loaded from YAML: 55 elements, each with ordered fallbacks (css / role+name / text / xpath, Polish texts). It also holds message phrases and bet-id/history regexes, plus behaviour flags. The YAML header explains how to update selectors with Chrome DevTools.
+- **Other methods.** `fetch_bet_history` parses "Moje zakłady": id, Warsaw dates (a displayed minute counts up to its end when filtering by `since`), odds, stake, status open/won/lost/void/cashout, payout, with "Pokaż więcej" paging. `health_check` covers browser start, login, balance, key selectors on the listing and on one event page, and the placement journal. `get_balance` parses "1 234,56 zł".
+- **Selectors.** Pydantic-validated `SelectorSet` loaded from YAML: 56 elements, each with ordered fallbacks (css / role+name / text / xpath, Polish texts). It also holds message phrases and bet-id/history regexes, plus behaviour flags. The YAML header explains how to update selectors with Chrome DevTools.
 - **Helpers.**
   - `FakeExecutor` (scripted results, records every call, simulates balance and history, never places twice for one key);
   - `ThreadBoundExecutor`, needed because Playwright's sync API is tied to one thread and cannot run inside asyncio;
@@ -41,11 +45,12 @@ What is in the package:
   - `PlacementJournal` (crash-safe idempotency);
   - Polish number/date/text utilities and screenshot naming.
 
-Tests (274):
-- Unit tests cover parsing, formatting, selector validation, matching, the lock, the journal, tuning from settings, the fake executor, the halt check and pacing, launch options via a fake Playwright, and the thread wrapper.
-- 81 browser tests run headless with executable_path /opt/pw-browsers/chromium against a mock site on 127.0.0.1. Every click on the final button reaches the mock server, so tests can assert it was never clicked (dry run, halt, odds moved).
+Tests (343):
+- Unit tests cover parsing, formatting, selector validation, matching, the lock, the journal, tuning from settings, the fake executor, the halt check and pacing, launch options via a fake Playwright, the thread wrapper, the URL guard and the order guards.
+- 108 browser tests run headless with executable_path /opt/pw-browsers/chromium against a mock site on 127.0.0.1. Every click on the final button reaches the mock server, so tests can assert it was never clicked (dry run, halt, odds moved). To save time most of them get a fresh browser context of one shared Chromium per module (`tests/executor/conftest.py`, `_SharedBrowserChromium`); `make_executor(real_profile=True)` and the thread-wrapper test use the production `launch_persistent_context` with a real profile directory.
 - Scenarios covered: dry run; placement; stake formatting; stale slip; odds moved before the click and silently in the slip; odds dialog accepted, declined, repeated, and acknowledge-mode; missing and ambiguous market/selection; suspended market; insufficient balance; stake limit; unknown message; login required; halt switched on between steps and during a pause; no confirmation → UNCERTAIN, no retry; idempotency; leftover receipt; broken selectors; history parsing; login prefill (env and keyring); relaunch after the window is closed; profile lock; thread confinement; screenshots.
-- Adversarial scenarios added in review round 1 (`test_executor_browser_safety.py`): page re-render between choosing and clicking a selection; slip showing another market; hidden stale slip selection; stake changed by the page before the final click; stake misread by the site (potential-win cross-check); two stake fields; odds-dialog number contradicting the slip; lingering "odds changed" text after accepting; odds far above the request; covered place button; stale confirmation message; pending-approval receipt; harmless notice next to a real error; restart after UNCERTAIN; crash right at the click; unwritable journal; redirect to another event.
+- Adversarial scenarios added in review round 1 (`test_executor_browser_safety.py`): page re-render between choosing and clicking a selection; slip showing another market; hidden stale slip selection; stake changed by the page before the final click; stake misread by the site (potential-win cross-check); missing or unreadable potential win; two stake fields; odds-dialog number contradicting the slip; lingering "odds changed" text after accepting; odds far above the request; covered place button; stale confirmation message; pending-approval receipt; harmless notice next to a real error; restart after UNCERTAIN; crash right at the click; unwritable journal; redirect to another event.
+- Second batch of review round 1 (`test_executor_browser_review.py`, `test_executor_review_units.py`): odds-change dialog that lingers or never closes after accepting (one accept click only); a second odds change right after accepting; odds dropping while the dialog is open; look-alike "Akceptuj" buttons elsewhere on the page; an ambiguous accept button; a bet taken behind an error-looking notice (three wordings); a real rejection with an untouched balance; selection suspended at the click; a bet placed by the selection click itself (quick-bet mode); live event; kick-off passing while the bot works; broken, duplicated or swapped ("deposit") final button in a dry run; bet-history row placed later in the displayed minute; journal with a torn last line, keys containing Unicode line breaks, a journal that must not be rewritten without the profile lock; already-clicked key with a disabled executor / invalid order / started event / halt; URL scheme downgrade and look-alike hosts; non-finite numbers in an order.
 
 ## Public API
 
@@ -131,10 +136,14 @@ Thread rule: the object is NOT thread-safe; use one thread or the `ThreadBoundEx
 Methods:
 - `place(order: BetOrder) -> PlacementResult`. The bet is real only if BOTH `order.dry_run` and `settings.executor.dry_run` are False. It raises only `ExecutorClosedError` / `ExecutorThreadError` (programming errors); everything else is a result. Statuses:
   - `PLACED`: `external_bet_id` (None if the receipt shows no id; reconcile in that case), `placed_odds`, `balance_after` (None if the header did not update yet), `screenshot_path`. The message carries a `WARNING:` when the balance did not drop by exactly the stake or the accepted odds are below the minimum.
-  - `DRY_RUN_OK`: `placed_odds` = the odds the bet would have had. The final button was never clicked.
-  - `UNCERTAIN`: the final button was clicked but no confirmation or definite rejection was detected within `confirmation_timeout_s` (including an unrecognised message, a receipt that says "pending approval", or an "odds changed" text that stays after the new odds were accepted). Also returned, without touching the page, when the key's final button was already clicked with a PLACED/UNCERTAIN outcome in this process or according to the placement journal (earlier run, crash). NEVER retry; reconcile with `fetch_bet_history`.
-  - No money at risk for all other statuses: `KILL_SWITCH`, `LOGIN_REQUIRED`, `ODDS_MOVED` (below the minimum, or more than `max_odds_rise_factor` x above the requested odds: re-price), `MARKET_UNAVAILABLE`, `INSUFFICIENT_BALANCE`, `REJECTED_BY_BOOKMAKER` (stake limits / rejected), `SELECTOR_ERROR` (a selector did not resolve; the market/selection is ambiguous; several stake fields or place buttons; the slip shows another market, a hidden extra selection, a changed stake or an implausible potential win; the place button is covered; a stale confirmation is displayed; also saves `<screenshot>.html`), `FAILED` (invalid order, executor disabled, browser or lock problem, foreign URL, the page changed while selecting, unknown slip message before the click, unreadable/unwritable placement journal).
-  - After the final click only explicit bookmaker rejections, a declined odds change and a halt before re-confirming count as "no bet"; any other problem after the click is reported as UNCERTAIN.
+  - `DRY_RUN_OK`: `placed_odds` = the odds the bet would have had. Every step up to the final click succeeded, including locating the one enabled "Postaw zakład" button; it was never clicked.
+  - `UNCERTAIN`: the final button was clicked but no confirmation or definite rejection was detected within `confirmation_timeout_s` (including an unrecognised message, a receipt that says "pending approval", an "odds changed" text that stays after the new odds were accepted, or an odds-change dialog that stays on screen after it was accepted). Also:
+    - a rejection was shown after the click but a receipt appeared or the header balance dropped below its value from before the click within `balance_update_wait_s` (the message says which);
+    - a receipt appeared or the balance dropped right after clicking the SELECTION (quick-bet mode; also for dry-run orders);
+    - without touching the page, when the key's final button was already clicked with a PLACED/UNCERTAIN outcome in this process or according to the placement journal (earlier run, crash). This check comes first: such a key is never answered with FAILED, KILL_SWITCH or MARKET_UNAVAILABLE.
+    NEVER retry; reconcile with `fetch_bet_history`.
+  - No money at risk for all other statuses: `KILL_SWITCH`, `LOGIN_REQUIRED`, `ODDS_MOVED` (below the minimum, or more than `max_odds_rise_factor` x above the requested odds: re-price; also an odds-change dialog whose accept button is ambiguous), `MARKET_UNAVAILABLE` (market/selection missing or suspended, event removed or redirected, event live, event already started according to the order's `event_starts_at`), `INSUFFICIENT_BALANCE` (the bookmaker's message; or the final button is missing/disabled while the stake exceeds the header balance), `REJECTED_BY_BOOKMAKER` (stake limits / rejected), `SELECTOR_ERROR` (a selector did not resolve; the market/selection is ambiguous; several stake fields or place buttons; the slip shows another market, a hidden extra selection, a changed stake, an implausible or unreadable potential win; the place button is covered; a stale confirmation or receipt is displayed; also saves `<screenshot>.html`), `FAILED` (invalid order incl. non-finite numbers, executor disabled, browser or lock problem, foreign URL or another scheme than `base_url`, the page changed while selecting, unknown slip message before the click, unreadable/unwritable placement journal).
+  - After the final click only explicit bookmaker rejections (not contradicted by a receipt or the balance), a declined odds change and a halt before re-confirming count as "no bet"; any other problem after the click is reported as UNCERTAIN. A post-click rejection takes up to `balance_update_wait_s` longer to return.
   - Definite rejections that happen after the click may be retried later with the same key.
   - Dry-run orders are never refused for an already clicked key (they never click).
   - Validation: non-blank `idempotency_key`; stake > 0 with at most 2 decimals and ≥ `settings.betclic.min_stake`; `min_acceptable_odds > 1`; `requested_odds > 1`; names present; `event_url`, or `external_event_id` matching `[A-Za-z0-9_.:-]+`.
@@ -142,7 +151,7 @@ Methods:
 - `is_logged_in() -> bool`: loads the home page and checks the header state. Raises `BrowserStartError` / `ProfileLockedError` / Playwright errors if the browser cannot be used.
 - `open_login_window(timeout_s: float = 600.0) -> bool`: visible browser on `urls.login`; clicks "Zaloguj się". With `credentials_source` "env" or "keyring" (lazy `import keyring`; `get_password(service, username)` if a username is configured, else `get_credential(service, None)`) it pre-fills the fields but never submits. Returns True when the logged-in indicator appears, False on timeout. If the owner closes the window, it re-checks the saved session.
 - `health_check() -> ExecutorHealth`: `ok` requires the browser running, logged in, balance readable, all checked selectors resolving and a readable placement journal. `selectors_ok` keys: `login_state`, `header_balance`, `nav_my_bets`, `event_link`, `market_container`, `market_title`, `selection_button`, `selection_odds`. Failures appear in `message`. A lock or browser failure gives `ok=False` and never raises.
-- `fetch_bet_history(since: datetime) -> list[BookmakerBetRecord]`: rows from "Moje zakłady" placed at or after `since` (rows with an unknown date are kept; an unreadable row is skipped). Raises `LoginRequiredError`, `SelectorNotFoundError`, `BrowserStartError`, `ProfileLockedError`.
+- `fetch_bet_history(since: datetime) -> list[BookmakerBetRecord]`: rows from "Moje zakłady" that may have been placed at or after `since`. The history shows minutes (or only the day) and `placed_at` is the START of that minute/day, so a row is returned when its minute (day) ends at or after `since`: pass the attempt time as it is, no margin needed, and match on selection + stake afterwards. Rows with an unknown date are kept; an unreadable row is skipped. Raises `LoginRequiredError`, `SelectorNotFoundError`, `BrowserStartError`, `ProfileLockedError`.
 - `close() -> None`: idempotent.
 - Properties: `screenshot_dir: Path`, `listing_url: str`.
 - `LoginState(StrEnum)`: LOGGED_IN / LOGGED_OUT / UNKNOWN.
@@ -150,9 +159,9 @@ Methods:
 Screenshots: one per attempt that reaches the browser, in `settings.executor.screenshot_dir`, named `YYYYMMDDTHHMMSSZ_bet<bet_id>_<idempotency-key>_<status>.png`.
 
 ## Placement journal (`cs2bot.executor.journal`)
-- File `<settings.betclic.browser_profile_dir>/cs2bot-placements.jsonl` (`JOURNAL_FILENAME`), JSON lines `{"event": "click"|"result", "key", "bet_id", "at", "status"?}`. No credentials, stakes or account data.
-- A `click` record is appended and fsync-ed immediately before the final click (if it cannot be written the button is not clicked: `FAILED`). A `result` record follows when the outcome is known.
-- A key is blocked while its latest record is a `click` (the process died around the click) or a result of `placed` / `uncertain`. Definite rejections unblock it. Records older than `journal_retention_days` (60) are ignored and removed at start-up. Malformed lines are skipped.
+- File `<settings.betclic.browser_profile_dir>/cs2bot-placements.jsonl` (`JOURNAL_FILENAME`), JSON lines `{"event": "click"|"result", "key", "bet_id", "at", "status"?}`, ASCII only (non-ASCII key characters are `\u`-escaped), records separated by `\n`. No credentials, stakes or account data.
+- A `click` record is appended and fsync-ed immediately before the final click (if it cannot be written the button is not clicked: `FAILED`). A `result` record follows when the outcome is known. A record is always a line of its own, also after a torn earlier write.
+- A key is blocked while its latest record is a `click` (the process died around the click) or a result of `placed` / `uncertain`. Definite rejections unblock it. Records older than `journal_retention_days` (60) are ignored; they are removed (`compact`) on the first placement after this process has taken the profile lock, never by merely constructing an executor. Malformed lines are skipped.
 - `PlacementJournal(path: Path, *, retention_days: float = 60.0, clock=utcnow)` with `.entries() -> list[JournalEntry]`, `.latest(key)`, `.blocking_entry(key) -> JournalEntry | None`, `.record_click(key, bet_id)`, `.record_result(key, bet_id, status: PlacementStatus)`, `.compact() -> int`. Read/write problems raise `JournalError` (`compact` never raises).
 - `JournalEntry(event, key, bet_id, at, status=None)` with `.blocks`.
 - Deleting the browser profile directory deletes the journal with it.
@@ -190,16 +199,19 @@ ThreadBoundExecutor(factory: Callable[[], AccountExecutor], *, thread_name: str 
 - `SelectorSet` (pydantic) fields:
   - `version`
   - `urls: SiteUrls(login="/", cs2_listing=None, bet_history=None)`
-  - `behaviour: SelectorBehaviour(odds_change_accept_places_bet=True, dismiss_cookie_banner=True, dismiss_popups=True, require_slip_market_match=True, count_hidden_slip_items=True)`
+  - `behaviour: SelectorBehaviour(odds_change_accept_places_bet=True, dismiss_cookie_banner=True, dismiss_popups=True, require_slip_market_match=True, count_hidden_slip_items=True, require_potential_win=True)`
   - `attributes: dict[str, list[str]]`, `texts: dict[str, list[str]]` (normalised at load), `patterns: dict[str, list[str]]`
   - `elements: dict[str, ElementSpec]`
   - Class constants `REQUIRED_ELEMENTS` and `REQUIRED_TEXTS`.
 - Behaviour flags added in review round 1:
   - `require_slip_market_match`: a market name shown in the slip that does not fit the ordered market aborts the bet (false: warning only).
   - `count_hidden_slip_items`: slip selections that are in the DOM but hidden count as stale selections (false: only visible ones count).
+  - `require_potential_win` (second pass): no bet and no successful dry run unless `slip_potential_win` resolves and holds exactly one amount within the accepted range of stake x odds (false: the check is skipped when the element is missing or unreadable). With the flag on, a selector file that does not define `slip_potential_win` is rejected when it is loaded.
 - `texts.ignore`: phrases of harmless slip notices; such messages are skipped. Messages are classified element by element in the order pending, bet_accepted, insufficient_balance, stake_limit, odds_changed, market_suspended, login_required, rejected.
-- Optional element `slip_potential_win`: potential payout in the slip, used to cross-check the stake.
+- Element `slip_potential_win`: potential payout in the slip, used to cross-check the stake (needed for betting while `require_potential_win` is true).
+- Optional element `event_live_indicator` (second pass): marker of an event that is in play; when visible the bet is refused with MARKET_UNAVAILABLE.
 - `slip_stake_input` and `slip_place_button` must match exactly one visible element.
+- `odds_changed_accept` / `odds_changed_decline`: looked up inside `odds_changed_notice` first, then inside `slip_container` (the whole page only if that does not resolve), and used only when exactly one visible element matches. The shipped names are anchored regexes ("Akceptuj", "Akceptuj zmiany", "Akceptuj nowy kurs", "... i postaw zakład"; "Anuluj", "Odrzuć"), so "Akceptuj wszystkie" of a cookie banner does not match.
 - `SelectorSet` methods:
   - `resolve(root: Page | Locator, key: str, timeout_s: float, *, state: Literal["attached", "visible"] = "visible", params: Mapping[str, str] | None = None, poll_s: float = 0.15) -> ResolvedElement`: polls all specs in priority order until one matches; raises `SelectorNotFoundError` listing every spec tried.
   - `try_resolve(...) -> ResolvedElement | None`, `resolve_all(..., limit=None) -> list[Locator]`, `probe(root, key, *, state="visible", params=None) -> ResolvedElement | None` (one non-waiting pass).
@@ -225,12 +237,12 @@ ThreadBoundExecutor(factory: Callable[[], AccountExecutor], *, thread_name: str 
 
 ## Tuning (`cs2bot.executor.tuning`)
 `ExecutorTuning` is a frozen dataclass.
-- `ExecutorTuning.from_settings(settings: Settings, **overrides) -> ExecutorTuning` copies the fields named in `SETTINGS_FIELDS` from `settings.executor`; overrides win; inconsistent values raise `ValueError`, unknown override names `TypeError`.
+- `ExecutorTuning.from_settings(settings: Settings, **overrides) -> ExecutorTuning` copies every tuning field that `settings.executor` also has under the same name (today exactly the names in `SETTINGS_FIELDS`; a field added to `ExecutorSettings` later is picked up without a code change); overrides win; inconsistent values raise `ValueError`, unknown override names `TypeError`.
 - Defaults:
   - viewport 1440x900
   - action_timeout_s 15, element_timeout_s 10, optional_timeout_s 1.5
   - login_check_timeout_s 8, login_logged_out_stable_s 1.5, login_poll_s 1
-  - slip_update_timeout_s 8, confirmation_timeout_s 45, balance_update_wait_s 5
+  - slip_update_timeout_s 8, confirmation_timeout_s 45, balance_update_wait_s 5 (also the watch window after a post-click rejection)
   - poll_interval_s 0.2, slip_settle_s 0.3
   - max_odds_change_rounds 2, min_seconds_between_bets 20, typing_delay 60–180 ms
   - history_max_load_more 10, health_check_event_page True, save_html_on_selector_error True
@@ -251,19 +263,28 @@ ThreadBoundExecutor(factory: Callable[[], AccountExecutor], *, thread_name: str 
 - Mapping from result to `bets.status`: use `cs2bot.domain.betting.bet_status_after_placement` (`engine.ledger.apply_placement` does):
   - PLACED → PLACED (write the ledger stake)
   - DRY_RUN_OK → DRY_RUN
-  - UNCERTAIN → keep PLACING and reconcile with `fetch_bet_history` (match by `external_bet_id`, else by selection + stake + `placed_at` ≥ attempt time)
+  - UNCERTAIN → keep PLACING and reconcile with `fetch_bet_history(since=<attempt time>)` (match by `external_bet_id`, else by event + market + selection + stake among the rows returned; the method already allows for the minute resolution of the displayed time). An UNCERTAIN result can also come from a dry-run order (quick-bet mode): treat it the same way and alert the owner.
   - LOGIN_REQUIRED → `state.set_paused(..., reason="Betclic login required")`
   - SELECTOR_ERROR → pause + dashboard alert
   - anything else → FAILED
 - ODDS_MOVED also covers "odds rose too far": re-price the outcome with fresh odds on the next cycle instead of resending the same order.
+- Never send a bet that is PLACING (UNCERTAIN) again. The executor answers UNCERTAIN for its key as a second line of defence, but a retry under a NEW idempotency key is a second bet.
+- A PLACED result whose message contains `WARNING:` (balance changed by another amount than the stake, or accepted below the minimum odds) should raise a dashboard alert.
+- Before going live the owner checks two account settings by hand (also listed in the header of config/betclic_selectors.yaml): Betclic must ask before taking a bet at changed odds (no automatic acceptance), and no quick-bet / one-click mode.
 
 ## Known limitations
 
 - All selectors in config/betclic_selectors.yaml are unverified guesses (betclic.pl is geo-blocked here); the mock site was built to match them, so passing tests prove the logic, not the live DOM. Before real bets the owner must run `cs2bot executor health` and one DRY_RUN placement on the PC, fixing selectors by following the DevTools guide in the YAML header.
-- The strict checks fail closed on a page that differs from the guesses: several visible stake fields or place buttons, hidden slip items kept in the DOM, a slip that words the market differently, or a `slip_potential_win` locator that hits the wrong element all give SELECTOR_ERROR until the YAML is adjusted (flags `count_hidden_slip_items`, `require_slip_market_match`; remove or fix the locator). The DRY_RUN smoke test shows all of them except the final-button checks.
+- The strict checks fail closed on a page that differs from the guesses: several visible stake fields or place buttons, hidden slip items kept in the DOM, a slip that words the market differently, a potential win that is missing, unreadable or outside the expected range all give SELECTOR_ERROR until the YAML is adjusted (flags `count_hidden_slip_items`, `require_slip_market_match`, `require_potential_win`; or fix the locator). The DRY_RUN smoke test shows all of them, including a final button that cannot be located; only the trial click on that button and everything after the click are not exercised by a dry run.
+- If Betclic's account is set to accept changed odds automatically, a bet can be taken below `min_acceptable_odds` without any dialog. The executor can only report that afterwards (a `WARNING:` on the PLACED result when the receipt shows the odds). The owner must switch automatic acceptance off.
+- Whether Betclic has a quick-bet / one-click mode is unknown. If a bet appears right after the bot clicks an outcome, the attempt ends UNCERTAIN (detected through a receipt or a lower balance only).
+- The post-click cross-check of a rejection needs a readable header balance (or a receipt). With an unreadable balance a wrongly classified rejection is not detected; `health_check` reports an unreadable balance.
+- The accepted-dialog rule is conservative: if the page reuses the same accept-button element for a second odds change, or a second change offers exactly the price already accepted, it is treated as the same dialog, nothing is clicked and the result is UNCERTAIN.
+- `event_live_indicator` is an unverified guess like every other selector: until it is confirmed, the only protection against betting on a started match is the caller's timing (and `event_starts_at`, once `BetOrder` has it).
 - How Betclic's odds-change dialog behaves is unknown, so behaviour.odds_change_accept_places_bet defaults to true (accepting submits the bet). If the real site needs a second click, the result is UNCERTAIN (reconciliation finds no bet), never a double bet; set it to false once observed.
 - `max_odds_rise_factor` (1.5), the potential-win ratios and `journal_retention_days` can only be changed through an explicit `ExecutorTuning`; they are not in `ExecutorSettings` yet.
-- The potential-win cross-check assumes Betclic shows the total payout (stake x odds x 0.88). If it shows the net profit instead, the check aborts with SELECTOR_ERROR and the ratios must be adjusted.
+- The potential-win cross-check assumes Betclic shows the total payout (stake x odds x 0.88). If it shows the net profit instead, the check aborts with SELECTOR_ERROR; the ratios must then be adjusted (explicit `ExecutorTuning` today) or, as a last resort, `require_potential_win` switched off.
+- If the wrapped executor cannot be created (broken selector file), `ThreadBoundExecutor.place` answers FAILED without looking at the placement journal, also for a key that was clicked in an earlier run.
 - The placement journal lives in the browser-profile directory. Deleting that directory (to reset the login) also deletes the record of clicked keys.
 - The idempotency key is the only identity the executor knows. Two different keys for the same outcome are two bets: the engine's `load_already_bet_keys` must prevent that.
 - Session cookies without an expiry may be dropped when Chromium restarts. The bot relies on staying alive inside `cs2bot up` and on the owner ticking 'remember me' at the manual login. Cookies are not exported to disk on purpose: that would store an unencrypted session token.
@@ -275,11 +296,12 @@ ThreadBoundExecutor(factory: Callable[[], AccountExecutor], *, thread_name: str 
 - Playwright's sync API cannot run inside an asyncio event loop and is tied to one thread. Use ThreadBoundExecutor / create_betclic_executor; a long open_login_window blocks other queued executor calls until it returns.
 - The cookie banner is only dismissed via 'reject / necessary only' buttons; the bot never accepts optional cookies for the owner (the owner handles the banner during the first manual login).
 - Attempts that never reach the browser (invalid order, duplicate key, executor disabled, profile lock or browser start failure) produce no screenshot. Every attempt that reaches the browser does.
-- Browser tests launch Chromium once per test: the directory takes about 2 min 25 s serially, 1 min 25 s with `-n 2`.
+- A placement against the mock site costs about a second of Playwright round trips, so the 108 browser tests take about 1 min 55 s with `-n 2` and 2 min 55 s serially.
 
 ## Foundation change requests
 
-- src/cs2bot/config.py `ExecutorSettings`: add `max_odds_rise_factor: float | None = 1.5`, `potential_win_min_ratio: float = 0.70`, `potential_win_max_ratio: float = 1.05` and `journal_retention_days: float = 60.0`, so the owner can change them from `.env`. Then add the four names to `cs2bot.executor.tuning.SETTINGS_FIELDS` (one line; `from_settings` copies whatever is listed there).
+- src/cs2bot/config.py `ExecutorSettings`: add `max_odds_rise_factor: float | None = 1.5`, `potential_win_min_ratio: float = 0.70`, `potential_win_max_ratio: float = 1.05` and `journal_retention_days: float = 60.0`, so the owner can change them from `.env`. `ExecutorTuning.from_settings` picks up same-named fields automatically; only add the four names to `cs2bot.executor.tuning.SETTINGS_FIELDS` (a test pins that tuple to the shared fields).
+- src/cs2bot/domain/betting.py `BetOrder`: add `event_starts_at: datetime | None = None` (UTC-aware kick-off of the bookmaker event, from `bookmaker_events.start_time`) and have the integration layer fill it. The executor already refuses an order whose `event_starts_at` has passed (before opening the browser and again right before the final click); without the field that check is inactive. It matters because orders are queued: a manual login window alone can hold the queue for ten minutes, and the model is pre-match only.
 - docs/ARCHITECTURE.md P9: document that `BetExecutor` includes `close()`, plus `AccountExecutor` (is_logged_in, open_login_window, fetch_bet_history), `ThreadBoundExecutor`, `create_betclic_executor(settings, session_factory)`, that real bets require both `order.dry_run` and `settings.executor.dry_run` to be false, and that the executor keeps a placement journal (`cs2bot-placements.jsonl`) in the browser-profile directory.
 - src/cs2bot/domain/betting.py `PlacementStatus.ODDS_MOVED`: add a comment that it also covers odds that rose implausibly far above `requested_odds` (the order must be re-priced, not resent).
 - src/cs2bot/domain/betting.py `BetOrder`: consider adding the bookmaker's event name (`event_name: str = ""`, from `bookmaker_events.name`). The executor could then verify the event shown on the page and in the slip; today a wrong event can only be detected through the event id in the URL.
@@ -290,9 +312,11 @@ ThreadBoundExecutor(factory: Callable[[], AccountExecutor], *, thread_name: str 
 
 ## Review round 1
 
-Independent review of the package against docs/dev/briefs/executor.md (requirements, addendum, review focus). All fixes are inside the package's owned paths. Checks after the fixes: 274 tests pass (193 unit, 81 browser), ruff check and format clean, mypy clean, tests/foundation passes.
+Independent review of the package against docs/dev/briefs/executor.md (requirements, addendum, review focus). All fixes are inside the package's owned paths. The round was done in two passes: the first reviewer was cut off after writing "First pass" below; the second pass verified that work critically (read all code, ran everything) and continued. Checks after both passes: 343 tests pass (235 unit, 108 browser), ruff check and format clean, mypy clean, tests/foundation passes.
 
-### What was verified
+### First pass
+
+#### What was verified
 - Requirements 1–5 point by point: contracts, selector loading and resolution, launch options, profile lock, login window, placement steps 1–11, balance, bet history, health check, utilities, test scenarios.
 - The placement flow was re-derived step by step for the review-focus properties: never twice, never when halted, never below the minimum odds, never with a stale slip, stake equal to the order stake, dry run never clicks.
 - Polish number parsing and formatting, text normalisation, name matching, date parsing, URL host check, screenshot naming.
@@ -300,7 +324,7 @@ Independent review of the package against docs/dev/briefs/executor.md (requireme
 - Interfaces against docs/ARCHITECTURE.md, `cs2bot.domain.betting`, `engine.ledger.apply_placement` and the API's `login_launcher` / `executor_health_provider`.
 - Each bug below was first reproduced as a failing test against the unmodified code (where marked "reproduced"), then fixed.
 
-### Issues found and fixed
+#### Issues found and fixed
 1. **Critical, reproduced: a page re-render could redirect the bet to another market.** The chosen market and selection are addressed by position. If the page re-rendered during the human-like pause (a market added or removed above), the click landed on the same-named outcome of another market, and the slip check only logged a warning. The mock test placed a real bet on "Zwycięzca mapy 1" instead of "Zwycięzca meczu". Fixed: the market title, selection name, lock state and odds are read again immediately before the click, and a slip showing another market now aborts (`behaviour.require_slip_market_match`).
 2. **Critical, reproduced: the stake was not re-checked before the final click.** A page that changed the stake field after it was typed (re-render, default stake) got the changed stake placed. Fixed: the stake field is read again right before the click and must equal the order stake.
 3. **Critical, reproduced: an odds-change dialog could be accepted below the minimum odds.** The new price was read from the dialog alone; any other number in it (or a dialog lagging behind the slip) was trusted. The mock test accepted "1,90" while the bet went in at 1,60 with a minimum of 1,80. Fixed: the dialog and the slip are both read and the lower price counts; a free-text number without a readable slip is not trusted.
@@ -321,9 +345,46 @@ Independent review of the package against docs/dev/briefs/executor.md (requireme
 18. **Minor: slip messages were classified as one joined text**, so one phrase could hide another message. Fixed: classified per element; new `texts.ignore` list for harmless notices.
 19. **Minor:** the pacing gap was slept before the halt check (a halted bot waited 20 s per order); a blank idempotency key and `requested_odds <= 1` were accepted; `fill()` errors on number inputs surfaced as FAILED; "load more" in the bet history was clicked up to 10 times even when it loaded nothing; one unparsable history row aborted the whole fetch; the odds text was removed from every position of a selection label; `FakeExecutor` placed the same key twice; a flaky test asserted the receipt was closed before the page had closed it (the executor now waits briefly for it). All fixed.
 
+### Second pass
+
+#### What was verified
+- Everything the first pass changed: read in full, the 274 tests re-run (all passed), each claimed fix traced in the code. Two of its statements were corrected here: the dry run did not check the final button at all (now it locates it), and the potential-win cross-check was silently skipped when the element was missing (now required by default).
+- Requirements 1–5 and the addendum once more, point by point; nothing was missing or stubbed.
+- The placement flow again from the point of view of "what can the page do that we do not expect": slow or repeated answers, look-alike buttons, messages that mean something else, account modes, queues and time.
+- What "definitely not placed" means for the caller: `bets.idempotency_key` is unique in the database, so a retry of a FAILED bet is a NEW key. The executor's per-key idempotency does not protect against a wrong "no bet" answer; every such answer after a click had to be re-examined.
+- Journal file format and crash behaviour, URL guard, order validation, launch options, lock, thread wrapper, credentials (never logged; tests exist), text utilities with adversarial inputs.
+- Interfaces: `engine.ledger.apply_placement`, `engine.decision.min_acceptable_odds` (3 decimals, Decimal comparison), the odds collector's raw names, external ids and event URLs (`-m<id>`; split market rows keep Betclic's raw name and original id), the API's `login_launcher` / health provider.
+- Every issue below marked "reproduced" was first written as a failing test against the code as the first pass left it.
+
+#### Issues found and fixed
+1. **Critical, reproduced: an odds-change dialog could be accepted twice.** After the accept click the code waited a few seconds and, if the dialog was still on screen (slow server, no spinner), treated it as a new odds change and clicked "accept" again. Against the mock the second click placed the bet while the first request was still in flight: on a real site that is a second bet. Fixed: the clicked accept button is remembered (element handle) together with the accepted price; a dialog counts as new only if the page showed no dialog in between, or the clicked element is gone AND the offered price differs. Otherwise nothing is clicked and, without a receipt, the result is UNCERTAIN.
+2. **Critical, reproduced: a bet that WAS taken could be reported as "definitely not placed".** After the final click any text matching a rejection phrase ended the attempt as ODDS_MOVED / MARKET_UNAVAILABLE / REJECTED_BY_BOOKMAKER. "Kurs uległ zmianie" can accompany a bet taken at updated odds, "niedostępny" can be about cash-out. The mock took the bet and the executor answered ODDS_MOVED; the caller would have staked the money again under a new key. Fixed: before a post-click rejection is returned the page is watched for `balance_update_wait_s`; a receipt or a balance below its value from before the click turns the result into UNCERTAIN.
+3. **Critical, reproduced: the new odds were not read again before accepting.** The price was read when the dialog was found, then came a human-like pause, then the click. A price that dropped below the minimum during the pause was accepted (the mock placed at 1,60 with a minimum of 1,80, reported as 1,82). Fixed: read again immediately before the accept click; decline if no longer acceptable.
+4. **Critical, reproduced: the accept / decline button was "the first match on the page".** The locator was `/akceptuj/i` page-wide; with a cookie banner's "Akceptuj wszystkie" earlier in the page the bot clicked that one (twice in the mock test), accepting cookies for the owner and never the odds. Fixed in code (inside the notice, else inside the bet slip, else page-wide; exactly one match or nothing is clicked) and in the YAML (anchored names; the bare-text fallback that could hit a label was removed).
+5. **Critical: an already-clicked key could be answered with FAILED.** Order validation ran before the "already clicked" check, so a re-sent UNCERTAIN bet came back as FAILED when the executor was disabled or the order no longer validated - a "no bet" answer for a bet that may exist. Fixed: the already-clicked check comes first (test covers disabled executor, invalid stake, started event, halt).
+6. **Major, reproduced: reconciliation could miss the very bet it looks for.** `fetch_bet_history(since)` compared the displayed time ("18:30", minute resolution, parsed as 18:30:00) with `since`; a bet placed at 18:30:40 and looked up with the attempt time 18:30:20 was filtered out as older, so an UNCERTAIN bet would be judged "not placed". Fixed: a row is kept when its displayed minute (or day) ends at or after `since`; the load-more stop condition uses the same rule.
+7. **Major, reproduced: a `click` journal record could be unreadable.** (a) After a torn last line (crash inside a write) the next record was glued to the fragment and skipped as malformed. (b) A key containing U+2028 or U+0085 was written raw and split in two by `str.splitlines()`. In both cases the write-ahead record did not block the key. Fixed: a record always starts on its own line; records are ASCII-escaped and split on `\n` only (old files stay readable).
+8. **Major: the journal was rewritten without the profile lock.** `BetclicExecutor.__init__` compacted the journal; a second process (`cs2bot executor login` while `cs2bot up` runs) could drop a record the running bot was appending. Fixed: compaction happens on the first placement after the lock is held.
+9. **Major, reproduced: the dry run did not look for the final button.** The smoke test could not reveal a wrong `slip_place_button` selector, the most important one. Fixed: the dry run locates the one enabled button (never clicks it); `_click_place_button` additionally refuses to click unless the attempt is real, journaled and marked as clicked.
+10. **Major: an unverifiable stake was sent.** The potential-win cross-check, the only check of what the site understood from "12,50", was skipped when its element did not resolve or held two numbers. Fixed: required by default (`behaviour.require_potential_win`), with an explicit opt-out for the owner.
+11. **Major, reproduced: a bet placed by the selection click itself went unnoticed.** With a quick-bet account mode the slip stays empty and the attempt ended SELECTOR_ERROR, a "no bet" status. Fixed: a receipt that appears right after the outcome was clicked, or (when the selection did not become the slip's single item) a lower balance, makes the result UNCERTAIN and blocks the key (journal), also for dry-run orders.
+12. **Major: nothing stopped a bet on a match that had started.** Orders wait in a queue (pacing gap, a login window of up to ten minutes). Fixed as far as possible inside the package: optional `event_live_indicator` selector (MARKET_UNAVAILABLE), and a kick-off check on `order.event_starts_at` that takes effect once `BetOrder` has the field (foundation change request), run before the browser and again right before the final click.
+13. **Minor, reproduced: a selection suspended at the moment of the click was a SELECTOR_ERROR** (which pauses the bot). Fixed: the bookmaker's slip message is read first (MARKET_UNAVAILABLE).
+14. **Minor: a missing or disabled final button on an underfunded account was a SELECTOR_ERROR.** Sites swap the button for a deposit button. Fixed: INSUFFICIENT_BALANCE when the stake exceeds the header balance.
+15. **Minor: `_safe_url` accepted `http://` for an `https://` site** (the session cookie would travel in clear text). Fixed: same scheme, host and port as `base_url`.
+16. **Minor: the trial click ran after the final reads**, so up to `action_timeout_s` could pass between verifying odds/stake and clicking. Fixed: actionability first, then the reads, the journal record, the halt check and the click; a receipt appearing during the pause also aborts.
+17. **Minor:** NaN / Infinity in an order built with `model_copy` raised from `place` (now FAILED); `from_settings` needed a code change for every knob added to `ExecutorSettings` (now picks up same-named fields); a racy assertion in one new test.
+
+#### Not changed on purpose
+- The stake check stays a numeric comparison of the field value with the order stake (not a string comparison): the site may reformat "12,50" as "12,50 zł" or "12.50". What the site understood is covered by the potential-win check.
+- No balance pre-check before the click (the header balance may exclude bonus funds); the bookmaker's own answer decides, except for the missing/disabled-button case above.
+
 ### Remaining concerns
-- The live site is still unverified. The new strict checks make a wrong guess fail closed with SELECTOR_ERROR rather than bet wrongly, but the owner must expect to adjust the YAML during the DRY_RUN smoke test.
-- The executor cannot verify the event itself beyond the id in the URL, because `BetOrder` carries no team or event name (see the foundation change request).
-- The acknowledge-mode path (`odds_change_accept_places_bet: false`) re-clicks the place button once. It now re-checks the receipt, messages, slip and stake after a pause first, but its safety on the real site depends on the flag matching the site's real behaviour.
-- The integration layer must still mark bets PLACING before calling `place` and reconcile UNCERTAIN results; the journal only guards against clicking twice for the same key.
-- Serial test time (2 min 25 s) is above the 2-minute guideline; with `-n 2` it is 1 min 25 s.
+- The live site is still unverified. The strict checks make a wrong guess fail closed (SELECTOR_ERROR, UNCERTAIN) rather than bet wrongly, but the owner must expect to adjust the YAML during the DRY_RUN smoke test, in particular `slip_potential_win` (now required), the odds-change dialog buttons (anchored names) and `event_live_indicator`.
+- Two Betclic account settings cannot be checked by the bot: automatic acceptance of changed odds and a possible quick-bet mode. They are documented in the YAML header and must be checked by hand.
+- The executor cannot verify the event itself beyond the id in the URL, because `BetOrder` carries no team or event name, and it cannot refuse a started event until `BetOrder` carries `event_starts_at` (see the foundation change requests).
+- The acknowledge-mode path (`odds_change_accept_places_bet: false`) re-clicks the place button once. It re-checks the receipt, messages, slip and stake after a pause first, but its safety on the real site depends on the flag matching the site's real behaviour.
+- The integration layer must still mark bets PLACING before calling `place`, never re-send a PLACING bet, and reconcile UNCERTAIN results; the journal only guards against clicking twice for the same key, and a retry under a new key is a new bet.
+- A post-click rejection is only as trustworthy as the Polish phrases in `texts.*` plus the balance / receipt cross-check; with an unreadable header balance the cross-check has only the receipt to go on.
+- Test time is about 1 min 55 s with `-n 2` but 2 min 55 s serially (108 browser tests), above the 2-minute guideline for a serial run. Each browser test guards a money-safety property, so none was dropped or marked slow.
+- Telling a new odds-change dialog from the accepted one relies on the clicked element having gone and the offered price being different. A page that re-creates the accept button of the SAME dialog while its request is in flight and, in that moment, shows a different price would be taken for a new dialog (a second accept click). No way was found to rule this out without the real DOM; `max_odds_change_rounds: 0` in the settings disables accepting altogether (every odds change is declined) if the owner prefers.

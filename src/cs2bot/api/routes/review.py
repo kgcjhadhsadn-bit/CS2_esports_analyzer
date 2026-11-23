@@ -15,17 +15,17 @@ from datetime import datetime, timedelta
 from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from sqlalchemy import func, null, select, update
+from sqlalchemy import func, null, or_, select, update
 from sqlalchemy.orm import Session
 
 from cs2bot.api.analytics import OPEN_STATUSES
 from cs2bot.api.deps import DB, Auth, Ctx, Paging, require_auth
-from cs2bot.api.params import ListParam, parse_enum_list, validation_error
+from cs2bot.api.params import IdPath, ListParam, parse_enum_list, validation_error
 from cs2bot.api.queries import event_ref, load_matches, market_counts, match_brief, match_load_options
 from cs2bot.api.schemas import ReviewActionIn, ReviewActionOut, ReviewCandidate, ReviewItem, ReviewPage
 from cs2bot.db import state
 from cs2bot.db.models import Bet, BookmakerEvent, BookmakerMarket, BookmakerSelection, Match, TeamAlias
-from cs2bot.domain.enums import LinkStatus
+from cs2bot.domain.enums import BetStatus, LinkStatus
 from cs2bot.utils.logging import get_logger
 from cs2bot.utils.names import team_name_similarity
 from cs2bot.utils.time import ensure_utc
@@ -178,6 +178,7 @@ def reset_event_mappings(session: Session, event_id: int) -> int:
 
 
 def _open_bets_on_event(session: Session, event_id: int) -> int:
+    """Unsettled bets (real or paper) on the event's selections - shown as a warning to the reviewer."""
     selection_ids = (
         select(BookmakerSelection.id)
         .join(BookmakerMarket, BookmakerSelection.market_id == BookmakerMarket.id)
@@ -186,7 +187,10 @@ def _open_bets_on_event(session: Session, event_id: int) -> int:
     return int(
         session.scalar(
             select(func.count(Bet.id)).where(
-                Bet.selection_id.in_(selection_ids), Bet.status.in_(list(OPEN_STATUSES))
+                Bet.selection_id.in_(selection_ids),
+                Bet.status.in_(list(OPEN_STATUSES)),
+                # a settled paper bet keeps status dry_run: it is no longer open
+                or_(Bet.status != BetStatus.DRY_RUN, Bet.settled_at.is_(None)),
             )
         )
         or 0
@@ -194,7 +198,7 @@ def _open_bets_on_event(session: Session, event_id: int) -> int:
 
 
 @router.post("/links/{event_id}", response_model=ReviewActionOut)
-def review_action(event_id: int, body: ReviewActionIn, ctx: Ctx, db: DB, auth: Auth) -> ReviewActionOut:
+def review_action(event_id: IdPath, body: ReviewActionIn, ctx: Ctx, db: DB, auth: Auth) -> ReviewActionOut:
     """confirm (optionally with ``match_id``), reject, or relink to ``match_id``."""
     event = db.get(BookmakerEvent, event_id)
     if event is None:

@@ -1,0 +1,100 @@
+# PostgreSQL for cs2bot - the ONLY thing that runs in Docker.
+#
+# The Python app (scrapers, models, executor, API + dashboard) runs natively with uv, so that
+# Playwright can open a real, visible browser window for the Betclic login.
+#
+#   start:   docker compose up -d            (deploy/windows/start.ps1 and scripts/dev.sh do this)
+#   status:  docker compose ps               ("healthy" = ready)
+#   stop:    docker compose stop             (data is kept)
+#   logs:    docker compose logs -f postgres
+#   DANGER:  docker compose down -v          deletes the database volume
+#
+# Values come from the .env file next to this file (Docker Compose reads it automatically). The
+# defaults below match CS2BOT_DATABASE__URL in .env.example:
+#   postgresql+psycopg://cs2bot:change-me@127.0.0.1:5432/cs2bot
+# If you set POSTGRES_USER / POSTGRES_PASSWORD / POSTGRES_DB / POSTGRES_PORT in .env, change
+# CS2BOT_DATABASE__URL to match. POSTGRES_USER / PASSWORD / DB are only applied when the database
+# volume is created for the first time; changing them later does NOT change an existing database.
+
+name: cs2bot
+
+services:
+  postgres:
+    # Pinned minor version on a pinned Debian release. Update deliberately (deploy/windows/update.ps1
+    # takes a backup first). Never change the major version (16) without a dump + restore.
+    image: postgres:16.16-bookworm
+    container_name: cs2bot-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-cs2bot}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-change-me}
+      POSTGRES_DB: ${POSTGRES_DB:-cs2bot}
+      # UTF-8 with the C.UTF-8 locale: sort order does not depend on the OS library version, so an
+      # image update can never invalidate text indexes. Checksums detect disk corruption early.
+      POSTGRES_INITDB_ARGS: "--encoding=UTF8 --locale=C.UTF-8 --data-checksums"
+      TZ: UTC
+      PGTZ: UTC
+    command:
+      - postgres
+      # Sized for a desktop PC (16 GB RAM or more) that also runs the bot, Chromium and the owner's
+      # own programs. Docker Desktop (WSL 2) gets half of the PC's memory by default.
+      # On an 8 GB machine put POSTGRES_SHARED_BUFFERS=512MB and
+      # POSTGRES_EFFECTIVE_CACHE_SIZE=1500MB in .env.
+      - -c
+      - shared_buffers=${POSTGRES_SHARED_BUFFERS:-1GB}
+      - -c
+      - effective_cache_size=${POSTGRES_EFFECTIVE_CACHE_SIZE:-3GB}
+      - -c
+      - work_mem=${POSTGRES_WORK_MEM:-32MB}
+      - -c
+      - maintenance_work_mem=${POSTGRES_MAINTENANCE_WORK_MEM:-256MB}
+      # One local app: API + scheduler threads + the odd CLI command. Few connections keep the
+      # worst-case memory use (connections x work_mem) small.
+      - -c
+      - max_connections=50
+      # SSD-friendly planner cost and fewer, smoother checkpoints during the demo backfill.
+      - -c
+      - random_page_cost=1.1
+      - -c
+      - checkpoint_timeout=15min
+      - -c
+      - checkpoint_completion_target=0.9
+      - -c
+      - max_wal_size=2GB
+      - -c
+      - wal_compression=on
+      # Durability stays at the safe defaults (fsync, synchronous_commit, full_page_writes): this
+      # database holds the bet ledger, and a desktop PC can lose power at any time.
+      - -c
+      - timezone=UTC
+      - -c
+      - log_timezone=UTC
+      - -c
+      - log_min_duration_statement=2000
+    ports:
+      # Reachable from this PC only. Never publish the database on 0.0.0.0.
+      - "127.0.0.1:${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - cs2bot_pgdata:/var/lib/postgresql/data
+    # Parallel queries use /dev/shm; Docker's 64 MB default is too small for work_mem=32MB.
+    shm_size: 512mb
+    healthcheck:
+      # TCP on purpose (-h 127.0.0.1): during first-time initialisation the server listens on the
+      # Unix socket only, so the container is not reported healthy before it accepts real clients.
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -p 5432 -U \"$${POSTGRES_USER}\" -d \"$${POSTGRES_DB}\""]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 60s
+      start_interval: 2s
+    # Give PostgreSQL time for a clean shutdown when Docker Desktop or Windows shuts down.
+    stop_grace_period: 1m
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  cs2bot_pgdata:
+    name: cs2bot_pgdata

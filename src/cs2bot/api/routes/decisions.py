@@ -7,7 +7,7 @@ from sqlalchemy import func, select
 
 from cs2bot.api.deps import DB, Paging, require_auth
 from cs2bot.api.formatting import parse_spec_key
-from cs2bot.api.params import FromParam, ToParam, as_utc
+from cs2bot.api.params import FromParam, IdQuery, ToParam, as_utc
 from cs2bot.api.queries import decision_out, load_matches, player_ids_in, player_names
 from cs2bot.api.schemas import DecisionPage
 from cs2bot.db.models import Bet, BetDecisionRow
@@ -19,7 +19,7 @@ router = APIRouter(prefix="/api/decisions", tags=["decisions"], dependencies=[De
 def list_decisions(
     db: DB,
     page: Paging,
-    match_id: int | None = None,
+    match_id: IdQuery = None,
     accepted: bool | None = None,
     from_: FromParam = None,
     to: ToParam = None,

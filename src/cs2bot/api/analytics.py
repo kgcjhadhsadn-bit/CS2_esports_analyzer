@@ -11,16 +11,22 @@ Definitions (also in docs/API.md):
   ``max_drawdown_pct`` divides each fall by ``capital base + peak``
 * **calibration** - equal-width probability bins; Brier score, log-loss and expected calibration
   error (ECE = sum over bins of ``n_bin / N * |mean predicted - observed|``)
+
+Paper (dry-run) bets: ``cs2bot.engine.ledger.settle_bet`` keeps ``bets.status = "dry_run"`` when it
+settles a paper bet and stores the result in ``bets.extra["settled_outcome"]`` (plus ``pnl`` /
+``payout`` / ``settled_at``). :func:`effective_status` turns that into won / lost / void, so every
+statistic here treats real and paper bets alike.
 """
 
 from __future__ import annotations
 
 import math
 from collections import defaultdict
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from decimal import Decimal
+from typing import Literal
 from zoneinfo import ZoneInfo
 
 from cs2bot.api.formatting import round_or_none
@@ -37,10 +43,59 @@ MONEY_OUT_STATUSES = frozenset({BetStatus.PLACED, BetStatus.WON, BetStatus.LOST,
 
 ZERO = Decimal("0")
 
+# ``bets.extra`` key written by ``cs2bot.engine.ledger.settle_bet`` ("won" / "lost" / "void" / "push").
+SETTLED_OUTCOME_KEY = "settled_outcome"
+_OUTCOME_STATUS: dict[str, BetStatus] = {
+    "won": BetStatus.WON,
+    "lost": BetStatus.LOST,
+    "void": BetStatus.VOID,
+    "push": BetStatus.VOID,
+}
+
+
+def effective_status(
+    status: BetStatus,
+    *,
+    extra: object = None,
+    pnl: Decimal | None = None,
+    settled_at: datetime | None = None,
+) -> BetStatus:
+    """The status a bet counts as in statistics: won / lost / void for a *settled paper bet*.
+
+    Real bets are returned unchanged. A paper bet keeps ``status = dry_run`` after settlement (see
+    the module doc); its result is read from ``extra["settled_outcome"]`` and, for rows without
+    that key, inferred from ``settled_at`` + the sign of ``pnl``. An unsettled paper bet stays
+    ``dry_run`` (= open).
+    """
+    if status is not BetStatus.DRY_RUN:
+        return status
+    outcome = extra.get(SETTLED_OUTCOME_KEY) if isinstance(extra, Mapping) else None
+    if outcome is not None:
+        mapped = _OUTCOME_STATUS.get(str(outcome).strip().lower())
+        if mapped is not None:
+            return mapped
+    if settled_at is not None and pnl is not None:
+        if pnl > 0:
+            return BetStatus.WON
+        return BetStatus.LOST if pnl < 0 else BetStatus.VOID
+    return BetStatus.DRY_RUN
+
+
+def bet_result(status: BetStatus) -> Literal["won", "lost", "void"] | None:
+    """``"won"`` / ``"lost"`` / ``"void"`` for an :func:`effective_status`, ``None`` while unsettled."""
+    if status is BetStatus.WON:
+        return "won"
+    if status is BetStatus.LOST:
+        return "lost"
+    return "void" if status is BetStatus.VOID else None
+
 
 @dataclass(frozen=True)
 class BetFact:
-    """The fields of a bet the analytics need (decoupled from the ORM row)."""
+    """The fields of a bet the analytics need (decoupled from the ORM row).
+
+    ``status`` is the :func:`effective_status` (a settled paper bet is won / lost / void).
+    """
 
     id: int
     match_id: int | None
@@ -234,7 +289,8 @@ def calibration_set(
     width = 1.0 / n_bins
     bucket: list[list[tuple[float, int]]] = [[] for _ in range(n_bins)]
     for p, y in clean:
-        bucket[min(n_bins - 1, int(p / width))].append((p, y))
+        # the epsilon keeps exact bin edges in the upper bin (0.3 / 0.1 is 2.9999999999999996)
+        bucket[min(n_bins - 1, int(p * n_bins + 1e-9))].append((p, y))
     bins: list[CalibrationBin] = []
     ece = 0.0
     n = len(clean)

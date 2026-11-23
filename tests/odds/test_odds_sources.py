@@ -378,3 +378,154 @@ def test_api_rest_listing_pagination_stops_on_short_page(monkeypatch: pytest.Mon
         source.fetch_cs2_events()
     offsets = [call.request.url.params["offset"] for call in route.calls]
     assert offsets == ["0", "2", "4"]  # full pages keep paginating up to api_max_pages
+
+
+# --------------------------------------------------------------------------- review round 1
+
+
+def test_select_cs2_drops_other_esports_even_when_their_id_is_allowed() -> None:
+    """With no CS2-looking links the whole e-sport section is crawled: LoL must not come out as CS2."""
+    from cs2bot.odds.payload_parser import ParsedEvent
+    from cs2bot.odds.source_config import DEFAULT_CS2_PATTERN, is_other_game, url_section
+    from cs2bot.odds.sources import select_cs2
+
+    def rec(
+        eid: str, competition: str | None, url: str | None = None, sport: str | None = None
+    ) -> ParsedEvent:
+        return ParsedEvent(
+            external_id=eid,
+            name="G2 - Fnatic",
+            team1_raw="G2",
+            team2_raw="Fnatic",
+            competition_raw=competition,
+            url=url,
+            sport_raw=sport,
+        )
+
+    records = [
+        rec("1", "IEM Chengdu"),
+        rec("2", "LEC Winter"),
+        rec("3", None, "https://www.betclic.pl/e-sport-s102/dota-2-the-international-c5/g2-fnatic-m3"),
+        rec("4", "Playoffs", None, "Valorant"),
+        rec("5", "Counter-Strike 2 - ESL Pro League"),
+    ]
+    allowed = {"1", "2", "3", "4", "5"}
+    kept = select_cs2(records, pattern=DEFAULT_CS2_PATTERN, allowed_ids=allowed)
+    assert [r.external_id for r in kept] == ["1", "5"]
+    assert url_section("https://x.test/a/b/c-m1?x=1") == "https://x.test/a/b"
+    assert url_section(None) is None
+    assert is_other_game([None, "", "ESL Pro League"]) is False
+    assert is_other_game(["Rainbow-Six Siege"]) is True
+
+
+def _winner_payload(odds: float) -> dict[str, object]:
+    return {
+        "id": 42,
+        "name": "Natus Vincere - FaZe Clan",
+        "date": "2026-11-23T17:00:00Z",
+        "sport": {"name": "Counter-Strike 2"},
+        "contestants": [{"name": "Natus Vincere"}, {"name": "FaZe Clan"}],
+        "markets": [
+            {
+                "id": 1,
+                "name": "Zwycięzca meczu",
+                "selections": [
+                    {"id": 11, "name": "Natus Vincere", "odds": odds},
+                    {"id": 12, "name": "FaZe Clan", "odds": 2.3},
+                ],
+            }
+        ],
+    }
+
+
+def test_capture_times_are_tracked_per_market_and_page_names_survive() -> None:
+    """A later payload that only repeats the match winner must not make the other markets look fresh."""
+    from cs2bot.odds.sources import FetchInfo, parse_captured_full
+
+    full = _winner_payload(1.60)
+    full["markets"].append(  # type: ignore[attr-defined]
+        {
+            "name": "Mapa 1",  # a group: its markets get the map as prefix
+            "items": [
+                {
+                    "id": 2,
+                    "name": "Liczba rund",
+                    "selections": [
+                        {"id": 21, "name": "Powyżej 21,5", "odds": 1.85},
+                        {"id": 22, "name": "Poniżej 21,5", "odds": 1.95},
+                    ],
+                }
+            ],
+        }
+    )
+    early, late = NOW, NOW + timedelta(minutes=4)
+    payloads = [
+        CapturedPayload(kind="json", data=json.dumps(full).encode(), captured_at=early, url="https://x/a"),
+        CapturedPayload(
+            kind="json", data=json.dumps(_winner_payload(1.70)).encode(), captured_at=late, url="https://x/b"
+        ),
+        CapturedPayload(kind="json", data=b"{not json", captured_at=late, url="https://x/c"),  # ignored
+    ]
+    parsed = parse_captured_full(payloads)
+    (collected,) = parsed.collected()
+    assert collected.captured_at == late and collected.sport_raw == "Counter-Strike 2"
+    winner = next(m for m in collected.markets if m.raw_name == "Zwycięzca meczu")
+    assert {s.raw_name: str(s.odds) for s in winner.selections}["Natus Vincere"] == "1.700"  # later wins
+    info = FetchInfo()
+    parsed.fill_info(info, parsed.records)
+    assert info.captured_at_by_event == {"42": late}
+    assert info.captured_at_by_market["42"] == {
+        ("Zwycięzca meczu", "1"): late,
+        ("Mapa 1 - Liczba rund", "2"): early,
+    }
+    assert info.market_meta_by_event == {
+        "42": {("Mapa 1 - Liczba rund", "2"): {"page_name": "Liczba rund", "group": "Mapa 1"}}
+    }
+
+
+def test_replay_keeps_the_original_capture_times(tmp_path: Path) -> None:
+    """Replaying yesterday's archive must never stamp its prices with the current time."""
+    day = tmp_path / "2026-11-21"
+    day.mkdir()
+    name = "101500_0001_json_listing.json"
+    (day / name).write_text(json.dumps(_winner_payload(1.60)), encoding="utf-8")
+    captured = datetime(2026, 11, 21, 10, 15, tzinfo=UTC)
+    index = [
+        "this line is damaged",
+        json.dumps({"file": name, "captured_at": captured.isoformat(), "page_url": "https://x/listing"}),
+    ]
+    (day / "index.jsonl").write_text("\n".join(index) + "\n", encoding="utf-8")
+    source = RawPayloadReplaySource([tmp_path])
+    (replayed,) = source.fetch_cs2_events()
+    assert replayed.captured_at == captured
+    info = source.last_fetch_info()
+    assert info.captured_at_by_event == {"42": captured} and info.partial_event_ids == {"42"}
+    # without an index entry the file's modification time is used - still never "now + something"
+    (day / "index.jsonl").unlink()
+    (again,) = RawPayloadReplaySource([tmp_path]).fetch_cs2_events()
+    assert again.captured_at is not None and again.captured_at <= datetime.now(UTC)
+
+
+def test_source_config_ignores_values_of_the_wrong_type(caplog: pytest.LogCaptureFixture) -> None:
+    cfg = BetclicSourceConfig.from_mapping(
+        {
+            "max_events_per_run": "many",
+            "min_page_delay_s": "1.5",  # numeric text is fine
+            "max_page_delay_s": None,
+            "fetch_categories": "yes",
+            "consent_selectors": "#one",
+            "user_agent": "Mozilla/5.0 test",
+            "raw_retention_days": 7.0,
+            "api_page_size": 2.5,
+            "cs2_pattern": ["x"],
+        }
+    )
+    default = BetclicSourceConfig()
+    assert cfg.max_events_per_run == default.max_events_per_run
+    assert cfg.min_page_delay_s == 1.5 and cfg.max_page_delay_s == default.max_page_delay_s
+    assert cfg.fetch_categories is default.fetch_categories
+    assert cfg.consent_selectors == default.consent_selectors
+    assert cfg.user_agent == "Mozilla/5.0 test" and cfg.raw_retention_days == 7
+    assert cfg.api_page_size == default.api_page_size and cfg.cs2_pattern == default.cs2_pattern
+    for key in ("max_events_per_run", "max_page_delay_s", "fetch_categories", "consent_selectors"):
+        assert key in caplog.text

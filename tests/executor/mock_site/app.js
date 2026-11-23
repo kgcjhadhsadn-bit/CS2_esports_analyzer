@@ -117,6 +117,7 @@ function renderListing(main, events) {
 
 function renderEvent(main, ev) {
   main.appendChild(h("h1", { class: "scoreboard", text: `${ev.team1} - ${ev.team2}` }));
+  if (ev.live) main.appendChild(h("span", { class: "scoreboard_live", text: "Na żywo" }));
   const showAll = ui.showAllMarkets === true;
   const tabs = h("div", { role: "tablist", class: "marketTabs" },
     h("button", { role: "tab", "aria-selected": String(!showAll), text: "Top", onclick: () => { ui.showAllMarkets = false; render(); } }),
@@ -207,6 +208,10 @@ function renderSlip(items) {
   slip.appendChild(head);
   if (!items.length) {
     slip.appendChild(h("p", { class: "betslip_empty", text: "Twój kupon jest pusty" }));
+    if (ui.errorText) {
+      // e.g. "Zakład zawieszony": the clicked outcome could not be added to the slip
+      slip.appendChild(h("div", { id: "slipError", class: "betslip_error", role: "alert", text: ui.errorText }));
+    }
   }
   for (const item of items) {
     slip.appendChild(
@@ -294,6 +299,12 @@ async function addToSlip(selectionId) {
   const r = await api("/api/slip/add", { selection_id: selectionId });
   ui.data.slip = r.slip;
   ui.errorText = r.error || "";
+  if (r.quick_bet) {
+    // "quick bet" account mode: the click itself placed a bet with the preset stake
+    ui.receipt = { bet_id: r.quick_bet.bet_id };
+    ui.data.balance_text = r.quick_bet.balance_text;
+    renderHeader();
+  }
   renderSlip(ui.data.slip);
 }
 
@@ -314,6 +325,16 @@ async function clearSlip() {
 
 function applyPlaceResponse(r) {
   ui.pending = r.result === "hang";
+  if (r.result === "ok" && r.shown_as_error) {
+    // The bet WAS accepted (the balance is debited) but the page shows no receipt, only an
+    // error-looking notice next to the (stale) slip.
+    ui.errorText = r.shown_as_error;
+    ui.oddsDialog = null;
+    ui.data.balance_text = r.balance_text;
+    renderHeader();
+    renderSlip(ui.data.slip);
+    return;
+  }
   if (r.slip) ui.data.slip = r.slip;
   if (r.result === "ok") {
     ui.receipt = { bet_id: r.bet_id, note: r.note };
@@ -341,7 +362,8 @@ async function placeBet(accept) {
 
 async function acceptOdds() {
   if (ui.data.accept_mode === "places") {
-    ui.oddsDialog = null;
+    // accept_dialog_lingers: the dialog (and its live button) stays until the server has answered
+    if (!ui.data.accept_dialog_lingers) ui.oddsDialog = null;
     await placeBet(true);
   } else {
     await api("/api/accept_odds", {});

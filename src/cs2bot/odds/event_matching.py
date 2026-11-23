@@ -19,6 +19,18 @@ Candidates are matches with status scheduled/live whose ``scheduled_at`` lies wi
 it beats the runner-up by ``min_margin``; otherwise ``PENDING_REVIEW`` (never bet on). In-scope
 matches win ties. Rows set to ``CONFIRMED`` / ``REJECTED`` from the dashboard are never changed.
 Betclic team names are stored as ``TeamAlias(source=BETCLIC)`` for AUTO/CONFIRMED links.
+
+Two safety rules on top of the scoring:
+
+* **other e-sports** - Betclic lists every e-sport in one section and organisations such as G2 or
+  Fnatic field teams in several games. An event whose sport label (``extra["sport_raw"]``, stored
+  by the collector), competition or URL section names another game (League of Legends, Dota 2,
+  Valorant ...) and not CS2 is never linked (``UNLINKED``), however well names and time fit;
+* **finished matches** - candidates are scheduled/live matches only, so once our match is
+  ``finished`` it would drop out and the event would be unlinked the next time Betclic still
+  lists it (results often reach us before the bookmaker removes the event). An ``AUTO`` link to
+  a finished match is therefore frozen: the link is history (closing-line and settlement
+  analysis need it) and nothing can be bet on it any more.
 """
 
 from __future__ import annotations
@@ -39,6 +51,7 @@ from cs2bot.config import Settings
 from cs2bot.db.models import BookmakerEvent, Match, Team, TeamAlias
 from cs2bot.db.state import effective_decision_settings
 from cs2bot.domain.enums import DataSource, LinkStatus, MatchStatus
+from cs2bot.odds.source_config import is_other_game, url_section
 from cs2bot.odds.text import fold_text
 from cs2bot.utils.names import normalize_team_name
 from cs2bot.utils.time import utcnow
@@ -286,6 +299,39 @@ def link_event(
             teams_swapped=bool(event_row.teams_swapped),
             reason="manual decision preserved",
         )
+
+    extra = event_row.extra or {}
+    sport_raw = extra.get("sport_raw")
+    hints = [sport_raw if isinstance(sport_raw, str) else None, event_row.competition_raw]
+    hints.append(url_section(event_row.url))
+    if is_other_game(hints):
+        event_row.match_id = None
+        event_row.teams_swapped = False
+        event_row.link_confidence = None
+        event_row.link_status = LinkStatus.UNLINKED
+        session.flush()
+        return LinkResult(
+            event_id=event_row.id,
+            match_id=None,
+            status=LinkStatus.UNLINKED,
+            confidence=None,
+            teams_swapped=False,
+            changed=before != (None, False),
+            status_changed=status_before is not LinkStatus.UNLINKED,
+            reason="another e-sport (not CS2) according to its sport / competition / URL",
+        )
+
+    if event_row.link_status is LinkStatus.AUTO and event_row.match_id is not None:
+        linked = session.get(Match, event_row.match_id)
+        if linked is not None and linked.status is MatchStatus.FINISHED:
+            return LinkResult(
+                event_id=event_row.id,
+                match_id=event_row.match_id,
+                status=event_row.link_status,
+                confidence=event_row.link_confidence,
+                teams_swapped=bool(event_row.teams_swapped),
+                reason="linked match is finished: link frozen",
+            )
 
     threshold = effective_decision_settings(session, settings).min_event_link_confidence
     scored = [

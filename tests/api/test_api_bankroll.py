@@ -102,7 +102,8 @@ def test_loss_limit_override_reaches_limit(client: TestClient) -> None:
     )
     assert resp.status_code == 200, resp.text
     day = client.get("/api/bankroll").json()["daily"]
-    assert day["limit_fraction"] == 0.02 and day["limit_amount"] == "20.27" and day["reached"] is True
+    # 2 % of 1013.44 = 20.2688, rounded DOWN to the grosz like the engine's loss_limit_status
+    assert day["limit_fraction"] == 0.02 and day["limit_amount"] == "20.26" and day["reached"] is True
     assert day["remaining"] == "0.00" and day["used_fraction"] > 1
     alerts = {a["code"]: a for a in client.get("/api/health").json()["alerts"]}
     assert alerts["loss_limit_reached"]["level"] == "critical"

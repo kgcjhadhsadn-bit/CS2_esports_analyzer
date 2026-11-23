@@ -12,8 +12,18 @@ from sqlalchemy.orm import selectinload
 
 from cs2bot.api.analytics import downsample
 from cs2bot.api.deps import DB, Ctx, Paging, require_auth
+from cs2bot.api.ev import TaxTerms
 from cs2bot.api.formatting import describe_outcome, market_sort_key, odds_str, parse_spec_key, utc
-from cs2bot.api.params import FromParam, ListParam, ToParam, as_utc, parse_enum_list
+from cs2bot.api.params import (
+    MAX_DB_INT,
+    FromParam,
+    IdPath,
+    IdQuery,
+    ListParam,
+    ToParam,
+    as_utc,
+    parse_enum_list,
+)
 from cs2bot.api.queries import (
     ACTIVE_LINK_STATUSES,
     build_market_rows,
@@ -85,7 +95,7 @@ def list_matches(
     linked: Annotated[
         bool | None, Query(description="true: has an auto/confirmed Betclic link; false: has none")
     ] = None,
-    team_id: int | None = None,
+    team_id: IdQuery = None,
     order: Literal["asc", "desc"] = "asc",
 ) -> MatchPage:
     stmt = select(Match)
@@ -117,12 +127,12 @@ def list_matches(
             .options(*match_load_options())
         )
     )
-    items = match_summaries(db, rows, ctx.settings.effective_tax_rate)
+    items = match_summaries(db, rows, TaxTerms.from_settings(ctx.settings))
     return MatchPage(total=total, limit=page.limit, offset=page.offset, items=items)
 
 
 @router.get("/{match_id}", response_model=MatchDetail)
-def get_match(match_id: int, ctx: Ctx, db: DB) -> MatchDetail:
+def get_match(match_id: IdPath, ctx: Ctx, db: DB) -> MatchDetail:
     match = db.scalar(
         select(Match)
         .where(Match.id == match_id)
@@ -136,7 +146,8 @@ def get_match(match_id: int, ctx: Ctx, db: DB) -> MatchDetail:
     if match is None:
         raise HTTPException(status_code=404, detail="match not found")
     settings = ctx.settings
-    summary = match_summaries(db, [match], settings.effective_tax_rate)[0]
+    tax = TaxTerms.from_settings(settings)
+    summary = match_summaries(db, [match], tax)[0]
 
     players: dict[int, Player] = {
         p.id: p
@@ -239,7 +250,7 @@ def get_match(match_id: int, ctx: Ctx, db: DB) -> MatchDetail:
     markets = build_market_rows(
         db,
         match,
-        tax_rate=settings.effective_tax_rate,
+        tax=tax,
         now=ctx.now(),
         odds_max_age_s=float(settings.betclic.odds_max_age_s),
         extra_players={pid: p.nickname for pid, p in players.items()},
@@ -260,10 +271,13 @@ def get_match(match_id: int, ctx: Ctx, db: DB) -> MatchDetail:
 
 @router.get("/{match_id}/odds-history", response_model=OddsHistoryOut)
 def odds_history(
-    match_id: int,
+    match_id: IdPath,
     db: DB,
     selection_id: Annotated[
-        int | None, Query(description="One selection; omitted = every mapped selection of the match")
+        int | None,
+        Query(
+            ge=1, le=MAX_DB_INT, description="One selection; omitted = every mapped selection of the match"
+        ),
     ] = None,
     since: Annotated[
         datetime | None, Query(description="Only snapshots captured at/after this instant")

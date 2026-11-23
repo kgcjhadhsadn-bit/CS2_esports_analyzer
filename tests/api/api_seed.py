@@ -641,10 +641,14 @@ def seed_database(session: Session, tmp: Path) -> Seed:
         )
 
     # ---------------------------------------------------------------- calibration predictions (finished 1-10)
+    # written one hour before each match started (later predictions are look-ahead and are ignored)
     for mid in range(1, 11):
-        _prediction(session, mid, MW, "team1", 0.6, created=_ts(days=-100))
-        _prediction(session, mid, MW, "team2", 0.4, created=_ts(days=-100))
-        _prediction(session, mid, MAP1, "team1", 0.55, created=_ts(days=-100))
+        finished = session.get(Match, mid)
+        assert finished is not None and finished.scheduled_at is not None
+        before_start = finished.scheduled_at - timedelta(hours=1)
+        _prediction(session, mid, MW, "team1", 0.6, created=before_start)
+        _prediction(session, mid, MW, "team2", 0.4, created=before_start)
+        _prediction(session, mid, MAP1, "team1", 0.55, created=before_start)
 
     # ---------------------------------------------------------------- job runs
     def run(

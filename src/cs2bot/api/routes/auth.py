@@ -68,7 +68,7 @@ def login(body: LoginIn, request: Request, response: Response, ctx: Ctx, db: DB)
         secure=request.url.scheme == "https",
         path="/",
     )
-    _audit(db, f"dashboard:{ctx.auth.username}", "auth_login", client)
+    _audit(db, AuthState(enabled=True, username=ctx.auth.username).actor, "auth_login", client)
     return AuthMe(auth_enabled=True, authenticated=True, username=ctx.auth.username)
 
 

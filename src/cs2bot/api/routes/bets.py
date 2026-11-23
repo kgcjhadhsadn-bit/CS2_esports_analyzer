@@ -2,16 +2,18 @@
 
 from __future__ import annotations
 
+from decimal import Decimal
 from pathlib import Path
 
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import FileResponse
 from sqlalchemy import func, select
 
-from cs2bot.api.analytics import EXCLUDED_STATUSES, OPEN_STATUSES, ZERO
+from cs2bot.api.analytics import EXCLUDED_STATUSES, OPEN_STATUSES, ZERO, effective_status
+from cs2bot.api.bankroll import paper_clause
 from cs2bot.api.deps import DB, Ctx, Paging, require_auth
-from cs2bot.api.formatting import money_str0, parse_spec_key, to_decimal
-from cs2bot.api.params import FromParam, ListParam, ToParam, as_utc, parse_enum_list
+from cs2bot.api.formatting import money_str0, parse_spec_key, to_decimal, utc
+from cs2bot.api.params import FromParam, IdPath, IdQuery, ListParam, ToParam, as_utc, parse_enum_list
 from cs2bot.api.queries import bet_out, decision_detail, load_matches, player_ids_in, player_names
 from cs2bot.api.schemas import BetDetail, BetPage, BetsSummary, LedgerEntryOut
 from cs2bot.db.models import BankrollLedger, Bet, BetDecisionRow, MatchAnalysis
@@ -61,15 +63,19 @@ def list_bets(
     dry_run: bool | None = None,
     from_: FromParam = None,
     to: ToParam = None,
-    match_id: int | None = None,
+    match_id: IdQuery = None,
 ) -> BetPage:
+    """Bets, newest first.
+
+    ``status`` matches the stored status **or** the settlement result: a paper bet keeps
+    ``status = "dry_run"`` after it is settled, so ``status=won`` also returns paper bets that won
+    (``status=dry_run`` returns every row stored as a dry run).
+    """
     when = func.coalesce(Bet.placed_at, Bet.created_at)
-    stmt = select(Bet)
-    statuses = parse_enum_list(status, BetStatus, "status")
-    if statuses:
-        stmt = stmt.where(Bet.status.in_(statuses))
+    stmt = select(Bet.id, Bet.status, Bet.stake, Bet.pnl, Bet.settled_at, Bet.extra)
+    statuses = set(parse_enum_list(status, BetStatus, "status"))
     if dry_run is not None:
-        stmt = stmt.where(Bet.dry_run.is_(dry_run))
+        stmt = stmt.where(paper_clause() if dry_run else ~paper_clause())
     lower, upper = as_utc(from_), as_utc(to)
     if lower is not None:
         stmt = stmt.where(when >= lower)
@@ -78,18 +84,27 @@ def list_bets(
     if match_id is not None:
         stmt = stmt.where(Bet.match_id == match_id)
 
-    totals = list(db.execute(stmt.with_only_columns(Bet.status, Bet.stake, Bet.pnl)))
-    counted = [(s, to_decimal(stake) or ZERO, to_decimal(pnl)) for s, stake, pnl in totals]
+    # The status filter needs the effective status (a JSON field), so it is applied here rather
+    # than in SQL; only six small columns per bet are loaded for it and for the summary.
+    counted: list[tuple[int, BetStatus, Decimal, Decimal | None]] = []
+    for bet_id, raw, stake, pnl, settled_at, extra in db.execute(stmt.order_by(when.desc(), Bet.id.desc())):
+        pnl_dec = to_decimal(pnl)
+        effective = effective_status(raw, extra=extra, pnl=pnl_dec, settled_at=utc(settled_at))
+        if statuses and raw not in statuses and effective not in statuses:
+            continue
+        counted.append((int(bet_id), effective, to_decimal(stake) or ZERO, pnl_dec))
     summary = BetsSummary(
         count=len(counted),
-        stake=money_str0(sum((stake for s, stake, _ in counted if s not in EXCLUDED_STATUSES), ZERO)),
-        pnl=money_str0(sum((pnl for s, _, pnl in counted if s.is_settled and pnl is not None), ZERO)),
-        open=sum(1 for s, _, _ in counted if s in OPEN_STATUSES),
-        won=sum(1 for s, _, _ in counted if s is BetStatus.WON),
-        lost=sum(1 for s, _, _ in counted if s is BetStatus.LOST),
-        void=sum(1 for s, _, _ in counted if s is BetStatus.VOID),
+        stake=money_str0(sum((stake for _, s, stake, _ in counted if s not in EXCLUDED_STATUSES), ZERO)),
+        pnl=money_str0(sum((pnl for _, s, _, pnl in counted if s.is_settled and pnl is not None), ZERO)),
+        open=sum(1 for _, s, _, _ in counted if s in OPEN_STATUSES),
+        won=sum(1 for _, s, _, _ in counted if s is BetStatus.WON),
+        lost=sum(1 for _, s, _, _ in counted if s is BetStatus.LOST),
+        void=sum(1 for _, s, _, _ in counted if s is BetStatus.VOID),
     )
-    bets = list(db.scalars(stmt.order_by(when.desc(), Bet.id.desc()).limit(page.limit).offset(page.offset)))
+    page_ids = [row[0] for row in counted[page.offset : page.offset + page.limit]]
+    by_id = {b.id: b for b in db.scalars(select(Bet).where(Bet.id.in_(page_ids)))} if page_ids else {}
+    bets = [by_id[i] for i in page_ids if i in by_id]
     matches = load_matches(db, [b.match_id for b in bets])
     decision_ids = [b.decision_id for b in bets if b.decision_id is not None]
     decisions = (
@@ -113,7 +128,7 @@ def list_bets(
 
 
 @router.get("/{bet_id}", response_model=BetDetail)
-def get_bet(bet_id: int, db: DB) -> BetDetail:
+def get_bet(bet_id: IdPath, db: DB) -> BetDetail:
     bet = db.get(Bet, bet_id)
     if bet is None:
         raise HTTPException(status_code=404, detail="bet not found")
@@ -167,7 +182,7 @@ def get_bet(bet_id: int, db: DB) -> BetDetail:
     response_class=FileResponse,
     responses={200: {"content": {"image/png": {}, "image/jpeg": {}}}, 404: {"description": "No screenshot"}},
 )
-def get_screenshot(bet_id: int, ctx: Ctx, db: DB) -> FileResponse:
+def get_screenshot(bet_id: IdPath, ctx: Ctx, db: DB) -> FileResponse:
     bet = db.get(Bet, bet_id)
     if bet is None:
         raise HTTPException(status_code=404, detail="bet not found")

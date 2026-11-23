@@ -229,3 +229,91 @@ def test_scoring_helpers() -> None:
     assert time_score(None) == 0.4
     assert competition_score("Counter-Strike 2 - IEM Chengdu", "IEM Chengdu 2026 Playoffs") == 1.0
     assert competition_score(None, "x") is None
+
+
+# --------------------------------------------------------------------------- review round 1
+
+
+def test_auto_link_to_a_finished_match_is_frozen(session, settings: Settings, teams) -> None:
+    """Results reach us before Betclic drops the event: the link is history, it must not be wiped."""
+    match = make_match(session, teams["faze"], teams["navi"], T0)
+    ev = make_event(session, "Natus Vincere", "FaZe Clan")
+    assert link_event(session, ev, settings=settings, now=NOW).status is LinkStatus.AUTO
+    confidence = ev.link_confidence
+    match.status = MatchStatus.FINISHED
+    session.flush()
+    result = link_event(session, ev, settings=settings, now=T0 + timedelta(hours=2))
+    assert (ev.match_id, ev.teams_swapped, ev.link_status) == (match.id, True, LinkStatus.AUTO)
+    assert ev.link_confidence == confidence
+    assert result.changed is False and result.status_changed is False and "frozen" in result.reason
+
+
+def test_cancelled_or_postponed_match_is_unlinked(session, settings: Settings, teams) -> None:
+    match = make_match(session, teams["navi"], teams["faze"], T0)
+    ev = make_event(session, "Natus Vincere", "FaZe Clan")
+    assert link_event(session, ev, settings=settings, now=NOW).status is LinkStatus.AUTO
+    match.status = MatchStatus.POSTPONED
+    session.flush()
+    result = link_event(session, ev, settings=settings, now=NOW)
+    assert result.status is LinkStatus.UNLINKED and ev.match_id is None and result.changed is True
+
+
+def test_pending_review_link_to_a_finished_match_is_not_frozen(session, settings: Settings, teams) -> None:
+    match = make_match(session, teams["navi"], teams["heroic"], T0)  # weak: only one team fits
+    ev = make_event(session, "Natus Vincere", "FaZe Clan")
+    assert link_event(session, ev, settings=settings, now=NOW).status is LinkStatus.PENDING_REVIEW
+    match.status = MatchStatus.FINISHED
+    session.flush()
+    assert link_event(session, ev, settings=settings, now=NOW).status is LinkStatus.UNLINKED
+
+
+@pytest.mark.parametrize(
+    ("competition", "url", "sport"),
+    [
+        ("League of Legends - LEC", None, None),
+        ("LEC Winter", None, None),
+        (None, "https://www.betclic.pl/e-sport-s102/valorant-vct-emea-c77/g2-fnatic-m555", None),
+        ("Winter Split", None, "Dota 2"),
+    ],
+)
+def test_other_esports_are_never_linked(
+    session, settings: Settings, competition: str | None, url: str | None, sport: str | None
+) -> None:
+    """G2 and Fnatic also play each other in League of Legends, Valorant ... at similar times."""
+    g2, fnatic = make_team(session, "G2"), make_team(session, "Fnatic")
+    match = make_match(session, g2, fnatic, T0)
+    ev = make_event(session, "G2", "Fnatic", competition=competition)
+    ev.url = url
+    if sport:
+        ev.extra = {"sport_raw": sport}
+    result = link_event(session, ev, settings=settings, now=NOW)
+    assert result.status is LinkStatus.UNLINKED and ev.match_id is None
+    assert "another e-sport" in result.reason and result.candidates == []
+    assert session.scalar(select(TeamAlias).where(TeamAlias.source == DataSource.BETCLIC)) is None
+    # the same event without the foreign label links normally
+    ev.competition_raw, ev.url, ev.extra = "IEM Chengdu", None, {}
+    assert link_event(session, ev, settings=settings, now=NOW).status is LinkStatus.AUTO
+    assert ev.match_id == match.id
+    # ... and is unlinked again as soon as the label says it is another game
+    ev.extra = {"sport_raw": "League of Legends"}
+    again = link_event(session, ev, settings=settings, now=NOW)
+    assert again.status is LinkStatus.UNLINKED and again.changed is True and again.status_changed is True
+
+
+def test_cs2_label_wins_over_look_alike_words(session, settings: Settings) -> None:
+    g2, fnatic = make_team(session, "G2"), make_team(session, "Fnatic")
+    make_match(session, g2, fnatic, T0)
+    # a team slug may contain anything ("lol", "dota"): only the URL *section* is inspected
+    ev = make_event(session, "G2", "Fnatic", competition="Counter-Strike 2 - VCT Showmatch")
+    ev.url = "https://www.betclic.pl/e-sport-s102/cs2-iem-c1/team-lol-dota-fans-m77"
+    assert link_event(session, ev, settings=settings, now=NOW).status is LinkStatus.AUTO
+
+
+def test_manual_confirmation_overrides_the_other_game_veto(session, settings: Settings) -> None:
+    g2, fnatic = make_team(session, "G2"), make_team(session, "Fnatic")
+    match = make_match(session, g2, fnatic, T0)
+    ev = make_event(
+        session, "G2", "Fnatic", competition="LEC", status=LinkStatus.CONFIRMED, match_id=match.id
+    )
+    assert link_event(session, ev, settings=settings, now=NOW).status is LinkStatus.CONFIRMED
+    assert ev.match_id == match.id

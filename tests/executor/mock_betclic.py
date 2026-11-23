@@ -72,6 +72,7 @@ class MockEvent:
     team1: str
     team2: str
     markets: list[MockMarket]
+    live: bool = False  # the match is in play: the event header shows a "Na żywo" badge
 
     @property
     def name(self) -> str:
@@ -209,6 +210,11 @@ class MockState:
     slip_market_override: str | None = None  # the slip shows this market name instead of the real one
     extra_slip_notice: str | None = None  # an informational role=alert message in the slip
     place_delay_s: float = 0.0  # the server takes this long to answer a place request
+    # the odds-change dialog (with a live "Akceptuj" button) stays on screen while the accept request
+    # is in flight - a site that does not disable the button during the round trip
+    accept_dialog_lingers: bool = False
+    # "quick bet" account mode: clicking an outcome places a bet at once with this preset stake
+    quick_bet_stake: Decimal | None = None
     redirects: dict[str, str] = field(default_factory=dict)  # GET path -> 302 Location
 
     def find_selection(self, selection_id: str) -> tuple[MockEvent, MockMarket, MockSelection] | None:
@@ -314,6 +320,7 @@ class MockBetclicServer:
                     "id": event.id,
                     "team1": event.team1,
                     "team2": event.team2,
+                    "live": event.live,
                     "markets": [
                         {
                             "id": mk.id,
@@ -344,6 +351,7 @@ class MockBetclicServer:
             "stake_multiplier": float(st.stake_multiplier),
             "hidden_slip_item": st.hidden_slip_item,
             "extra_slip_notice": st.extra_slip_notice,
+            "accept_dialog_lingers": st.accept_dialog_lingers,
             "slip": self.slip_items(),
             "page": self.page_data(path),
         }
@@ -357,6 +365,25 @@ class MockBetclicServer:
             _, market, selection = found
             if selection.suspended:
                 return {"slip": self.slip_items(), "error": "Zakład zawieszony"}
+            if st.quick_bet_stake is not None:
+                event = found[0]
+                bet_id = f"BC{st.next_bet_no}"
+                st.next_bet_no += 1
+                st.bets.insert(
+                    0,
+                    MockBet(
+                        bet_id=bet_id,
+                        placed_at=datetime.now(UTC).replace(second=0, microsecond=0),
+                        event=event.name,
+                        market=market.name,
+                        selection=selection.name,
+                        odds=selection.odds,
+                        stake=st.quick_bet_stake,
+                    ),
+                )
+                st.balance -= st.quick_bet_stake
+                st.last_receipt = bet_id
+                return {"slip": [], "quick_bet": {"bet_id": bet_id, "balance_text": pl_money(st.balance)}}
             same_market = {s.id for s in market.selections}
             st.slip = [sid for sid in st.slip if sid not in same_market] + [selection.id]
             return {"slip": self.slip_items()}
@@ -436,13 +463,17 @@ class MockBetclicServer:
         )
         st.balance -= stake
         st.slip = []
-        st.last_receipt = bet_id
+        # "shown_as_error": the bet IS accepted (balance debited) but the page shows no receipt, only
+        # an error-looking notice (e.g. "Kurs uległ zmianie" after an automatic odds update).
+        shown_as_error = response.get("shown_as_error")
+        st.last_receipt = None if shown_as_error else bet_id
         return {
             "result": "ok",
             "bet_id": bet_id,
             "balance_text": pl_money(st.balance),
             "slip": [],
             "note": response.get("note"),  # e.g. "oczekuje na akceptację" (pending trader approval)
+            "shown_as_error": shown_as_error,
         }
 
 

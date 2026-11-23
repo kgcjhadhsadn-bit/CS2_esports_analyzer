@@ -140,7 +140,13 @@ CASES: list[tuple[str, str, bool, str | None]] = [
         False,
         "player_kills_h2h|map=1|player=11|opp=22#player:22",
     ),
-    ("Pojedynek graczy: ZywOo - s1mple", "s1mple", False, "player_kills_h2h|player=11|opp=22#player:11"),
+    (
+        "Pojedynek graczy: ZywOo - s1mple - mecz",
+        "s1mple",
+        False,
+        "player_kills_h2h|player=11|opp=22#player:11",
+    ),
+    ("Pojedynek graczy: ZywOo - s1mple", "s1mple", False, None),  # no scope: one map or the series?
     ("Najwięcej zabójstw - mapa 1", "s1mple", False, "top_fragger|map=1#player:11"),
     ("Najwięcej zabójstw w drużynie FaZe Clan", "ropz", True, "top_fragger|team=team1#player:33"),
     # --- unknown / unsupported -> unmapped ------------------------------------------------------
@@ -163,6 +169,58 @@ CASES: list[tuple[str, str, bool, str | None]] = [
     ("s1mple vs ZywOo - zabójstwa (mapa 1)", "ZywOo (+1,5)", False, None),
     ("Handicap zabójstw: s1mple vs ZywOo", "s1mple (-2,5)", False, None),
     ("Handicap map", "Natus Vincere 2:0", False, None),
+    # --- settlement wording: the pricing engine counts overtime (defaults) ---------------------------
+    ("Liczba rund - mapa 1 (bez dogrywki)", "Powyżej 21,5", False, None),
+    ("Liczba rund - mapa 1 - regulaminowy czas gry", "Powyżej 21,5", False, None),
+    ("Mapa 1 - liczba rund w czasie regulaminowym", "Powyżej 21,5", False, None),
+    ("Liczba rund - mapa 1 (nie wliczając dogrywki)", "Powyżej 21,5", False, None),
+    ("Map 1 - Total rounds (regular time)", "Over 21.5", False, None),
+    ("Handicap rund - mapa 1 (bez dogrywki)", "Natus Vincere (-3,5)", False, None),
+    ("Mapa 1 - liczba rund: parzysta/nieparzysta (bez dogrywki)", "Parzysta", False, None),
+    ("Liczba rund Natus Vincere - mapa 1 (bez dogrywki)", "Powyżej 10,5", False, None),
+    ("Liczba rund - mapa 1 (z dogrywką)", "Powyżej 21,5", False, "total_rounds|map=1|line=21.5#over"),
+    ("Mapa 1 - liczba rund w dogrywce", "Powyżej 3,5", False, None),  # rounds played IN overtime
+    # markets always priced on the final result: a "regulation only" variant is another market
+    ("Zwycięzca meczu (regulaminowy czas)", "Natus Vincere", False, None),
+    ("Zwycięzca mapy 1 (bez dogrywki)", "Natus Vincere", False, None),
+    ("Dokładny wynik - mapa 1 (bez dogrywki)", "13:9", False, None),
+    ("Zabójstwa gracza - mapa 1 (bez dogrywki)", "s1mple Powyżej 19,5", False, None),
+    # --- unsupported wording --------------------------------------------------------------------
+    ("Zwycięzca meczu (bez remisu)", "Natus Vincere", False, None),
+    ("Podwójna szansa", "Natus Vincere lub remis", False, None),
+    ("Zwycięzca meczu i liczba map", "Natus Vincere i Powyżej 2,5", False, None),
+    ("Zwycięzca mapy 1 + Liczba rund", "Natus Vincere", False, None),
+    ("Liczba map", "Powyżej 2,5 i Natus Vincere", False, None),
+    ("Obie drużyny wygrają mapę", "Natus Vincere - Tak", False, None),
+    # --- a round line must never be read as a map line (it would look like a certain winner) ---------
+    ("Handicap", "Natus Vincere (-1,5)", False, None),
+    ("Handicap map 1", "Natus Vincere (-2,5)", False, None),
+    ("Mapa 1 - handicap map", "Natus Vincere (-2,5)", False, None),
+    ("Mapa 1 - Handicap", "Natus Vincere (-3,5)", False, "round_handicap|map=1|line=-3.5#team1"),
+    ("Handicap map", "Natus Vincere (-4,5)", False, None),  # outside the map-handicap line bounds
+    ("Liczba map", "Powyżej 21,5", False, None),
+    ("Liczba rund - mapa 1", "Powyżej 2,5", False, None),
+    ("Liczba map - mapa 1", "Powyżej 2,5", False, None),
+    # --- kill lines need an explicit scope ---------------------------------------------------------
+    ("Zabójstwa gracza", "s1mple Powyżej 19,5", False, None),
+    ("Zabójstwa gracza - mecz", "s1mple Powyżej 49,5", False, "player_kills|player=11|line=49.5#over"),
+    ("Liczba zabójstw w meczu - s1mple", "Poniżej 49,5", False, "player_kills|player=11|line=49.5#under"),
+    (
+        "Zabójstwa gracza - mapa 1+2",
+        "s1mple Powyżej 39,5",
+        False,
+        "player_kills|maps=1,2|player=11|line=39.5#over",
+    ),
+    # --- team markets that look like player markets --------------------------------------------------
+    ("Mapa 1 - Liczba zabójstw - Natus Vincere", "Powyżej 70,5", False, None),
+    ("Mapa 1 - Liczba zabójstw - NAVI", "Powyżej 70,5", False, None),
+    ("Mapa 1 - Łączna liczba zabójstw", "Powyżej 140,5", False, None),
+    # --- look-alikes of mapped markets -------------------------------------------------------------
+    ("Obie drużyny wygrają rundę pistoletową - mapa 1", "Tak", False, None),
+    ("Obie rundy pistoletowe - mapa 1", "Natus Vincere", False, None),
+    ("Mapa 1 - Runda 13 - zwycięzca", "Natus Vincere", False, "pistol_round_winner|map=1|round=13#team1"),
+    ("Mapa 1 - Runda 5 - zwycięzca", "Natus Vincere", False, None),
+    ("Mapy 1-2 - zwycięzca", "Natus Vincere", False, None),
 ]
 
 
@@ -211,14 +269,148 @@ def test_player_markets_need_a_resolver(mapper: MarketMapper) -> None:
 
 
 def test_h2h_opponent_from_sibling_selections(mapper: MarketMapper) -> None:
-    key = _key(
-        mapper, "Więcej zabójstw (mapa 1)", "s1mple", False, sibling_selections=["s1mple", "ZywOo", "Remis"]
-    )
+    key = _key(mapper, "Więcej zabójstw (mapa 1)", "s1mple", False, sibling_selections=["s1mple", "ZywOo"])
     assert key == "player_kills_h2h|map=1|player=11|opp=22#player:11"
-    draw = _key(
-        mapper, "Więcej zabójstw (mapa 1)", "Remis", False, sibling_selections=["s1mple", "ZywOo", "Remis"]
-    )
+    assert _key(mapper, "Więcej zabójstw (mapa 1)", "s1mple", False, sibling_selections=["s1mple"]) is None
+
+
+def _key_with(mapper: MarketMapper, market: str, selection: str, **kw: object) -> str | None:
+    mapped = mapper.map(market, selection, event=EVENT, swapped=False, player_resolver=fake_resolver, **kw)  # type: ignore[arg-type]
+    return f"{mapped.spec.key()}#{mapped.selection_key}" if mapped else None
+
+
+def test_three_way_h2h_follows_the_tie_rule(mapper: MarketMapper) -> None:
+    """A head-to-head listing "Remis": the players LOSE on a tie - only priceable with h2h_tie_rule=lose."""
+    siblings = ["s1mple", "ZywOo", "Remis"]
+    assert mapper.settlement.h2h_tie_rule == "push"
+    assert _key_with(mapper, "Więcej zabójstw (mapa 1)", "s1mple", sibling_selections=siblings) is None
+    assert _key_with(mapper, "Więcej zabójstw (mapa 1)", "Remis", sibling_selections=siblings) is None
+    lose = mapper.with_settlement(totals_include_overtime=True, h2h_tie_rule="lose")
+    assert lose is not mapper and lose.settlement.h2h_tie_rule == "lose"
+    key = _key_with(lose, "Więcej zabójstw (mapa 1)", "s1mple", sibling_selections=siblings)
+    assert key == "player_kills_h2h|map=1|player=11|opp=22#player:11"
+    draw = _key_with(lose, "Więcej zabójstw (mapa 1)", "Remis", sibling_selections=siblings)
     assert draw == "player_kills_h2h|map=1|player=11|opp=22#draw"
+
+
+@pytest.mark.parametrize(
+    ("market", "selection", "siblings"),
+    [
+        ("Zwycięzca mapy 1", "Natus Vincere", ["Natus Vincere", "Remis", "FaZe Clan"]),
+        ("Zwycięzca mapy 1", "1", ["1", "X", "2"]),
+        ("Mapa 1 - Handicap", "Natus Vincere (-3,5)", ["Natus Vincere (-3,5)", "Remis (-3,5)", "FaZe Clan"]),
+        (
+            "Handicap map",
+            "Natus Vincere (-1,5)",
+            ["Natus Vincere (-1,5)", "Remis (-1,5)", "FaZe Clan (+1,5)"],
+        ),
+        ("Pierwszy do 5 rund - mapa 1", "Natus Vincere", ["Natus Vincere", "Żaden", "FaZe Clan"]),
+        ("Runda pistoletowa - mapa 1", "Natus Vincere", ["Natus Vincere", "Remis", "FaZe Clan"]),
+        ("Liczba rund - mapa 1", "Powyżej 21", ["Powyżej 21", "Dokładnie 21", "Poniżej 21"]),
+        ("Total maps", "Over 2", ["Over 2", "Exactly 2", "Under 2"]),
+    ],
+)
+def test_three_way_variants_of_two_way_markets_stay_unmapped(
+    mapper: MarketMapper, market: str, selection: str, siblings: list[str]
+) -> None:
+    two_way = [s for s in siblings if s in (siblings[0], siblings[-1])]
+    assert _key_with(mapper, market, selection, sibling_selections=two_way) is not None  # the control
+    assert _key_with(mapper, market, selection, sibling_selections=siblings) is None
+
+
+def test_match_winner_with_a_draw_needs_a_series_that_can_end_level(mapper: MarketMapper) -> None:
+    """ "1 X 2" in a BO1/BO3/BO5 is a regulation-time market: the teams lose on overtime."""
+    three = ["Natus Vincere", "Remis", "FaZe Clan"]
+    for selection, key in (("Natus Vincere", "team1"), ("Remis", "draw"), ("FaZe Clan", "team2")):
+        expected = f"match_winner#{key}"
+        assert _key_with(mapper, "Zwycięzca meczu", selection, sibling_selections=three) == expected
+        assert (
+            _key_with(mapper, "Zwycięzca meczu", selection, sibling_selections=three, draw_possible=True)
+            == expected
+        )
+        assert (
+            _key_with(mapper, "Zwycięzca meczu", selection, sibling_selections=three, draw_possible=False)
+            is None
+        )
+    two = ["Natus Vincere", "FaZe Clan"]
+    assert (
+        _key_with(mapper, "Zwycięzca meczu", "Natus Vincere", sibling_selections=two, draw_possible=False)
+        == "match_winner#team1"
+    )
+    # a half can end 6-6 whatever the series format
+    half = _key_with(mapper, "1. połowa - mapa 1", "Remis", sibling_selections=three, draw_possible=False)
+    assert half == "half_winner|map=1|half=1#draw"
+
+
+def test_round_count_markets_follow_totals_include_overtime(mapper: MarketMapper) -> None:
+    """With totals_include_overtime=False only names that EXCLUDE overtime... and silent ones map."""
+    regulation = mapper.with_settlement(totals_include_overtime=False, h2h_tie_rule="push")
+    assert mapper.with_settlement(totals_include_overtime=True, h2h_tie_rule="push") is mapper
+    name, sel = "Liczba rund - mapa 1 (bez dogrywki)", "Powyżej 21,5"
+    assert _key_with(mapper, name, sel) is None
+    assert _key_with(regulation, name, sel) == "total_rounds|map=1|line=21.5#over"
+    assert _key_with(regulation, "Liczba rund - mapa 1 (z dogrywką)", sel) is None
+    assert _key_with(mapper, "Liczba rund - mapa 1 (z dogrywką)", sel) == "total_rounds|map=1|line=21.5#over"
+    assert (
+        _key_with(regulation, "Handicap rund - mapa 1 - regulaminowy czas", "FaZe Clan (+3,5)")
+        == "round_handicap|map=1|line=-3.5#team2"
+    )
+    # never for markets priced on the final result, whatever the setting
+    assert _key_with(regulation, "Zwycięzca mapy 1 (bez dogrywki)", "Natus Vincere") is None
+    # contradictory wording is never guessed
+    assert _key_with(mapper, "Liczba rund - mapa 1 (z dogrywką) bez dogrywki", sel) is None
+    with pytest.raises(ValueError, match="h2h_tie_rule"):
+        mapper.with_settlement(totals_include_overtime=True, h2h_tie_rule="void")
+
+
+def test_shipped_guards_match_the_code_defaults() -> None:
+    """The YAML ``guards:`` section replaces the defaults: keep both in sync."""
+    from cs2bot.odds.market_mapping import MarketGuards
+
+    shipped = MarketMapper.from_yaml(project_root() / "config" / "betclic_markets.yaml").guards
+    default = MarketGuards.build()
+    for attr in ("excludes_overtime", "includes_overtime", "unsupported"):
+        assert [p.pattern for p in getattr(shipped, attr)] == [p.pattern for p in getattr(default, attr)]
+    assert dict(shipped.line_bounds) == dict(default.line_bounds)
+
+
+def test_guards_section_is_validated_and_overridable() -> None:
+    rules = {"rules": [_minimal_rule(market_type="total_maps", patterns=["^mapy$"], selection="over_under")]}
+    custom = MarketMapper.from_dict({**rules, "guards": {"line_bounds": {"total_maps": [0.5, 9.5]}}})
+    assert custom.map("Mapy", "Powyżej 8,5", event=EVENT, swapped=False) is not None
+    assert MarketMapper.from_dict(rules).map("Mapy", "Powyżej 8,5", event=EVENT, swapped=False) is None
+    with pytest.raises(ValueError, match="line_bounds"):
+        MarketMapper.from_dict({**rules, "guards": {"line_bounds": {"total_maps": [1]}}})
+    with pytest.raises(ValueError, match="guards"):
+        MarketMapper.from_dict({**rules, "guards": ["nope"]})
+    with pytest.raises(ValueError, match="bad regex"):
+        MarketMapper.from_dict({**rules, "guards": {"unsupported": ["("]}})
+
+
+def test_team_prefixed_nicknames_are_still_players(mapper: MarketMapper) -> None:
+    resolver = make_name_resolver({"s1mple": 11, "zywoo": 22})
+    mapped = mapper.map(
+        "Najwięcej zabójstw - mapa 1", "NAVI s1mple", event=EVENT, swapped=False, player_resolver=resolver
+    )
+    assert mapped is not None and mapped.selection_key == "player:11"
+    kills = mapper.map(
+        "Zabójstwa gracza - mapa 1",
+        "Natus Vincere s1mple Powyżej 19,5",
+        event=EVENT,
+        swapped=False,
+        player_resolver=resolver,
+    )
+    assert kills is not None and kills.spec.player_id == 11
+    # ... but a bare team name is a team market, never a player
+    assert _key_with(mapper, "Najwięcej zabójstw - mapa 1", "Natus Vincere") is None
+
+
+def test_mapping_rule_names_the_rule_that_mapped(mapper: MarketMapper) -> None:
+    assert mapper.match_rule("Liczba rund - mapa 1") == "team_total_rounds"  # first rule fitting the name
+    assert mapper.mapping_rule("Liczba rund - mapa 1", "Powyżej 21,5", event=EVENT) == "total_rounds"
+    assert mapper.mapping_rule("Zwycięzca meczu", "Natus Vincere", event=EVENT) == "match_winner"
+    assert mapper.mapping_rule("Zwycięzca turnieju", "Natus Vincere", event=EVENT) is None
+    assert mapper.match_rule("Liczba rund - mapa 1 (bez dogrywki)") is None  # fails the settlement guard
 
 
 def test_academy_teams_are_not_confused(mapper: MarketMapper) -> None:
@@ -262,6 +454,9 @@ def test_match_rule_diagnostics(mapper: MarketMapper) -> None:
         ("pierwsza mapa", 1),
         ("liczba map", None),
         ("liczba map 2,5", None),
+        ("mapa 1+2", None),  # several maps are never a single map
+        ("mapy 1-2", None),
+        ("mapa 9", None),
     ],
 )
 def test_extract_map_number(text: str, expected: int | None) -> None:
@@ -276,6 +471,9 @@ def test_extract_map_number(text: str, expected: int | None) -> None:
         ("maps 1-3", (1, 2, 3)),
         ("mapa 1 - 2. polowa", None),
         ("mapa 1", None),
+        ("mapa 1+2", (1, 2)),
+        ("mapy 1, 2 i 3", (1, 2, 3)),
+        ("mapy 2-1", None),
     ],
 )
 def test_extract_maps_scope(text: str, expected: tuple[int, ...] | None) -> None:

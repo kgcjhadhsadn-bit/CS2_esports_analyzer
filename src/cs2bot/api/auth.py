@@ -107,6 +107,8 @@ class SessionAuth:
 class LoginRateLimiter:
     """Sliding-window limit on failed logins, per client address and globally."""
 
+    _MAX_TRACKED_CLIENTS = 256
+
     def __init__(
         self,
         *,
@@ -147,6 +149,12 @@ class LoginRateLimiter:
     def record_failure(self, client: str) -> None:
         now = self._clock()
         with self._lock:
+            if len(self._by_client) >= self._MAX_TRACKED_CLIENTS:
+                # forget clients whose failures all left the window (bounded memory under a
+                # long-running guessing attempt from many addresses)
+                cutoff = now - self.window_s
+                for key in [k for k, q in self._by_client.items() if not q or q[-1] <= cutoff]:
+                    del self._by_client[key]
             self._by_client.setdefault(client, deque()).append(now)
             self._global.append(now)
 

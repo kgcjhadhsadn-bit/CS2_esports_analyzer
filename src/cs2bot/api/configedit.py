@@ -11,6 +11,7 @@ Fields equal to the default are dropped so the stored overrides stay minimal.
 
 from __future__ import annotations
 
+import math
 import re
 from collections.abc import Callable, Mapping
 from decimal import Decimal
@@ -144,6 +145,14 @@ def _validate_section(
         return {}
     seen: set[int] = set()
     for name in raw:
+        value = getattr(merged, name)
+        if isinstance(value, float) and not math.isfinite(value):
+            # Python's JSON parser accepts NaN / Infinity. Every comparison with NaN is false, so a
+            # NaN threshold would pass the range checks below AND switch the engine's check off.
+            errors.append(
+                {"loc": ["body", section, name], "msg": "must be a finite number", "type": "finite_number"}
+            )
+            continue
         for check in checks.get(name, []):
             if id(check) in seen:
                 continue

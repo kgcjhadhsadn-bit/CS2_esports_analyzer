@@ -13,6 +13,7 @@ from sqlalchemy.orm import selectinload
 
 from cs2bot.api.deps import DB, Ctx, require_auth
 from cs2bot.api.formatting import round_or_none, utc
+from cs2bot.api.params import IdPath
 from cs2bot.api.queries import match_brief, match_load_options, team_ref
 from cs2bot.api.schemas import TeamDetail, TeamMapResult, TeamMapStat, TeamOut, TeamPlayerOut, TeamResult
 from cs2bot.db.models import MapPlayed, Match, Player, PlayerMapStats, Team, Veto
@@ -58,7 +59,7 @@ class _MapAcc:
 
 @router.get("/{team_id}", response_model=TeamDetail)
 def get_team(
-    team_id: int,
+    team_id: IdPath,
     ctx: Ctx,
     db: DB,
     limit: Annotated[int, Query(ge=1, le=100, description="Recent results to return")] = 20,

@@ -38,7 +38,7 @@ FAST_TUNING = ExecutorTuning(
     login_poll_s=0.2,
     slip_update_timeout_s=3.0,
     confirmation_timeout_s=3.0,
-    balance_update_wait_s=1.5,
+    balance_update_wait_s=0.75,  # also the post-click "is the rejection real?" watch window
     poll_interval_s=0.05,
     slip_settle_s=0.1,
     min_seconds_between_bets=0.0,
@@ -94,55 +94,116 @@ def selectors() -> SelectorSet:
 ExecutorFactory = Callable[..., BetclicExecutor]
 
 
+class _SharedBrowserChromium:
+    """``playwright.chromium`` stand-in that opens a fresh CONTEXT in one shared browser.
+
+    Launching Chromium with a persistent profile costs well over half a second per test and there are
+    more than a hundred browser tests. The executor only uses the ``BrowserContext`` API of what
+    ``launch_persistent_context`` returns, so for most tests a new (isolated: own cookies and storage)
+    context of one long-lived browser is equivalent. The profile directory is still created - the lock
+    file and the placement journal live there. Tests that are about the real persistent launch pass
+    ``make_executor(real_profile=True)``.
+    """
+
+    _CONTEXT_OPTIONS = ("locale", "timezone_id", "viewport", "accept_downloads", "proxy")
+
+    def __init__(self, playwright: Any) -> None:
+        self._playwright = playwright
+        self._browser: Any = None
+        self.launch_options: list[dict[str, Any]] = []
+
+    def launch_persistent_context(self, **options: Any) -> Any:
+        self.launch_options.append(options)
+        if self._browser is None or not self._browser.is_connected():
+            self._browser = self._playwright.chromium.launch(
+                headless=options.get("headless", True), executable_path=options.get("executable_path")
+            )
+        Path(options["user_data_dir"]).mkdir(parents=True, exist_ok=True)
+        return self._browser.new_context(**{k: options[k] for k in self._CONTEXT_OPTIONS if k in options})
+
+    def close(self) -> None:
+        if self._browser is not None and self._browser.is_connected():
+            self._browser.close()
+        self._browser = None
+
+
 class _SharedPlaywright:
     """One Playwright driver for all executors of a test module (starting it costs ~0.3 s each time).
 
     ``BrowserSession.close()`` stops "its" Playwright; for the shared driver that is a no-op - the
-    module fixture stops the real one. Browsers and profiles are still launched and closed per test.
+    module fixture stops the real one. ``chromium`` is the real launcher (one Chromium with a persistent
+    profile per executor) or, by default, :class:`_SharedBrowserChromium`.
     """
 
-    def __init__(self, playwright: Any) -> None:
+    def __init__(self, playwright: Any, chromium: Any = None) -> None:
         self._playwright = playwright
+        self._chromium = chromium
 
     @property
     def chromium(self) -> Any:
-        return self._playwright.chromium
+        return self._chromium if self._chromium is not None else self._playwright.chromium
 
     def stop(self) -> None:
         return
 
 
+class PlaywrightFactories:
+    """The two ``playwright_factory`` callables of a test module (same driver underneath)."""
+
+    def __init__(self) -> None:
+        self._started: list[Any] = []
+        self._shared_chromium: _SharedBrowserChromium | None = None
+
+    def _driver(self) -> Any:
+        if not self._started:
+            self._started.append(sync_playwright().start())
+        return self._started[0]
+
+    def shared_browser(self) -> Any:
+        """Fast: every executor gets a new context of one shared browser."""
+        driver = self._driver()
+        if self._shared_chromium is None:
+            self._shared_chromium = _SharedBrowserChromium(driver)
+        return _SharedPlaywright(driver, self._shared_chromium)
+
+    def real_profile(self) -> Any:
+        """The production path: ``chromium.launch_persistent_context`` with the profile directory."""
+        return _SharedPlaywright(self._driver())
+
+    def stop(self) -> None:
+        if self._shared_chromium is not None:
+            self._shared_chromium.close()
+        for playwright in self._started:
+            playwright.stop()
+        self._started.clear()
+
+
 @pytest.fixture(scope="module")
-def shared_playwright() -> Iterator[Callable[[], Any]]:
-    """Factory for ``BetclicExecutor(playwright_factory=...)``; the driver starts on first use.
-
-    Module-scoped on purpose: Playwright's sync API allows one driver per thread, so it must be gone
-    before another package's browser tests start their own in the same pytest process.
-    """
-    started: list[Any] = []
-
-    def factory() -> Any:
-        if not started:
-            started.append(sync_playwright().start())
-        return _SharedPlaywright(started[0])
-
-    yield factory
-    for playwright in started:
-        playwright.stop()
+def playwright_factories() -> Iterator[PlaywrightFactories]:
+    """Module-scoped on purpose: Playwright's sync API allows one driver per thread, so it must be gone
+    before another package's browser tests start their own in the same pytest process."""
+    factories = PlaywrightFactories()
+    yield factories
+    factories.stop()
 
 
 @pytest.fixture
 def make_executor(
-    executor_settings: Settings, shared_playwright: Callable[[], Any]
+    executor_settings: Settings, playwright_factories: PlaywrightFactories
 ) -> Iterator[ExecutorFactory]:
+    """Executors against the mock site; ``real_profile=True`` launches Chromium with the profile dir."""
     created: list[BetclicExecutor] = []
 
     def _make(**kwargs: Any) -> BetclicExecutor:
         settings = kwargs.pop("settings", executor_settings)
+        real_profile = kwargs.pop("real_profile", False)
         kwargs.setdefault("halt_check", lambda: (False, None))
         kwargs.setdefault("sleep", lambda _s: None)
         kwargs.setdefault("tuning", FAST_TUNING)
-        kwargs.setdefault("playwright_factory", shared_playwright)
+        kwargs.setdefault(
+            "playwright_factory",
+            playwright_factories.real_profile if real_profile else playwright_factories.shared_browser,
+        )
         executor = BetclicExecutor(settings, **kwargs)
         created.append(executor)
         return executor

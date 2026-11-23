@@ -6,7 +6,7 @@ from datetime import datetime
 from enum import StrEnum
 from typing import Annotated, Any
 
-from fastapi import HTTPException, Query
+from fastapi import HTTPException, Path, Query
 
 from cs2bot.utils.time import ensure_utc
 
@@ -16,6 +16,11 @@ FromParam = Annotated[
     Query(alias="from", description="Lower bound (inclusive), ISO-8601; no offset = UTC"),
 ]
 ToParam = Annotated[datetime | None, Query(description="Upper bound (inclusive), ISO-8601; no offset = UTC")]
+# Primary keys are 32-bit integers on PostgreSQL: a larger value in the URL must be a clean 422, not a
+# driver error (SQLite: OverflowError, PostgreSQL: "integer out of range") surfacing as HTTP 500.
+MAX_DB_INT = 2**31 - 1
+IdPath = Annotated[int, Path(ge=-MAX_DB_INT - 1, le=MAX_DB_INT)]
+IdQuery = Annotated[int | None, Query(ge=-MAX_DB_INT - 1, le=MAX_DB_INT)]
 ListParam = Annotated[
     list[str] | None, Query(description="Repeat the parameter or separate values with commas")
 ]

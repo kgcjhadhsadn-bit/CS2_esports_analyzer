@@ -49,5 +49,5 @@ class ApiOptions:
     failing_job_threshold: int = 3
     """Consecutive failed runs after which a job raises a "failing" alert."""
     scheduler_overdue_grace_s: float = 900.0
-    """A scheduler job whose ``next_due`` lies further in the past than this (and at least two of
-    its own intervals, when known) is reported as overdue - the scheduler thread is probably stuck."""
+    """A scheduler job whose ``next_due`` lies further in the past than this while nothing runs in
+    its lane is reported as overdue - the scheduler (or that lane's thread) is probably not running."""

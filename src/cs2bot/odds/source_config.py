@@ -8,7 +8,8 @@ changes. Unknown keys are ignored with a warning.
 from __future__ import annotations
 
 import logging
-from collections.abc import Mapping
+import re
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, fields, replace
 from pathlib import Path
 from typing import Any, Literal
@@ -17,11 +18,87 @@ import yaml
 
 from cs2bot.config import Settings
 from cs2bot.odds.grpc_web import DEFAULT_GRPC_BASE_URL
+from cs2bot.odds.text import fold_text
 from cs2bot.utils.paths import resolve_path
 
 logger = logging.getLogger(__name__)
 
 DEFAULT_CS2_PATTERN = r"counter[\s\-_]*strike|\bcs\s*-?\s*2\b|\bcs:?\s*go\b|\bcsgo\b|\bcs2\b"
+
+# Other e-sports Betclic lists in the same "E-sport" section. Organisations such as G2, Fnatic,
+# Team Liquid or NAVI field teams in several of them, so a League of Legends "G2 - Fnatic" played
+# around the same time as a CS2 "G2 - Fnatic" would otherwise be linked to our CS2 match (same team
+# names, close start time) and its "Zwycięzca meczu" would be priced with the CS2 model. Matched on
+# folded sport / competition / URL-section text (never on team names); spaces also match "-" / "_".
+_OTHER_GAMES: tuple[str, ...] = (
+    "league of legends",
+    r"\blol\b",
+    r"\bdota\b",
+    "valorant",
+    "rainbow six",
+    r"\br6\b",
+    "overwatch",
+    "starcraft",
+    "warcraft",
+    "rocket league",
+    r"\bea (?:sports )?fc\b",
+    r"\befootball\b",
+    r"\bfifa\b",
+    r"\bnba 2k",
+    "mobile legends",
+    "king of glory",
+    "honor of kings",
+    "arena of valor",
+    "wild rift",
+    "teamfight tactics",
+    r"\bpubg\b",
+    "call of duty",
+    "apex legends",
+    "hearthstone",
+    "fortnite",
+    "age of empires",
+    "crossfire",
+    "free fire",
+    "brawl stars",
+    "street fighter",
+    r"\btekken\b",
+    "marvel rivals",
+    "deadlock",
+    r"\b(?:lec|lck|lpl|lcs|vct)\b",  # League of Legends / Valorant league abbreviations
+)
+DEFAULT_OTHER_GAMES_PATTERN = "|".join(p.replace(" ", r"[\s\-_]*") for p in _OTHER_GAMES)
+_CS2_RE = re.compile(DEFAULT_CS2_PATTERN)
+_OTHER_GAMES_RE = re.compile(DEFAULT_OTHER_GAMES_PATTERN)
+
+
+def url_section(url: str | None) -> str | None:
+    """A URL without its last path segment (the event slug carries team names, not the game)."""
+    if not url:
+        return None
+    path = url.split("?", 1)[0].split("#", 1)[0].rstrip("/")
+    head, _, _ = path.rpartition("/")
+    return head or None
+
+
+def is_other_game(
+    hints: Iterable[str | None],
+    *,
+    cs2_pattern: str | re.Pattern[str] | None = None,
+    other_pattern: str | re.Pattern[str] | None = None,
+) -> bool:
+    """Do the sport / competition / URL-section hints name another e-sport (and not CS2)?
+
+    ``False`` when no hint is conclusive - this is a veto against clear mismatches only.
+    """
+    cs2_re = re.compile(cs2_pattern) if isinstance(cs2_pattern, str) else (cs2_pattern or _CS2_RE)
+    other_re = (
+        re.compile(other_pattern) if isinstance(other_pattern, str) else (other_pattern or _OTHER_GAMES_RE)
+    )
+    folded = [fold_text(h) for h in hints if h]
+    if any(cs2_re.search(h) for h in folded):
+        return False
+    return any(other_re.search(h) for h in folded)
+
 
 DEFAULT_IGNORED_URLS: tuple[str, ...] = (
     "google",
@@ -41,6 +118,39 @@ DEFAULT_IGNORED_URLS: tuple[str, ...] = (
     "/collect",
     "/track",
 )
+
+
+def _coerce(default: Any, value: Any) -> Any:
+    """``value`` converted to the type of the option's default; raises on a mismatch."""
+    if isinstance(default, bool):
+        if not isinstance(value, bool):
+            raise TypeError("expected a boolean")
+        return value
+    if isinstance(default, int):
+        if isinstance(value, bool) or not isinstance(value, int | float | str):
+            raise TypeError("expected an integer")
+        number = float(value)
+        if not number.is_integer():
+            raise ValueError("expected an integer")
+        return int(number)
+    if isinstance(default, float):
+        if isinstance(value, bool) or not isinstance(value, int | float | str):
+            raise TypeError("expected a number")
+        number = float(value)
+        if number != number or number in (float("inf"), float("-inf")):
+            raise ValueError("expected a finite number")
+        return number
+    if isinstance(default, tuple):
+        if not isinstance(value, list | tuple):
+            raise TypeError("expected a list")
+        return tuple(str(v) for v in value)
+    if value is None:
+        if default is None:
+            return None
+        raise TypeError("expected a value")
+    if not isinstance(value, str):
+        raise TypeError("expected text")
+    return value
 
 
 @dataclass(frozen=True)
@@ -111,16 +221,20 @@ class BetclicSourceConfig:
 
     @classmethod
     def from_mapping(cls, data: Mapping[str, Any]) -> BetclicSourceConfig:
-        known = {f.name: f for f in fields(cls)}
+        """Defaults overridden by ``data``; unknown keys and values of the wrong type are ignored
+        with a warning (a typo in the YAML must not crash a crawl half-way through)."""
+        defaults = cls()
+        known = {f.name for f in fields(cls)}
         values: dict[str, Any] = {}
         for key, value in data.items():
             if key not in known:
                 logger.warning("ignoring unknown Betclic source option %r", key)
                 continue
-            if isinstance(value, list):
-                value = tuple(value)
-            values[key] = value
-        return replace(cls(), **values)
+            try:
+                values[key] = _coerce(getattr(defaults, key), value)
+            except (TypeError, ValueError):
+                logger.warning("ignoring Betclic source option %r: bad value %r", key, value)
+        return replace(defaults, **values)
 
     @classmethod
     def load(cls, settings: Settings) -> BetclicSourceConfig:

@@ -47,7 +47,7 @@ def test_dry_run_never_clicks_the_final_button(
     site: MockBetclicServer, make_executor: ExecutorFactory, make_order: OrderFactory
 ) -> None:
     order = make_order(dry_run=True)
-    result = make_executor().place(order)
+    result = make_executor(real_profile=True).place(order)  # Chromium with the persistent profile
     assert result.status is PlacementStatus.DRY_RUN_OK, result.message
     assert result.placed_odds == Decimal("1.85")
     assert "NOT clicked" in result.message
@@ -78,8 +78,10 @@ def test_successful_placement(
     site: MockBetclicServer, make_executor: ExecutorFactory, make_order: OrderFactory
 ) -> None:
     order = make_order()
-    result = make_executor().place(order)
+    executor = make_executor(real_profile=True)  # the production launch: Chromium + persistent profile
+    result = executor.place(order)
     assert result.status is PlacementStatus.PLACED, result.message
+    assert (Path(executor.settings.betclic.browser_profile_dir) / "Default").is_dir()  # a real profile
     assert result.external_bet_id == "BC1001"
     assert result.placed_odds == Decimal("1.85")
     assert result.balance_after == Decimal("1222.06")
@@ -626,7 +628,7 @@ def test_open_login_window_when_already_logged_in(
 def test_relaunch_after_the_owner_closes_the_window(
     site: MockBetclicServer, make_executor: ExecutorFactory
 ) -> None:
-    executor = make_executor()
+    executor = make_executor(real_profile=True)
     assert executor.is_logged_in()
     context = executor._session._context
     assert context is not None

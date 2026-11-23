@@ -42,7 +42,8 @@ def _selectors(elements: dict[str, list[dict[str, Any]]]) -> SelectorSet:
     }
     filler.update({key: {"description": "test", "locators": locs} for key, locs in elements.items()})
     texts = {key: ["x"] for key in SelectorSet.REQUIRED_TEXTS}
-    return SelectorSet.model_validate({"elements": filler, "texts": texts})
+    behaviour = {"require_potential_win": False}  # (the element is not part of this minimal set)
+    return SelectorSet.model_validate({"elements": filler, "texts": texts, "behaviour": behaviour})
 
 
 @pytest.fixture(scope="module")

@@ -291,6 +291,11 @@ class SelectorBehaviour(BaseModel):
     # bet (a hidden second selection would turn the single into a combination bet). Set to False only
     # if the page is known to keep hidden duplicates of the visible slip.
     count_hidden_slip_items: bool = True
+    # True: no bet (and no successful dry run) unless the slip's potential win (``slip_potential_win``)
+    # can be read and fits stake x odds. It is the only check of what Betclic UNDERSTOOD from the typed
+    # stake: the stake field can show "12,50" while the site computes with 1250. Set to False only after
+    # checking by hand that a typed "12,50" is taken as 12.50 and if the slip really shows no such line.
+    require_potential_win: bool = True
 
 
 @dataclass(frozen=True)
@@ -396,6 +401,12 @@ class SelectorSet(BaseModel):
         missing_texts = sorted(k for k in self.REQUIRED_TEXTS if not self.texts.get(k))
         if missing_texts:
             raise ValueError(f"missing required texts: {missing_texts}")
+        if self.behaviour.require_potential_win and "slip_potential_win" not in self.elements:
+            # reported at start-up, not as a SELECTOR_ERROR on every bet
+            raise ValueError(
+                "behaviour.require_potential_win is true but the element 'slip_potential_win' is not "
+                "defined (define it, or set the flag to false)"
+            )
         return self
 
     # ------------------------------------------------------------------ lookups

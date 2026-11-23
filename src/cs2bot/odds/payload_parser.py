@@ -30,7 +30,11 @@ Recognition rules (all defensive - one malformed record never aborts the whole p
   the node whose id equals the betslip market id, else the name of the *outermost* named node
   holding a selection container (the card; named rows such as ``"Powyżej"`` inside it are
   ignored), else the nearest named ancestor. When a market sits inside a group named after a map
-  (``"Mapa 1"``) and its own name has no map number, the group name is prefixed.
+  (``"Mapa 1"``) and its own name has no map number, the group name is prefixed
+  (``"Mapa 1 - Liczba rund"``) so that the mapper can tell the maps apart. Such a ``raw_name`` is
+  NOT the text shown on the page: the market's own title and its group are kept in
+  :attr:`ParsedMarket.page_name` / :attr:`ParsedMarket.group` (the collector stores them in
+  ``bookmaker_markets.extra`` for whoever has to find the market on the page again).
 
 Duplicates of the same event found in several payloads are merged (markets and selections are
 unioned; prices from later payloads win because they were captured later).
@@ -48,9 +52,11 @@ from decimal import Decimal
 from typing import Any
 from urllib.parse import urljoin
 
+from dateutil import parser as dateutil_parser
+
 from cs2bot.domain.odds import CollectedEvent, CollectedMarket, CollectedSelection
 from cs2bot.odds.text import fold_text, parse_odds, tidy
-from cs2bot.utils.time import parse_datetime
+from cs2bot.utils.time import WARSAW, parse_datetime
 
 logger = logging.getLogger(__name__)
 
@@ -61,6 +67,8 @@ _MAP_REF_RE = re.compile(r"\bmap[a-z]*\s*(?:nr\.?\s*)?\d|\b\d\s*\.?\s*map[a-z]*\
 _CATEGORY_RE = re.compile(r"^ca_[a-z0-9_]+$")
 _ASSET_RE = re.compile(r"\.(?:png|jpe?g|gif|svg|webp|ico|css|js)(?:$|[?#])", re.IGNORECASE)
 _DEFAULT_URL_ID_PATTERN = r"-m(\d+)(?=$|[/?#])"
+# "23.11.2026 18:00" / "5/11/26": a date written the Polish way (day first)
+_DAY_FIRST_DATE_RE = re.compile(r"^\s*\d{1,2}[./]\d{1,2}[./]\d{2,4}\b")
 
 
 @dataclass(frozen=True)
@@ -296,6 +304,10 @@ class ParsedMarket:
     selections: dict[str, ParsedSelection] = field(default_factory=dict)
     # when the payload this market was last seen in was captured (set by the source pipeline)
     captured_at: datetime | None = None
+    # set only when ``raw_name`` was built by prefixing a map group: the market's own title as the
+    # page shows it, and the group ("Mapa 1") it sits in
+    page_name: str | None = None
+    group: str | None = None
 
     def add(self, sel: ParsedSelection) -> None:
         self.selections[sel.merge_key()] = sel  # later observations win (fresher)
@@ -350,6 +362,8 @@ class ParsedEvent:
                 target.captured_at is None or mkt.captured_at > target.captured_at
             ):
                 target.captured_at = mkt.captured_at
+            if mkt.page_name and not target.page_name:
+                target.page_name, target.group = mkt.page_name, mkt.group
 
     def _collected_markets(self) -> list[tuple[CollectedMarket, datetime | None]]:
         """Markets as handed to the collector, each with the capture time of its freshest payload."""
@@ -385,9 +399,15 @@ class ParsedEvent:
 
     def market_times(self) -> dict[tuple[str, str], datetime]:
         """``(raw_name, external_id) -> capture time`` of the markets :meth:`to_collected` returns."""
-        return {
-            (cm.raw_name, cm.external_id): at for cm, at in self._collected_markets() if at is not None
-        }
+        return {(cm.raw_name, cm.external_id): at for cm, at in self._collected_markets() if at is not None}
+
+    def market_meta(self) -> dict[tuple[str, str], dict[str, str]]:
+        """``(raw_name, external_id) -> {"page_name", "group"}`` for markets with a prefixed name."""
+        out: dict[tuple[str, str], dict[str, str]] = {}
+        for key, mkt in self.markets.items():
+            if mkt.page_name and mkt.group:
+                out[key] = {"page_name": mkt.page_name, "group": mkt.group}
+        return out
 
     def to_collected(self, *, captured_at: datetime | None = None) -> CollectedEvent:
         """The event as a :class:`CollectedEvent`; ``captured_at`` = when its prices were read."""
@@ -471,8 +491,16 @@ def _parse_dt(value: Any) -> datetime | None:
         return None  # not an epoch timestamp
     if isinstance(value, str) and not re.search(r"\d{4}|\d{1,2}[./]\d{1,2}[./]\d{2,4}", value):
         return None
+    dt: datetime | None
     try:
-        dt = parse_datetime(value) if isinstance(value, str | int | float | datetime) else None
+        if isinstance(value, str) and _DAY_FIRST_DATE_RE.match(value):
+            # A display date from a Polish site: day first ("05.11.2026" is 5 November, which the
+            # default month-first reading would turn into 11 May) and, without an offset, local
+            # Polish time. ISO timestamps (below) are UTC when they carry no offset.
+            dt = dateutil_parser.parse(value, dayfirst=True)
+            dt = dt.replace(tzinfo=WARSAW) if dt.tzinfo is None else dt
+        else:
+            dt = parse_datetime(value) if isinstance(value, str | int | float | datetime) else None
     except (ValueError, OverflowError, TypeError, OSError):
         return None
     if dt is None or not (2000 <= dt.year <= 2100):
@@ -799,8 +827,9 @@ class _Walker:
                 raw_name = hit.market_name or hit.any_name
             if not raw_name:
                 continue
+            page_name: str | None = None
             if hit.map_prefix and hit.map_prefix != raw_name and not _MAP_REF_RE.search(fold_text(raw_name)):
-                raw_name = f"{hit.map_prefix} - {raw_name}"
+                page_name, raw_name = raw_name, f"{hit.map_prefix} - {raw_name}"
             external_id = betslip_id or hit.market_node_id or ""
             selection = ParsedSelection(
                 external_id=self._first_id(hit.node, self.keys.selection_ids) or "",
@@ -808,7 +837,10 @@ class _Walker:
                 odds=hit.odds,
                 is_available=not hit.unavailable,
             )
-            event.market(raw_name, external_id).add(selection)
+            parsed_market = event.market(raw_name, external_id)
+            parsed_market.add(selection)
+            if page_name is not None and hit.map_prefix:
+                parsed_market.page_name, parsed_market.group = page_name, hit.map_prefix
 
     def attach_orphans(self) -> None:
         """Attach market nodes that carry a match id but sit outside their match node."""
@@ -1050,7 +1082,8 @@ def find_match_categories(documents: Iterable[Any], match_id: str) -> list[str]:
                     cid = cat.get("id") if isinstance(cat, Mapping) else cat
                     if isinstance(cid, str) and cid not in found:
                         found.append(cid)
-            for cid in node.get("categoryIds") or []:
+            category_ids = node.get("categoryIds")
+            for cid in category_ids if isinstance(category_ids, list) else []:
                 if isinstance(cid, str) and cid not in found:
                     found.append(cid)
         for value in node.values():
