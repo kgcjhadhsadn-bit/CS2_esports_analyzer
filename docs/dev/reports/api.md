@@ -2,7 +2,7 @@
 
 > Written by the engineer who implemented the package. Reviewers update it when the public API changes.
 
-**Tests:** `.venv/bin/python -m pytest tests/api -q` - 220 passed, 0 failed, 2 skipped (PostgreSQL; both pass with `CS2BOT_TEST_DATABASE_URL` set) after review round 1 (lint/type clean: True)
+**Tests:** `.venv/bin/python -m pytest tests/api -q` - 224 passed, 0 failed, 2 skipped (PostgreSQL; both pass with `CS2BOT_TEST_DATABASE_URL` set) after review round 1 and its second pass (lint/type clean: True)
 
 ## Summary
 
@@ -98,7 +98,7 @@ Settings read from `settings.api`: `host`, `port`, `serve_dashboard`, `dashboard
 - **Audit actor** is `"dashboard"`, or `"dashboard:<username>"` when auth is on. Audit actions: `kill_switch_on`, `kill_switch_off`, `pause`, `resume`, `config_overrides` (written by db.state), plus `link_review`, `betclic_login_requested`, `auth_login`, `auth_logout`.
 - **Job names** (owned by the scheduler) are classified by keyword to find the expected interval in `SchedulerSettings`: odds, predict, settle, bet, result, news, demo, ranking, train/retrain, backup, reconcil, upcoming/fixture/schedule. Example: `odds_collect`, `ingest_upcoming`, `predict_upcoming`, `settle_bets`. A job is stale when its last success is older than 2 × interval + 10 min.
 
-- **Paper bets** (contract with `engine.ledger.settle_bet`): a settled paper bet keeps `bets.status = "dry_run"`; its result is read from `bets.extra["settled_outcome"]` (`won` / `lost` / `void` / `push`), falling back to `settled_at` + the sign of `pnl`. The API exposes it as `result` and uses it in every statistic. A row counts as paper when `dry_run` is true or its status is `dry_run` (the engine's `is_dry_run`).
+- **Paper bets** (contract with `engine.ledger.settle_bet`): a settled paper bet keeps `bets.status = "dry_run"`; its result is read from `bets.extra["settled_outcome"]` (`won` / `lost` / `void` / `push`), falling back to `settled_at` + the sign of `pnl`. The API exposes it as `result` and uses it in every statistic. A row counts as paper when `dry_run` is true or its status is `dry_run` (the engine's `is_dry_run`). Because `settle_bet` settles every row `is_dry_run` accepts, a row flagged `dry_run` that is still `pending` / `placing` / `placed` is also read as a settled paper bet once `settled_outcome` (or `settled_at` + `pnl`) is present.
 - **Bankroll numbers** follow `engine.bankroll.compute_state` / `loss_limit_status` (balance = last written ledger row, `bankroll_reference` = balance + debited open stakes, period-start bankroll = reference - realized P&L of the period, limit rounded down to the grosz). A test compares the endpoint with the engine on the same database.
 - **Scheduler status**: the provider returns `Scheduler.status()` dicts (`name`, `lane`, `enabled`, `last_run`, `next_due` as ISO strings or datetimes, `failures`). It is called on every `/api/health` request and must not block.
 - **Predictions** are expected to be unconditional (`OutcomeProbability`): `p_win + p_push + p_void + p_lose = 1`. The match page shows `p_win_settled`; calibration uses it.
@@ -176,3 +176,17 @@ Independent review of the whole package against the brief and its addendum. An e
 - Job classification for staleness still relies on keywords in job names when no scheduler status is available; with `scheduler_status_provider` wired the overdue check covers every job regardless of its name.
 - Selectors, Betclic payloads and the live site remain unverified (not this package), so the end-to-end path dashboard -> login window -> executor has only been exercised with fakes.
 
+### Second pass (independent reviewer)
+
+A second, independent reviewer re-ran every check and went through the brief, the addendum and the code again (security middleware, auth, controls, config validation, review queue, screenshot / SPA path handling, EV vs `engine.ev.expected_value`, bankroll vs `engine.bankroll.compute_state` / `loss_limit_status`, health vs `flows.scheduler.Scheduler.status`, odds `remap_event` contract). A fuzz pass sent 19 GET endpoints x 23 hostile parameter sets (bad / reversed / extreme dates, huge and negative ids and limits, unknown enum values, SQL-looking strings) and got no 5xx; adversarial `PUT /api/control/config` bodies (NaN / Infinity / sNaN strings, nested NaN thresholds, 1e300 integers, wrong types, extra keys) all gave clean 422s. All OpenAPI routes and query parameters are documented in docs/API.md.
+
+Issues found and fixed:
+
+1. **Minor - flagged paper rows settled while still `pending` looked open for ever.** `engine.ledger.settle_bet` settles any row its `is_dry_run` accepts (`dry_run` flag OR status) and keeps the status, so a `dry_run=True` row whose simulated placement never ran stays `pending` / `placing` with a `settled_outcome`. `analytics.effective_status` only reinterpreted status `dry_run`: such a bet stayed "open" in the bets list, the paper bankroll (open exposure), per-market performance and the review queue's open-bet warning, and was missing from calibration. `effective_status` takes a `dry_run` flag now (all callers pass `bets.dry_run`); the calibration query loads every paper bet and the review count uses `paper_clause()`. FAILED / CANCELLED rows are never reinterpreted.
+2. **Minor - a won bet without `pnl` counted 0.** The engine's loss-limit code uses `payout - stake` for such a row; the API now does the same, so its daily / weekly figures keep matching `compute_state` even after an integration bug.
+3. **Minor (robustness) -** `SessionAuth.verify` caught only `BadSignature`; it catches `itsdangerous.BadData` now (covers `BadPayload` too), so no cookie can turn into a 500.
+4. **Tests / docs:** 4 new tests in `tests/api/test_api_review1_extra.py` (flagged paper rows end to end through bets / bankroll / performance / calibration / review, the engine comparison for a won bet without pnl, undecodable session tokens); docs/API.md notes the flagged paper rows.
+
+No public API changed (`effective_status` is internal; its new keyword defaults to the old behaviour).
+
+Remaining concerns (unchanged from the first pass, still valid): nothing persists `system_state["executor_health"]`, `bet_decisions.prediction_id` and pre-start-only predictions until the integration layer exists; login rate limiting / logout revocation are in-process only; the Swagger UI needs a CDN. The engine docstring of `settle_bet` says PENDING / FAILED bets raise, but for paper rows it settles any status (including FAILED / CANCELLED) - the engine reviewer should decide which is intended; the API ignores settled FAILED / CANCELLED rows either way.

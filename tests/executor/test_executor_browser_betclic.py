@@ -398,7 +398,9 @@ def test_login_required(
 def test_halt_switched_on_between_steps(
     site: MockBetclicServer, make_executor: ExecutorFactory, make_order: OrderFactory
 ) -> None:
-    answers = iter([(False, None), (True, "kill switch is on")])
+    # 1st check: start of the attempt; 2nd: right before the outcome is clicked; 3rd: right before
+    # "Postaw zakład".
+    answers = iter([(False, None), (False, None), (True, "kill switch is on")])
     calls: list[int] = []
 
     def halt_check() -> tuple[bool, str | None]:
@@ -409,7 +411,7 @@ def test_halt_switched_on_between_steps(
     result = make_executor(halt_check=halt_check).place(order)
     assert result.status is PlacementStatus.KILL_SWITCH
     assert "right before confirming" in result.message
-    assert len(calls) == 2
+    assert len(calls) == 3
     assert site.state.place_calls == [] and site.state.slip == []
     _shot(result.screenshot_path, "kill_switch", order.bet_id, order.idempotency_key)
 

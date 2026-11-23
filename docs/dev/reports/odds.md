@@ -2,7 +2,7 @@
 
 > Written by the engineer who implemented the package. Reviewers update it when the public API changes.
 
-**Tests:** `.venv/bin/python -m pytest tests/odds -q` - 352 passed, 2 skipped (the 2 PostgreSQL tests; they pass against PostgreSQL 16 when `CS2BOT_TEST_DATABASE_URL` is set), 0 failed (lint/type clean: True). Numbers as of review round 1.
+**Tests:** `.venv/bin/python -m pytest tests/odds -q` - 374 passed, 2 skipped (the 2 PostgreSQL tests; they pass against PostgreSQL 16 when `CS2BOT_TEST_DATABASE_URL` is set), 0 failed (lint/type clean: True). Numbers as of the independent review-round-1 pass.
 
 ## Summary
 
@@ -85,15 +85,16 @@ with session_scope() as s:
   - Returns `None` for unknown markets or selections; these are stored unmapped and never bet.
   - Handicap: `spec.line` is our team1's handicap. "Team2 -1.5" becomes line +1.5 with selection team2.
   - Head-to-head specs store the two player ids sorted ascending.
-  - `sibling_selections` (all selection names of the market) is needed for the three-way guards; `draw_possible` is whether the linked series can end level (`True` only for a BO2, `None` = unknown / no check).
+  - `sibling_selections` (all selection names of the market) is needed for the three-way guards; `draw_possible` is whether the linked series can end level (`True` only for a BO2, `False` other formats, `None` = unknown). A match-winner market listing a draw is mapped only with `draw_possible=True`.
   - Guards (a mis-mapped market is worse than an unmapped one):
     - names stating that overtime is excluded ("bez dogrywki", "regulaminowy czas", "czas regulaminowy", "nie wliczając dogrywki", "regular time") or included ("z dogrywką") are mapped only when that agrees with `totals_include_overtime` for the round-count family (total rounds, team total rounds, odd/even, round handicap); for every other market type a "regulation only" variant is never mapped;
     - draw-no-bet, double chance and combined markets are never mapped;
-    - a two-way market type listing a draw ("Remis", "X") stays unmapped; a head-to-head listing a draw is mapped only with `h2h_tie_rule='lose'`; a match-winner market listing a draw is mapped only when `draw_possible` is not `False`; an over/under market that also lists "Dokładnie N" stays unmapped;
+    - a two-way market type listing a draw ("Remis", "X") stays unmapped; a head-to-head listing a draw is mapped only with `h2h_tie_rule='lose'`; a match-winner market listing a draw is mapped only when `draw_possible` is `True` (known BO2); an over/under market that also lists "Dokładnie N" stays unmapped;
     - player kill lines and head-to-heads need an explicit scope in the name: a map ("mapa 1"), several maps ("mapy 1-2", "mapa 1+2") or the whole match ("- mecz", "w meczu");
     - a "player" that is exactly one of the event's teams is a team market (unmapped);
     - lines outside `guards.line_bounds` stay unmapped (map handicap |line| <= 2.5, total maps 1.5-4.5, round handicap |line| <= 12.5, total rounds 13-40, team total rounds 0.5-16.5, race to 1-16, player kills 0.5-150);
-    - a bare "Handicap" or a "Handicap map" name carrying a map number is never a MAP handicap.
+    - a bare "Handicap" or a "Handicap map" name carrying a map number is never a MAP handicap;
+    - a name naming two different maps ("Mapa 1 i Mapa 2 - Zwycięzca", "Mapa 2 - Zwycięzca mapy 3") is never read as one map, and a rule that extracts maps never falls back to the whole match when the name has a numbered map it could not read; a digit right after "Mapa" is never a round or half number ("Mapa 1 runda 10", "Mapa 2 połowa"); a handicap selection carrying two lines stays unmapped.
 - `MarketMapper.match_rule(market_raw: str) -> str | None` returns the id of the first rule whose patterns fit the name (diagnostics for `odds unmapped`; `None` when the name fails a guard).
 - `MarketMapper.mapping_rule(market_raw, selection_raw, *, event, sibling_selections=None, draw_possible=None) -> str | None` returns the id of the rule that actually maps the selection.
 - `MarketMapper.group_key(market_raw, selection_raw, *, event, sibling_selections=None) -> str | None`
@@ -109,9 +110,10 @@ with session_scope() as s:
   - Never changes CONFIRMED or REJECTED rows.
   - Never links an event whose sport label (`event.extra["sport_raw"]`), competition or URL section names another e-sport and not CS2 (UNLINKED, reason "another e-sport ...").
   - An AUTO link whose match is `finished` is frozen (returned unchanged) instead of being wiped because the match is no longer a scheduled/live candidate.
-- `LinkResult` (pydantic) fields: `event_id`, `match_id`, `status: LinkStatus`, `confidence: float|None`, `teams_swapped`, `changed`, `status_changed`, `candidates: list[LinkCandidate(match_id, confidence, teams_swapped, team_score, time_score, competition_score, in_scope)]`, `reason`
+- `LinkResult` (pydantic) fields: `event_id`, `match_id`, `status: LinkStatus`, `confidence: float|None`, `teams_swapped`, `changed`, `status_changed`, `candidates: list[LinkCandidate(match_id, confidence, teams_swapped, team_score, time_score, competition_score, in_scope, orientation_margin)]`, `reason`
+  - AUTO also requires `orientation_margin` (team score of the chosen orientation minus the swapped one) >= `LinkConfig.min_orientation_margin` (0.10); otherwise PENDING_REVIEW with reason "team order unclear".
 - `store_betclic_aliases(session, event: BookmakerEvent) -> int`
-- `LinkConfig` (frozen dataclass; weights 0.7 team / 0.2 time / 0.1 competition, window 12 h, min_margin 0.05)
+- `LinkConfig` (frozen dataclass; weights 0.7 team / 0.2 time / 0.1 competition, window 12 h, min_margin 0.05, min_orientation_margin 0.10)
 
 ## Collector
 - `collect_once(session: Session, source: OddsSource, mapper: MarketMapper, *, settings: Settings, now: datetime | None = None, player_resolver_factory: Callable[[Session, int], PlayerResolver | None] | None = None, config: CollectorConfig | None = None) -> CollectReport`
@@ -204,3 +206,36 @@ State found: the package had been partly reworked by an earlier, interrupted rev
 - The other-game veto is a list of known game / league names; an unknown game with no label at all in the payload, played by same-named teams at the same time, would still rely on the competition score alone.
 - A market name with a line only in the market name ("Handicap map (-1,5)" with "1" / "2" selections) is read as the first team's handicap - unverified for Betclic.
 - Collection passes must not overlap; the row lock protects manual reviews, not two collectors racing each other.
+
+## Review round 1 - independent pass
+
+A second, independent reviewer re-checked the package after the first round-1 pass (which is recorded above and was committed). State found: 352 tests passing, ruff / mypy clean. Everything below was re-derived from the code and probed with adversarial inputs (about 130 hand-written market/selection names in both orientations, see the new tests).
+
+### Verified
+
+- Handicap orientation (selection line, market-name line, `1`/`2` selections, both swap directions) against `cs2bot.domain.markets` and the pricing engine's `_handicap` convention (`margin_team1 + line`); score flipping; team-specific markets under swap.
+- Settlement wording vs `BetclicSettings` (Addendum), `remap_required` handling (listed and unlisted events) and the API side that sets it (`api/routes/review.py`).
+- Collector: snapshot only on change, `last_seen_at` vs `last_odds_at`, stale observations ignored, unavailable snapshots, partial events, per-event savepoints; quotes: freshness on `last_odds_at`, live / kick-off / link-status filters; closing line = last available snapshot strictly before kick-off.
+- Linking scores, manual statuses preserved, other-e-sport veto, frozen AUTO links to finished matches.
+- Secrets: proxy credentials only via `get_secret_value()` into the launch / client options, never logged; raw payload file names are sanitised.
+
+### Issues found
+
+| # | Severity | Issue | Fixed |
+|---|---|---|---|
+| 1 | critical | A name naming two maps was read as the first one: `"Mapa 1 i Mapa 2 - Zwycięzca"` / `"Mapa 1 / Mapa 3 - Zwycięzca"` -> map 1 winner, `"Mapa 2 - Zwycięzca mapy 3"` -> map 2, and `"Liczba zabójstw - s1mple - mapa 1 i mapa 2"` (a two-map kills line of 38.5) -> a single-map line, which the model prices as an almost certain "under". `extract_map_number` now returns `None` when more than one distinct map number appears, and a rule that extracts maps fails (instead of falling back to the whole match) when the name has a numbered map it could not read. | yes |
+| 2 | major | The map number was read as the round: `"Mapa 1 runda 10"` -> pistol round 1 winner (a round-10 market), `"Mapa 2 runda pistoletowa"` -> round 13 (the "2" is the map). The pistol rule now excludes a map number directly followed by "runda" (config/betclic_markets.yaml). | yes |
+| 3 | major | The map number was read as the half: `"Mapa 2 połowa 1"` -> half 2, `"Mapa 2 połowa"` -> half 2. `extract_half` removes map references first. | yes |
+| 4 | major | A match-winner market listing a draw ("1 X 2") was mapped when the series format was unknown (`draw_possible=None`). In a BO1/BO3 that is a regulation-time market (team selections lose on overtime) and the engine falls back to inferred formats elsewhere, so the team side would be over-priced. Now mapped only for a known BO2 (`draw_possible=True`). | yes |
+| 5 | major | `teams_swapped` was chosen by `swapped > straight` with no margin: with a lowered dashboard threshold an event whose names fit both orientations almost equally (near-identical team names, truncated Betclic spellings) could be linked AUTO with a guessed team order, putting every bet on the other team. AUTO now also needs `orientation_margin >= 0.10` (`LinkCandidate.orientation_margin`, `LinkConfig.min_orientation_margin`). | yes |
+| 6 | minor | Browser source: the page-capture binding accepted bodies of any size from any script on the page (the limit was only enforced in the injected page script), so a third-party script could fill memory / the raw archive. The size limit is now enforced in Python too; non-string bodies are ignored. | yes |
+| 7 | minor | A handicap selection carrying two lines (`"NAVI (-1,5) (1,5)"`) used the first one; now unmapped. | yes |
+
+Tests added: 22 (ambiguous map / round / half names, two-line handicap selections, team names with digits, 1X2 with unknown format, orientation margin, capture-binding size limit). 374 passed, 2 skipped (PostgreSQL); ruff / format / mypy clean; tests/foundation and the API tests that drive `odds.remap_event` pass.
+
+### Remaining concerns
+
+- Unchanged from the first pass: nothing is verified against live Betclic.pl; tune config/betclic_markets.yaml with `cs2bot odds unmapped` on the owner's PC.
+- Top-fragger markets without a scope in their name are priced as whole-match markets (no `scope` requirement, unlike kill lines). Parser-built names carry the map group ("Mapa 1 - Najwięcej zabójstw"), so this only matters if Betclic shows an un-prefixed map-level top-fragger market; add `scope` to the rule's `requires` if the raw payloads show that.
+- Whole-match player kill lines ("... - mecz") are priced on the engine's "match" scope; whether Betclic voids them when not all maps are played (or counts only maps played) is unverified.
+- Rules fall through to later rules when a selection cannot be parsed. The guards above close the known paths, but a new YAML rule should be tested with `MarketMapper.mapping_rule` against real names before it is relied on.

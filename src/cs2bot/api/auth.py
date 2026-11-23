@@ -17,7 +17,7 @@ from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass
 
-from itsdangerous import BadSignature, URLSafeTimedSerializer
+from itsdangerous import BadData, URLSafeTimedSerializer
 from pydantic import SecretStr
 
 _SALT = "cs2bot.api.session"
@@ -85,7 +85,7 @@ class SessionAuth:
             return None
         try:
             data = self._serializer.loads(token, max_age=self.max_age_s)
-        except BadSignature:  # includes SignatureExpired
+        except BadData:  # BadSignature, SignatureExpired, BadPayload ...
             return None
         if not isinstance(data, dict):
             return None

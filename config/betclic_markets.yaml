@@ -181,8 +181,11 @@ rules:
       - '\brund[ay] (?:nr\.? ?)?(?P<round>1|13)(?![\d.,]|\s*-\s*\d)'      # "Mapa 1 - Runda 13 - zwycięzca"
       - '\bround (?P<round>1|13)(?![\d.,]|\s*-\s*\d)'
     # "obie rundy pistoletowe" / "both pistol rounds" (win BOTH) is a different market
+    # "Mapa 1 runda 10" / "Mapa 2 runda pistoletowa": the digit right before "runda" is the MAP
+    # number, not the round (it would be read as round 1 / the 2nd pistol = round 13)
     exclude: [*half, 'handicap', 'liczba', 'suma', 'zabojstw', '\bkills?\b', 'pierwsz\w* do \d',
-              '\bob(?:u|ie|ydwie|ydwu|a)\b', '\bboth\b', '\bkazd', '\beach\b', '\bany\b', 'ktorakolwiek']
+              '\bob(?:u|ie|ydwie|ydwu|a)\b', '\bboth\b', '\bkazd', '\beach\b', '\bany\b', 'ktorakolwiek',
+              '\bmap[a-z]*\s*(?:nr\.?\s*)?\d+\s*\.?\s*rund']
     extract: [map]
     defaults: {round: 1}
     allowed: {round: [1, 13]}

@@ -253,6 +253,9 @@ function renderSlip(items) {
       slip.appendChild(
         h("div", { id: "oddsChange", class: "betslip_oddsChange" },
           "Kurs uległ zmianie: ",
+          // dialog_old_odds: the dialog shows "old -> new", both as .oddValue, the old price first
+          ui.oddsDialog.old_odds ? h("span", { class: "oddValue is-old", text: ui.oddsDialog.old_odds }) : null,
+          ui.oddsDialog.old_odds ? " → " : null,
           h("span", { class: "oddValue", text: ui.oddsDialog.dialog_odds || ui.oddsDialog.new_odds }),
           h("button", { class: "btn", text: "Akceptuj zmiany", onclick: acceptOdds }),
           h("button", { class: "btn", text: "Anuluj", onclick: declineOdds }),
@@ -344,7 +347,7 @@ function applyPlaceResponse(r) {
     ui.data.balance_text = r.balance_text;
     renderHeader();
   } else if (r.result === "odds_changed") {
-    ui.oddsDialog = { new_odds: r.new_odds, dialog_odds: r.dialog_odds };
+    ui.oddsDialog = { new_odds: r.new_odds, dialog_odds: r.dialog_odds, old_odds: r.dialog_old_odds };
     if (r.message) ui.errorText = r.message;  // inline notice that lingers until the next answer
   } else if (r.result === "error") {
     ui.errorText = r.message;

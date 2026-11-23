@@ -44,6 +44,8 @@ number the decision engine compares with `min_probability`, and the one used for
 the paper result on the row instead of changing the status. Read **`result`** (`"won"` / `"lost"` /
 `"void"` / `null` = not settled) and `is_open` rather than `status` to show how a bet ended; every
 statistic of the API (bankroll, P&L, hit rate, calibration, per-market performance) already does.
+A row flagged `dry_run: true` whose simulated placement never ran (still `pending` / `placing`)
+can also be settled as a paper bet; its `result` is filled in the same way.
 
 ---
 

@@ -529,3 +529,24 @@ def test_source_config_ignores_values_of_the_wrong_type(caplog: pytest.LogCaptur
     assert cfg.api_page_size == default.api_page_size and cfg.cs2_pattern == default.cs2_pattern
     for key in ("max_events_per_run", "max_page_delay_s", "fetch_categories", "consent_selectors"):
         assert key in caplog.text
+
+
+def test_page_capture_binding_enforces_the_size_limit(settings: Settings) -> None:
+    """Review round 1: any page script can call the capture binding - oversized bodies are dropped."""
+    import base64
+
+    from cs2bot.odds.browser import BetclicBrowserSource, _CrawlRun
+    from cs2bot.odds.sources import RawPayloadStore
+
+    config = BetclicSourceConfig.from_mapping({"max_payload_bytes": 64})
+    source = BetclicBrowserSource(settings, config=config, store=RawPayloadStore(None))
+    run = _CrawlRun(source)
+    small = base64.b64encode(b'{"a": 1}').decode()
+    run.on_capture(None, {"url": "https://x.test/a", "body": small, "contentType": "application/json"})
+    assert len(run.captured) == 1
+    big = base64.b64encode(b"x" * 1000).decode()
+    run.on_capture(None, {"url": "https://x.test/b", "body": big, "contentType": "application/json"})
+    run.on_capture(None, {"url": "https://x.test/c", "body": small, "request": big})
+    run.on_capture(None, {"url": "https://x.test/d", "body": 12345})  # not a string: ignored
+    run.on_capture(None, "garbage")  # never raises
+    assert len(run.captured) == 1

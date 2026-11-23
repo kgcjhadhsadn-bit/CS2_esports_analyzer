@@ -53,21 +53,29 @@ _OUTCOME_STATUS: dict[str, BetStatus] = {
 }
 
 
+# statuses a paper bet (``dry_run`` flag set) can keep while ``settle_bet`` records its result
+_PAPER_OPEN_STATUSES = frozenset({BetStatus.PENDING, BetStatus.PLACING, BetStatus.PLACED, BetStatus.DRY_RUN})
+
+
 def effective_status(
     status: BetStatus,
     *,
     extra: object = None,
     pnl: Decimal | None = None,
     settled_at: datetime | None = None,
+    dry_run: bool = False,
 ) -> BetStatus:
     """The status a bet counts as in statistics: won / lost / void for a *settled paper bet*.
 
-    Real bets are returned unchanged. A paper bet keeps ``status = dry_run`` after settlement (see
-    the module doc); its result is read from ``extra["settled_outcome"]`` and, for rows without
-    that key, inferred from ``settled_at`` + the sign of ``pnl``. An unsettled paper bet stays
-    ``dry_run`` (= open).
+    Real bets are returned unchanged. A paper bet keeps its status after settlement (see the module
+    doc): normally ``dry_run``, but ``engine.ledger.settle_bet`` settles every row its ``is_dry_run``
+    accepts (``dry_run`` flag OR status), so a flagged row whose simulated placement never ran keeps
+    ``pending`` / ``placing``. Its result is read from ``extra["settled_outcome"]`` and, for rows
+    without that key, inferred from ``settled_at`` + the sign of ``pnl``. An unsettled paper bet
+    keeps its status (= open).
     """
-    if status is not BetStatus.DRY_RUN:
+    paper = status is BetStatus.DRY_RUN or (dry_run and status in _PAPER_OPEN_STATUSES)
+    if not paper:
         return status
     outcome = extra.get(SETTLED_OUTCOME_KEY) if isinstance(extra, Mapping) else None
     if outcome is not None:
@@ -78,7 +86,7 @@ def effective_status(
         if pnl > 0:
             return BetStatus.WON
         return BetStatus.LOST if pnl < 0 else BetStatus.VOID
-    return BetStatus.DRY_RUN
+    return status
 
 
 def bet_result(status: BetStatus) -> Literal["won", "lost", "void"] | None:

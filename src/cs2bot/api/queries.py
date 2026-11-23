@@ -505,7 +505,11 @@ def decision_brief(row: BetDecisionRow) -> DecisionBrief:
 def bet_effective_status(bet: Bet) -> BetStatus:
     """won / lost / void also for a settled paper bet (see :func:`cs2bot.api.analytics.effective_status`)."""
     return effective_status(
-        bet.status, extra=bet.extra, pnl=to_decimal(bet.pnl), settled_at=utc(bet.settled_at)
+        bet.status,
+        extra=bet.extra,
+        pnl=to_decimal(bet.pnl),
+        settled_at=utc(bet.settled_at),
+        dry_run=bool(bet.dry_run),
     )
 
 

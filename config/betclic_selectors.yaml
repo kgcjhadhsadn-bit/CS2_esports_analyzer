@@ -423,11 +423,15 @@ elements:
       - {css: "[data-qa='betslip-clear'], .betslip_clear"}
       - {text: "Wyczyść"}
   slip_clear_confirm:
-    description: Confirmation button if clearing the slip asks "are you sure?".
+    description: >-
+      Confirmation button if clearing the slip asks "are you sure?". Must never match the final
+      "Postaw zakład" / "Potwierdź zakład" button (a bet slip shown as a dialog would contain it): the
+      text may not contain "postaw" nor start with "Potwierdź zakład", and the code also refuses to click
+      any element whose text contains "postaw" or that is (or contains) a slip_place_button match.
     verified: false
     optional: true
     locators:
-      - {css: "[role='dialog'] button, [role='alertdialog'] button", has_text: "/^(tak|usuń|potwierdź|wyczyść)/i"}
+      - {css: "[role='dialog'] button, [role='alertdialog'] button", has_text: "/^\\s*(tak|usuń|potwierdź(?!\\s+zak)|wyczyść)(?![\\s\\S]*postaw)/i"}
   slip_count_badge:
     description: Selection counter of the bet slip (must read 1 before placing, when present).
     verified: false

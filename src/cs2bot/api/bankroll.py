@@ -94,10 +94,18 @@ def load_bet_facts(session: Session, *, dry_run: bool | None) -> list[BetFact]:
     for bet, ev, p_win in session.execute(stmt):
         pnl = to_decimal(bet.pnl)
         settled_at = utc(bet.settled_at)
-        status = effective_status(bet.status, extra=bet.extra, pnl=pnl, settled_at=settled_at)
+        status = effective_status(
+            bet.status, extra=bet.extra, pnl=pnl, settled_at=settled_at, dry_run=bool(bet.dry_run)
+        )
         placed_at, created_at = utc(bet.placed_at), utc(bet.created_at)
+        stake = to_decimal(bet.stake) or ZERO
         if settled_at is None and status in SETTLED_STATUSES:
             settled_at = utc(bet.updated_at) or placed_at or created_at
+        if pnl is None and status is BetStatus.WON:
+            # like the engine's loss-limit code: a won bet without pnl is worth payout - stake
+            payout = to_decimal(bet.payout)
+            if payout is not None:
+                pnl = payout - stake
         out.append(
             BetFact(
                 id=bet.id,
@@ -105,7 +113,7 @@ def load_bet_facts(session: Session, *, dry_run: bool | None) -> list[BetFact]:
                 market_type=market_type_of(bet.spec_key),
                 status=status,
                 dry_run=bool(bet.dry_run) or bet.status is BetStatus.DRY_RUN,
-                stake=to_decimal(bet.stake) or ZERO,
+                stake=stake,
                 pnl=pnl,
                 odds=to_decimal(bet.placed_odds) or to_decimal(bet.requested_odds),
                 clv=bet.clv,

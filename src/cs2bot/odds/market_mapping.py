@@ -45,9 +45,10 @@ section of the YAML):
   (``"Remis"``, ``"X"``), the market is a regulation-time / European-handicap variant and stays
   unmapped; a head-to-head kills market listing a draw is mapped only when ``h2h_tie_rule`` is
   ``"lose"`` (with ``"push"`` the pricing engine would treat a tie as a refund); a match-winner
-  market listing a draw is mapped only when the series can end level (``draw_possible``: the
-  collector passes ``False`` unless the linked match is a BO2 - in a BO1/BO3/BO5 a "1 X 2" market
-  is a regulation-time market, where the team selections lose on an overtime); an over/under
+  market listing a draw is mapped only when the series is known to be able to end level
+  (``draw_possible is True``: the linked match is a BO2 - in a BO1/BO3/BO5 a "1 X 2" market is a
+  regulation-time market, where the team selections lose on an overtime; with an unknown format
+  it stays unmapped too, review round 1); an over/under
   market that also lists an "exactly N" outcome (``"Dokładnie 21"``) is three-way too (the
   two-way spec would price a result on the line as a refund);
 * **selection residue** - an over/under, yes/no or odd/even selection carrying anything else (a
@@ -198,6 +199,10 @@ _UNIT_WORDS_RE = re.compile(
 )
 # a third outcome next to over/under: "Dokładnie 21", "Exactly 21", "Równo 21"
 _EXACT_OUTCOME_RE = re.compile(r"(?<![a-z0-9])(?:dokladnie|exactly|rowno|equal(?:s| to)?)(?![a-z0-9])")
+# a numbered map reference ("mapa 1", "1. mapa", "mapy 1-2") - not a bare "map" word
+_MAP_NUM_REF_RE = re.compile(
+    r"\bmap[a-z]*\s*(?:nr\.?\s*|#\s*)?\d(?![\d]|[.,]\d)|(?<![\d.,])\d\s*\.?\s*map[a-z]*\b"
+)
 _MAP_REF_ANY_RE = re.compile(r"\bmap[a-z]*\s*(?:nr\.?\s*)?\d|(?<![\d.,])\d\s*\.?\s*map[a-z]*\b|\bmap[a-z]*$")
 _SEGMENT_SPLIT_RE = re.compile(r"\s+-\s+|:|\(|\)|\||/|,|;")
 # "Natus Vincere / Remis", "NAVI i Tak", "NAVI & Powyżej 2,5": combined outcomes, never a plain team
@@ -460,17 +465,19 @@ class _Raw:
 def extract_map_number(folded: str) -> int | None:
     """``"mapa 1"`` / ``"1. mapa"`` / ``"mapie 2"`` / ``"1st map"`` / ``"pierwsza mapa"`` -> 1-based map.
 
-    A name referring to several maps (``"mapy 1-2"``, ``"Mapa 1+2"``) is never a single map.
+    A name referring to several maps (``"mapy 1-2"``, ``"Mapa 1+2"``) is never a single map, and
+    neither is a name naming two different maps (``"Mapa 1 i Mapa 2 - Zwycięzca"``, ``"Mapa 2 -
+    Zwycięzca mapy 3"``): reading the first one would price a combined / contradictory market as a
+    plain single-map market (review round 1).
     """
     if _MAPS_SCOPE_RE.search(folded):
         return None
-    for regex in _MAP_NUM_RES:
-        m = regex.search(folded)
-        if m:
-            number = int(m.group(1))
-            return number if 1 <= number <= 7 else None
-    m = _MAP_ORDINAL_RE.search(folded)
-    return _ORDINALS[m.group(1)] if m else None
+    numbers = {int(m.group(1)) for regex in _MAP_NUM_RES for m in regex.finditer(folded)}
+    numbers.update(_ORDINALS[m.group(1)] for m in _MAP_ORDINAL_RE.finditer(folded))
+    if len(numbers) != 1:
+        return None
+    number = numbers.pop()
+    return number if 1 <= number <= 7 else None
 
 
 def extract_maps_scope(folded: str) -> tuple[int, ...] | None:
@@ -494,6 +501,11 @@ def extract_maps_scope(folded: str) -> tuple[int, ...] | None:
 
 
 def extract_half(folded: str) -> int | None:
+    """``"1. połowa"`` / ``"druga połowa"`` / ``"1st half"`` -> 1 / 2.
+
+    Map references are removed first: in ``"Mapa 2 połowa 1"`` the ``2`` is the map, not the half.
+    """
+    folded = _MAP_NUM_RES[0].sub(" ", folded)
     for regex in _HALF_RES:
         m = regex.search(folded)
         if m:
@@ -636,8 +648,9 @@ class MarketMapper:
         ``bookmaker_events.teams_swapped``; ``sibling_selections`` (all selection names of the
         market) lets head-to-head markets find the opponent when the market name omits it and
         drives the three-way guards. ``draw_possible`` says whether the linked series can end
-        level (``True`` only for a BO2; ``None`` = unknown, no check): with ``False`` a
-        match-winner market that lists a draw stays unmapped (see the module docstring).
+        level (``True`` only for a BO2, ``False`` for other formats, ``None`` = unknown): unless
+        it is ``True`` a match-winner market that lists a draw stays unmapped (see the module
+        docstring); markets without a draw are not affected.
         """
         try:
             raw = self._match_raw(market_raw, selection_raw, event, sibling_selections, draw_possible)
@@ -764,6 +777,15 @@ class MarketMapper:
                 raw.maps_scope = scope
             elif "map" in rule.extract or "maps" in rule.extract:
                 raw.map_number = extract_map_number(fm)
+        if (
+            raw.map_number is None
+            and raw.maps_scope is None
+            and ("map" in rule.extract or "maps" in rule.extract)
+            and _MAP_NUM_REF_RE.search(fm)
+        ):
+            # the name refers to a numbered map but no single map / map range could be read
+            # ("Mapa 1 i Mapa 2", "Mapa 2 - ... mapy 3"): never fall back to the whole match
+            return None
         if raw.map_number is None and raw.maps_scope is None:
             raw.match_scope = bool(_MATCH_SCOPE_RE.search(fm))
         # ---- half / round / race-to
@@ -851,11 +873,12 @@ class MarketMapper:
         if (
             kind == "team_draw"
             and raw.market_type is MarketType.MATCH_WINNER
-            and draw_possible is False
+            and draw_possible is not True
             and (vocab.is_draw(fs) or self._has_draw_sibling(siblings))
         ):
             # "1 X 2" on a series that cannot end level (BO1 / BO3 / BO5): a regulation-time
-            # market - the team selections lose when the deciding map goes to overtime
+            # market - the team selections lose when the deciding map goes to overtime. With an
+            # unknown format (None) we cannot tell a BO2 from a regulation-time market either.
             return False
         if kind in ("team", "team_draw"):
             if kind == "team_draw" and vocab.is_draw(fs):
@@ -982,6 +1005,8 @@ class MarketMapper:
         m = _PAREN_NUM_RE.search(fs) or _SIGNED_NUM_RE.search(fs)
         handicap = parse_decimal(m.group(1)) if m else None
         text = f"{fs[: m.start()]} {fs[m.end() :]}" if m else fs
+        if m and (_PAREN_NUM_RE.search(text) or _SIGNED_NUM_RE.search(text)):
+            return False  # two lines in one selection ("NAVI (-1,5) (1,5)"): do not guess
         slot = self._team_slot(_clean_name(text), event)
         if slot is None:
             return False

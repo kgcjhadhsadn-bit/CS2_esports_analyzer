@@ -317,3 +317,31 @@ def test_manual_confirmation_overrides_the_other_game_veto(session, settings: Se
     )
     assert link_event(session, ev, settings=settings, now=NOW).status is LinkStatus.CONFIRMED
     assert ev.match_id == match.id
+
+
+def test_unclear_team_order_is_never_auto(session, settings: Settings) -> None:
+    """Review round 1: when both orientations fit (near-identical team names) the swap flag is a
+    guess, and a wrong guess puts every bet on the other team -> PENDING_REVIEW."""
+    # a lowered dashboard threshold makes the confidence alone sufficient
+    state.set_config_overrides(session, {"decision": {"min_event_link_confidence": 0.80}}, actor="test")
+    wolves = make_team(session, "Red Wolves")
+    wolfs = make_team(session, "Red Wolfs")
+    make_match(session, wolves, wolfs, T0)
+    ev = make_event(session, "Red Wolv", "Red Wol", external_id="2001")
+    result = link_event(session, ev, settings=settings, now=NOW)
+    best = result.candidates[0]
+    assert best.confidence >= 0.80 and best.orientation_margin < 0.10
+    assert result.status is LinkStatus.PENDING_REVIEW
+    assert "team order unclear" in result.reason
+    # exact names on both sides: the order is clear even for near-identical teams
+    ev2 = make_event(session, "Red Wolfs", "Red Wolves", external_id="2003")
+    result2 = link_event(session, ev2, settings=settings, now=NOW)
+    assert result2.status is LinkStatus.AUTO and result2.teams_swapped is True
+
+
+def test_clear_team_order_reports_its_margin(session, settings: Settings, teams) -> None:
+    make_match(session, teams["spirit"], teams["spirit_ac"], T0)
+    ev = make_event(session, "Spirit Academy", "Team Spirit", external_id="2002")
+    result = link_event(session, ev, settings=settings, now=NOW)
+    assert result.status is LinkStatus.AUTO and result.teams_swapped is True
+    assert result.candidates[0].orientation_margin >= 0.10

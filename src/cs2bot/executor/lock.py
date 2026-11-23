@@ -18,6 +18,7 @@ import os
 import socket
 import sys
 import threading
+import time
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -188,7 +189,8 @@ class ProfileLock:
         if self._held:  # lost: forget the old lock (release() never deletes a file that is not ours)
             self.release()
         self.profile_dir.mkdir(parents=True, exist_ok=True)
-        for _ in range(3):
+        attempts = 3
+        for attempt in range(attempts):
             now = self._clock()
             info = LockInfo(os.getpid(), self._host, self._token, now, now)
             try:
@@ -199,6 +201,16 @@ class ProfileLock:
                     self._break_stale(holder)
                     continue
                 raise ProfileLockedError(self.path, holder) from None
+            except PermissionError:
+                # Windows: a lock file that its holder is deleting right now ("delete pending") cannot
+                # be created again for a moment. Retry briefly; a persistent error on an existing file
+                # means it is in use, on a missing one that the directory is not writable (re-raised).
+                if attempt + 1 < attempts:
+                    time.sleep(0.1)
+                    continue
+                if self.path.exists():
+                    raise ProfileLockedError(self.path, self.read_info()) from None
+                raise
             with os.fdopen(fd, "w", encoding="utf-8") as fh:
                 fh.write(info.to_json())
                 fh.flush()
@@ -272,7 +284,7 @@ class ProfileLock:
             return (self._clock() - holder.heartbeat_at).total_seconds()
         try:
             mtime = self.path.stat().st_mtime
-        except FileNotFoundError:
+        except OSError:  # vanished meanwhile (or, on Windows, being deleted): judged again on the retry
             return None
         return self._clock().timestamp() - datetime.fromtimestamp(mtime, tz=UTC).timestamp()
 

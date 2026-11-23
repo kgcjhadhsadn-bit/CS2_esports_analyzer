@@ -16,8 +16,9 @@ Candidates are matches with status scheduled/live whose ``scheduled_at`` lies wi
 
 ``confidence = 0.70 team + 0.20 time + 0.10 competition``. The best candidate is linked
 ``AUTO`` when ``confidence >= decision.min_event_link_confidence`` (dashboard overrides apply) and
-it beats the runner-up by ``min_margin``; otherwise ``PENDING_REVIEW`` (never bet on). In-scope
-matches win ties. Rows set to ``CONFIRMED`` / ``REJECTED`` from the dashboard are never changed.
+it beats the runner-up by ``min_margin`` and its team order is clear (the chosen orientation's team
+score beats the swapped one by ``min_orientation_margin``); otherwise ``PENDING_REVIEW`` (never bet
+on). In-scope matches win ties. Rows set to ``CONFIRMED`` / ``REJECTED`` from the dashboard are never changed.
 Betclic team names are stored as ``TeamAlias(source=BETCLIC)`` for AUTO/CONFIRMED links.
 
 Two safety rules on top of the scoring:
@@ -85,6 +86,9 @@ class LinkConfig:
     time_weight: float = 0.20
     competition_weight: float = 0.10
     min_margin: float = 0.05
+    # AUTO also needs the chosen orientation to beat the other one by this much (team score):
+    # a wrong ``teams_swapped`` would put every bet on the other team (review round 1)
+    min_orientation_margin: float = 0.10
     missing_start_time_score: float = 0.4
     unknown_competition_score: float = 0.5
     in_scope_tiebreak: float = 0.005  # ranking only; never changes the stored confidence
@@ -99,6 +103,7 @@ class LinkCandidate(BaseModel):
     time_score: float
     competition_score: float
     in_scope: bool
+    orientation_margin: float = 1.0  # team score of the chosen orientation minus the other one
 
 
 class LinkResult(BaseModel):
@@ -188,6 +193,7 @@ def score_candidate(event: BookmakerEvent, match: Match, cfg: LinkConfig) -> Lin
         time_score=round(t_score, 4),
         competition_score=round(c_score, 4),
         in_scope=bool(match.in_scope),
+        orientation_margin=round(abs(straight - swapped), 4),
     )
 
 
@@ -350,7 +356,8 @@ def link_event(
         best = scored[0]
         runner_up = scored[1].confidence if len(scored) > 1 else 0.0
         margin = best.confidence - runner_up
-        auto = best.confidence >= threshold and margin >= cfg.min_margin
+        orientation_clear = best.orientation_margin >= cfg.min_orientation_margin
+        auto = best.confidence >= threshold and margin >= cfg.min_margin and orientation_clear
         event_row.match_id = best.match_id
         event_row.teams_swapped = best.teams_swapped
         event_row.link_confidence = best.confidence
@@ -359,6 +366,8 @@ def link_event(
             reason = f"confidence {best.confidence:.3f} >= {threshold:.2f}, margin {margin:.3f}"
         elif best.confidence < threshold:
             reason = f"confidence {best.confidence:.3f} below {threshold:.2f}"
+        elif not orientation_clear:
+            reason = f"team order unclear (orientation margin {best.orientation_margin:.3f})"
         else:
             reason = f"ambiguous: runner-up within {margin:.3f}"
     session.flush()

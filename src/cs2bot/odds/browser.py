@@ -402,8 +402,17 @@ class _CrawlRun:
     def on_capture(self, source: Any, payload: Any) -> None:
         """Binding called by the page script with ``{url, body, contentType, request}`` (base64)."""
         try:
-            data = base64.b64decode(payload.get("body") or "")
-            request = base64.b64decode(payload.get("request") or "") or None
+            # Any script on the page (third-party ones included) can call the binding: enforce the
+            # size limit here too, not only in the page script, so it cannot fill memory / disk.
+            body_b64 = payload.get("body") or ""
+            request_b64 = payload.get("request") or ""
+            limit_b64 = (self.cfg.max_payload_bytes * 4) // 3 + 4
+            if not isinstance(body_b64, str) or not isinstance(request_b64, str):
+                return
+            if len(body_b64) > limit_b64 or len(request_b64) > limit_b64:
+                return
+            data = base64.b64decode(body_b64)
+            request = base64.b64decode(request_b64) or None
             ctype = payload.get("contentType") or None
             kind = classify_body(data, ctype) or "grpc"
             page_url = getattr(getattr(source, "page", None), "url", None)

@@ -50,7 +50,7 @@ CASES: list[tuple[str, str, bool, str | None]] = [
     ("Zwycięzca meczu", "Natus Vincere", True, "match_winner#team2"),
     ("Wynik meczu", "1", False, "match_winner#team1"),
     ("Wynik meczu", "2", True, "match_winner#team1"),
-    ("Kto wygra mecz?", "Remis", False, "match_winner#draw"),
+    ("Kto wygra mecz?", "Remis", False, None),  # a draw needs a known BO2 (draw_possible=True)
     ("Match winner", "FaZe Clan", False, "match_winner#team2"),
     ("Zwycięzca meczu", "NAVI", False, "match_winner#team1"),
     # --- map winner -------------------------------------------------------------------------
@@ -323,7 +323,8 @@ def test_match_winner_with_a_draw_needs_a_series_that_can_end_level(mapper: Mark
     three = ["Natus Vincere", "Remis", "FaZe Clan"]
     for selection, key in (("Natus Vincere", "team1"), ("Remis", "draw"), ("FaZe Clan", "team2")):
         expected = f"match_winner#{key}"
-        assert _key_with(mapper, "Zwycięzca meczu", selection, sibling_selections=three) == expected
+        # unknown format: a BO2 cannot be told from a regulation-time market -> unmapped
+        assert _key_with(mapper, "Zwycięzca meczu", selection, sibling_selections=three) is None
         assert (
             _key_with(mapper, "Zwycięzca meczu", selection, sibling_selections=three, draw_possible=True)
             == expected
@@ -614,3 +615,56 @@ def test_list_unmapped(session) -> None:
     assert list_unmapped(session) == [("Pierwsza krew", 2), ("Asy", 1)]
     assert list_unmapped(session, limit=1) == [("Pierwsza krew", 2)]
     assert list_unmapped_selections(session) == [("Zwycięzca meczu", "Ktoś inny", 1)]
+
+
+@pytest.mark.parametrize(
+    ("market", "selection"),
+    [
+        # two different maps named: a combined / contradictory market, never "map 1"
+        ("Mapa 1 i Mapa 2 - Zwycięzca", "Natus Vincere"),
+        ("Mapa 1 / Mapa 3 - Zwycięzca", "Natus Vincere"),
+        ("Mapa 1 oraz mapa 2 - zwycięzca", "Natus Vincere"),
+        ("Mapa 2 - Zwycięzca mapy 3", "Natus Vincere"),
+        ("Liczba zabójstw - s1mple - mapa 1 i mapa 2", "Powyżej 38,5"),
+        ("Najwięcej zabójstw - mapa 1 i mapa 2", "s1mple"),
+        # the digit before "runda" is the MAP number, not the round
+        ("Mapa 1 runda 10", "Natus Vincere"),
+        ("Mapa 2 runda pistoletowa", "Natus Vincere"),
+        # the digit after "Mapa" is not the half
+        ("Mapa 2 połowa", "Natus Vincere"),
+        # two lines in one handicap selection
+        ("Handicap map", "Natus Vincere (-1,5) (1,5)"),
+    ],
+)
+def test_review1_ambiguous_names_stay_unmapped(mapper: MarketMapper, market: str, selection: str) -> None:
+    assert _key(mapper, market, selection, False) is None
+    assert _key(mapper, market, selection, True) is None
+
+
+@pytest.mark.parametrize(
+    ("market", "selection", "expected"),
+    [
+        ("Mapa 2 połowa 1", "Natus Vincere", None),  # was read as half 2
+        ("Mapa 2 - 1. połowa", "Natus Vincere", "half_winner|map=2|half=1#team1"),
+        ("1. połowa - mapa 2", "FaZe Clan", "half_winner|map=2|half=1#team2"),
+        ("Mapa 1 - 2. połowa", "FaZe Clan", "half_winner|map=1|half=2#team2"),
+        ("Mapa 1 - Liczba rund - mapa 1", "Powyżej 26,5", "total_rounds|map=1|line=26.5#over"),
+        ("Mapa 2 - Runda 13", "FaZe Clan", "pistol_round_winner|map=2|round=13#team2"),
+        ("Mapa 2 - runda pistoletowa", "FaZe Clan", "pistol_round_winner|map=2|round=1#team2"),
+        ("100 Thieves vs FaZe - Handicap map", "100 Thieves (-1,5)", None),  # not an event team
+    ],
+)
+def test_review1_map_and_half_numbers(
+    mapper: MarketMapper, market: str, selection: str, expected: str | None
+) -> None:
+    assert _key(mapper, market, selection, False) == expected
+
+
+def test_review1_team_names_with_digits_keep_their_handicap(mapper: MarketMapper) -> None:
+    event = CollectedEvent(
+        external_id="9", name="100 Thieves - 9INE", team1_raw="100 Thieves", team2_raw="9INE"
+    )
+    mapped = mapper.map("Handicap map", "100 Thieves (-1,5)", event=event, swapped=False)
+    assert mapped is not None and mapped.spec.line == -1.5 and mapped.selection_key == "team1"
+    mapped = mapper.map("Handicap map", "9INE +1,5", event=event, swapped=True)
+    assert mapped is not None and mapped.spec.line == 1.5 and mapped.selection_key == "team1"

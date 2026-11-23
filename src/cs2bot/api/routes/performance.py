@@ -13,7 +13,7 @@ from datetime import datetime
 from typing import Annotated, Any, Literal
 
 from fastapi import APIRouter, Depends, Query
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.orm import Session
 
 from cs2bot.api.analytics import (
@@ -166,13 +166,15 @@ def bet_samples(
             Bet.settled_at,
             Bet.pnl,
             Bet.extra,
+            Bet.dry_run,
             BetDecisionRow.p_win,
             Prediction.p_push,
             Prediction.p_void,
         )
         .join(BetDecisionRow, Bet.decision_id == BetDecisionRow.id)
         .outerjoin(Prediction, BetDecisionRow.prediction_id == Prediction.id)
-        .where(Bet.status.in_([BetStatus.WON, BetStatus.LOST, BetStatus.DRY_RUN]))
+        # real results, or any paper bet (its result may sit in extra, whatever its status)
+        .where(or_(Bet.status.in_([BetStatus.WON, BetStatus.LOST]), paper_clause()))
     )
     dry = _dry_run_filter(mode)
     if dry is not None:
@@ -182,9 +184,11 @@ def bet_samples(
     if upper is not None:
         stmt = stmt.where(Bet.settled_at <= upper)
     out: list[tuple[float, int, datetime | None]] = []
-    for status, settled, pnl, extra, p_win, p_push, p_void in session.execute(stmt):
+    for status, settled, pnl, extra, dry, p_win, p_push, p_void in session.execute(stmt):
         settled_at = utc(settled)
-        result = effective_status(status, extra=extra, pnl=to_decimal(pnl), settled_at=settled_at)
+        result = effective_status(
+            status, extra=extra, pnl=to_decimal(pnl), settled_at=settled_at, dry_run=bool(dry)
+        )
         if result not in (BetStatus.WON, BetStatus.LOST) or p_win is None:
             continue
         p = p_win_given_settled(float(p_win), p_push=float(p_push or 0.0), p_void=float(p_void or 0.0))

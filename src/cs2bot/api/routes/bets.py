@@ -72,7 +72,7 @@ def list_bets(
     (``status=dry_run`` returns every row stored as a dry run).
     """
     when = func.coalesce(Bet.placed_at, Bet.created_at)
-    stmt = select(Bet.id, Bet.status, Bet.stake, Bet.pnl, Bet.settled_at, Bet.extra)
+    stmt = select(Bet.id, Bet.status, Bet.stake, Bet.pnl, Bet.settled_at, Bet.extra, Bet.dry_run)
     statuses = set(parse_enum_list(status, BetStatus, "status"))
     if dry_run is not None:
         stmt = stmt.where(paper_clause() if dry_run else ~paper_clause())
@@ -85,11 +85,14 @@ def list_bets(
         stmt = stmt.where(Bet.match_id == match_id)
 
     # The status filter needs the effective status (a JSON field), so it is applied here rather
-    # than in SQL; only six small columns per bet are loaded for it and for the summary.
+    # than in SQL; only seven small columns per bet are loaded for it and for the summary.
     counted: list[tuple[int, BetStatus, Decimal, Decimal | None]] = []
-    for bet_id, raw, stake, pnl, settled_at, extra in db.execute(stmt.order_by(when.desc(), Bet.id.desc())):
+    rows = db.execute(stmt.order_by(when.desc(), Bet.id.desc()))
+    for bet_id, raw, stake, pnl, settled_at, extra, dry in rows:
         pnl_dec = to_decimal(pnl)
-        effective = effective_status(raw, extra=extra, pnl=pnl_dec, settled_at=utc(settled_at))
+        effective = effective_status(
+            raw, extra=extra, pnl=pnl_dec, settled_at=utc(settled_at), dry_run=bool(dry)
+        )
         if statuses and raw not in statuses and effective not in statuses:
             continue
         counted.append((int(bet_id), effective, to_decimal(stake) or ZERO, pnl_dec))
