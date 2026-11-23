@@ -117,6 +117,16 @@ function Update-SessionPath {
     $env:Path = ($parts.ToArray() -join ';')
 }
 
+function Resolve-NativeCommand {
+    # Full path of a program on PATH ("docker" -> "C:\Program Files\Docker\...\docker.exe").
+    # Start-Process and .NET process APIs are given full paths so they never pick a wrong program.
+    param([Parameter(Mandatory = $true)][string]$Name)
+    if (Test-Path -LiteralPath $Name -PathType Leaf) { return (Resolve-Path -LiteralPath $Name).Path }
+    $command = Get-Command -Name $Name -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($null -eq $command) { throw "'$Name' was not found on PATH." }
+    return $command.Source
+}
+
 function Invoke-Checked {
     # Runs a native program with its output shown, and stops the script if it fails.
     #   Invoke-Checked 'uv sync' 'uv' @('sync', '--frozen')
@@ -175,8 +185,11 @@ function Invoke-ProcessToFile {
         [Parameter(Mandatory = $true)][string]$ErrorFile,
         [string]$InputFile = ''
     )
+    foreach ($argument in $Arguments) {
+        if ($argument -match '\s') { throw "Invoke-ProcessToFile: argument '$argument' contains a space." }
+    }
     $startArgs = @{
-        FilePath               = $FilePath
+        FilePath               = (Resolve-NativeCommand -Name $FilePath)
         ArgumentList           = $Arguments
         RedirectStandardOutput = $OutputFile
         RedirectStandardError  = $ErrorFile
@@ -322,8 +335,9 @@ function Start-DockerDesktop {
 }
 
 function Test-PostgresContainerRunning {
-    $id = Get-NativeOutput 'docker' @('ps', '--quiet', '--filter', "name=^$($script:PostgresContainer)$", '--filter', 'status=running')
-    return (-not [string]::IsNullOrWhiteSpace($id))
+    # "docker inspect" by exact name (a "docker ps --filter name=" filter is a regular expression).
+    $running = Get-NativeOutput 'docker' @('inspect', '--format', '{{.State.Running}}', $script:PostgresContainer)
+    return ($running -eq 'true')
 }
 
 function Get-PostgresHealth {
@@ -434,4 +448,82 @@ function Build-Dashboard {
         Pop-Location
     }
     Write-Ok 'Dashboard built (dashboard\dist).'
+}
+
+# ---------------------------------------------------------------------------------------------
+# Task Scheduler and windows
+# ---------------------------------------------------------------------------------------------
+
+function Get-CurrentUserId {
+    # DOMAIN\user (or PC-NAME\user) of the person running this script.
+    return [Security.Principal.WindowsIdentity]::GetCurrent().Name
+}
+
+function Get-WindowsPowerShellPath {
+    # Windows PowerShell 5.1 is on every Windows 10 / 11 PC; the scheduled tasks always use it.
+    return (Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe')
+}
+
+function New-ScriptTaskAction {
+    # A Task Scheduler action that runs one of these scripts.
+    #
+    # Hidden: the script runs inside an explicitly started classic console host (conhost.exe) with
+    # -WindowStyle Hidden. On Windows 11 with "Windows Terminal" as the default terminal,
+    # powershell.exe -WindowStyle Hidden alone leaves a terminal window open for as long as the bot
+    # runs (microsoft/terminal issue 12464); starting conhost.exe ourselves avoids the hand-over to
+    # Windows Terminal, so the window only flashes for a moment at logon. The console still exists
+    # (invisibly), which stop.ps1 needs to send Ctrl+C to the bot.
+    param(
+        [Parameter(Mandatory = $true)][string]$ScriptName,
+        [string]$ScriptArguments = '',
+        [switch]$Visible
+    )
+    $scriptPath = Join-Path $PSScriptRoot $ScriptName
+    $powershell = Get-WindowsPowerShellPath
+    $style = 'Hidden'
+    if ($Visible) { $style = 'Minimized' }
+    $psArguments = "-NoProfile -ExecutionPolicy Bypass -WindowStyle $style -File `"$scriptPath`""
+    if ($ScriptArguments -ne '') { $psArguments = "$psArguments $ScriptArguments" }
+    $conhost = Join-Path $env:SystemRoot 'System32\conhost.exe'
+    if (Test-Path -LiteralPath $conhost) {
+        return (New-ScheduledTaskAction -Execute $conhost -Argument "`"$powershell`" $psArguments" -WorkingDirectory $script:RepoRoot)
+    }
+    return (New-ScheduledTaskAction -Execute $powershell -Argument $psArguments -WorkingDirectory $script:RepoRoot)
+}
+
+function Register-UserTask {
+    # Registers (or replaces) a Task Scheduler task that runs as the current user, only while that
+    # user is signed in (needed: the bot shows a browser window on the desktop). Explains
+    # "Access is denied" instead of failing with a cryptic message.
+    param(
+        [Parameter(Mandatory = $true)][string]$TaskName,
+        [Parameter(Mandatory = $true)][string]$Description,
+        [Parameter(Mandatory = $true)]$Action,
+        [Parameter(Mandatory = $true)]$Trigger,
+        [Parameter(Mandatory = $true)]$Settings
+    )
+    $principal = New-ScheduledTaskPrincipal -UserId (Get-CurrentUserId) -LogonType Interactive -RunLevel Limited
+    try {
+        Register-ScheduledTask -TaskName $TaskName -TaskPath '\' -Description $Description -Action $Action `
+            -Trigger $Trigger -Principal $principal -Settings $Settings -Force | Out-Null
+    } catch {
+        $message = $_.Exception.Message
+        if ($message -match 'denied|0x80070005') {
+            throw ("Windows refused to create the scheduled task '$TaskName' (access denied). Open PowerShell with " +
+                '"Run as administrator" - signed in as the same Windows user that runs the bot - and run this script again.')
+        }
+        throw "Could not create the scheduled task '$TaskName': $message"
+    }
+}
+
+function Start-ScriptInNewWindow {
+    # Opens a new PowerShell window that runs one of these scripts (used to restart the bot).
+    param(
+        [Parameter(Mandatory = $true)][string]$ScriptName,
+        [string]$ScriptArguments = ''
+    )
+    $scriptPath = Join-Path $PSScriptRoot $ScriptName
+    $psArguments = "-NoProfile -ExecutionPolicy Bypass -File `"$scriptPath`""
+    if ($ScriptArguments -ne '') { $psArguments = "$psArguments $ScriptArguments" }
+    Start-Process -FilePath (Get-WindowsPowerShellPath) -ArgumentList $psArguments -WorkingDirectory $script:RepoRoot | Out-Null
 }
