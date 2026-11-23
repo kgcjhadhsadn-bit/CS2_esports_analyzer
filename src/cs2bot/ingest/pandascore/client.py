@@ -158,6 +158,7 @@ class PandaScoreClient:
         self._base_url = settings.base_url.rstrip("/")
         self._game = settings.videogame.strip("/")
         self.stats = ClientStats()
+        self._single_match_forbidden = False  # set after a 403 on /matches/{id} (see :meth:`match`)
 
     def __repr__(self) -> str:  # never show the token
         return f"PandaScoreClient(base_url={self._base_url!r}, has_token={self.has_token})"
@@ -376,11 +377,15 @@ class PandaScoreClient:
         videogame_title: str | None = None,
         max_pages: int | None = None,
         on_invalid: InvalidHandler | None = None,
+        now: datetime | None = None,
     ) -> Iterator[PSMatch]:
-        """Not-started matches, soonest first; limited to the next ``hours_ahead`` hours when given."""
+        """Not-started matches, soonest first; limited to the next ``hours_ahead`` hours when given.
+
+        ``now`` (default: the client's clock) anchors the ``hours_ahead`` window.
+        """
         params: dict[str, Any] = {"sort": "begin_at"}
         if hours_ahead is not None:
-            now = self._now()
+            now = now or self._now()
             # one hour of slack backwards: a match that is a few minutes late is still "not_started"
             lo = format_timestamp(now - timedelta(hours=1))
             hi = format_timestamp(now + timedelta(hours=hours_ahead))
@@ -441,8 +446,31 @@ class PandaScoreClient:
         return list(self.iter_past_matches(since, until, videogame_title=videogame_title))
 
     def match(self, match_id: int | str) -> PSMatch:
-        """One match with per-game ``rounds_score`` (no map names: see :meth:`games`)."""
-        return self._one(PSMatch, f"{self._game}/matches/{match_id}")
+        """One match with per-game ``rounds_score`` (no map names: see :meth:`games`).
+
+        ``/csgo/matches/{id}`` needs a historical / real-time plan. On HTTP 403 the match is read from
+        the list endpoint instead (``/csgo/matches?filter[id]=...``, available on every plan; numeric
+        ids only), so reconciling single matches keeps working on the entry plan.
+        """
+        path = f"{self._game}/matches/{match_id}"
+        numeric = str(match_id).isdigit()
+        if not (numeric and self._single_match_forbidden):
+            try:
+                return self._one(PSMatch, path)
+            except PandaScorePlanError:
+                if not numeric:
+                    raise
+                self._single_match_forbidden = True  # do not ask again: go straight to the list
+        raw = next(self.paginate(f"{self._game}/matches", {"filter[id]": str(match_id)}, max_pages=1), None)
+        if raw is None:
+            raise PandaScoreNotFoundError(f"GET /{path}: not found")
+        try:
+            return PSMatch.model_validate(raw)
+        except ValidationError as exc:
+            self.stats.invalid_items += 1
+            raise PandaScoreResponseError(
+                f"GET /{path}: malformed PSMatch ({exc.error_count()} validation errors)"
+            ) from exc
 
     def games(self, match_id: int | str) -> list[PSGame]:
         """Games (maps) of a match incl. map, round history and player lines, ordered by position.

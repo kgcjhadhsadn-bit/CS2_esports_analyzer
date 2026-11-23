@@ -26,6 +26,7 @@ from cs2bot.executor.base import (
 from cs2bot.executor.betclic import BetclicExecutor, LoginState
 from cs2bot.executor.factory import create_betclic_executor
 from cs2bot.executor.fake import FakeExecutor
+from cs2bot.executor.journal import JournalError, PlacementJournal
 from cs2bot.executor.lock import ProfileLock, ProfileLockedError
 from cs2bot.executor.safety import HumanPacer, db_halt_check, never_halted
 from cs2bot.executor.selectors import (
@@ -63,9 +64,11 @@ __all__ = [
     "FakeExecutor",
     "HaltCheck",
     "HumanPacer",
+    "JournalError",
     "LocatorSpec",
     "LoginRequiredError",
     "LoginState",
+    "PlacementJournal",
     "ProfileLock",
     "ProfileLockedError",
     "ResolvedElement",

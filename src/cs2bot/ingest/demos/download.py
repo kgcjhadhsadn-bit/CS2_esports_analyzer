@@ -22,7 +22,7 @@ from urllib.parse import unquote, urlsplit
 
 import httpx
 
-from cs2bot.ingest.demos.errors import DemoDownloadError
+from cs2bot.ingest.demos.errors import DemoDownloadBlockedError, DemoDownloadError
 from cs2bot.utils.http import DEFAULT_USER_AGENT
 from cs2bot.utils.logging import get_logger
 
@@ -35,6 +35,18 @@ MAX_ARCHIVE_BYTES = 6 * 1024**3
 _CHUNK_BYTES = 1 << 20
 _PART_SUFFIX = ".part"
 _SAFE_NAME_RE = re.compile(r"[^A-Za-z0-9._-]+")
+# Answers that mean "you are being rate-limited / challenged", not "this file does not exist".
+BLOCK_STATUSES: frozenset[int] = frozenset({403, 429, 503})
+_CHALLENGE_RE = re.compile(
+    r"<title>\s*(just a moment|attention required|access denied|please wait)"
+    r"|cf-chl-|challenge-platform/h/|cf_chl_opt|id=\"challenge-form\"|error code: 10\d\d",
+    re.IGNORECASE,
+)
+
+
+def looks_like_challenge(html: str) -> bool:
+    """True for Cloudflare-style interstitial / block pages (title and token markers only)."""
+    return bool(html) and _CHALLENGE_RE.search(html[:200_000]) is not None
 
 
 def safe_filename(name: str, *, default: str = "demo-archive") -> str:
@@ -82,7 +94,9 @@ def http_download(
     """Stream ``url`` into ``dest_dir`` (redirects followed, temp file + atomic rename).
 
     ``timeout_s`` is the budget for the *whole* transfer; individual socket operations time out
-    after 60 s. The partial file is always removed on failure.
+    after 60 s. The partial file is always removed on failure. HTTP 403 / 429 / 503 and challenge
+    pages raise :class:`DemoDownloadBlockedError` (the demo job then stops its batch without using up
+    an attempt); other failures raise :class:`DemoDownloadError`.
     """
     dest_dir.mkdir(parents=True, exist_ok=True)
     owns_client = client is None
@@ -95,10 +109,18 @@ def http_download(
     deadline = time.monotonic() + timeout_s
     try:
         with http.stream("GET", url, follow_redirects=True) as response:
+            if response.status_code in BLOCK_STATUSES:
+                raise DemoDownloadBlockedError(
+                    f"HTTP {response.status_code} for {url}: the source blocks plain HTTP downloads "
+                    "(pass a browser downloader, e.g. cs2bot.ingest.demos.BrowserDownloader)"
+                )
             if response.status_code >= 400:
                 raise DemoDownloadError(f"HTTP {response.status_code} for {url}")
             content_type = response.headers.get("content-type", "").lower()
             if "text/html" in content_type:
+                head = response.read()[:200_000].decode("utf-8", errors="replace")
+                if looks_like_challenge(head):
+                    raise DemoDownloadBlockedError(f"challenge page instead of a demo archive from {url}")
                 raise DemoDownloadError(f"got an HTML page instead of a demo archive from {url}")
             declared = response.headers.get("content-length")
             if declared and declared.isdigit() and int(declared) > max_bytes:

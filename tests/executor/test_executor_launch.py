@@ -361,17 +361,21 @@ def test_profile_in_use_by_another_process_fails_cleanly(settings: Settings) -> 
 
 def test_minimum_gap_between_bets(settings: Settings) -> None:
     slept: list[float] = []
+    halted = {"on": False}
     executor = BetclicExecutor(
         settings,
-        halt_check=lambda: (True, "paused"),
+        halt_check=lambda: (halted["on"], "paused"),
         playwright_factory=Factory(),
         tuning=ExecutorTuning(min_seconds_between_bets=30, lock_stale_after_s=60, lock_heartbeat_s=5),
         sleep=slept.append,
     )
-    executor.place(_order(idempotency_key="a"))
+    assert executor.place(_order(idempotency_key="a")).status is PlacementStatus.FAILED  # fake goto error
     assert slept == []
     executor.place(_order(idempotency_key="b"))
     assert len(slept) == 1 and 29 <= slept[0] <= 30
+    halted["on"] = True  # a halted bot answers at once: no pacing sleep for a bet it will not place
+    assert executor.place(_order(idempotency_key="c")).status is PlacementStatus.KILL_SWITCH
+    assert len(slept) == 1
     executor.close()
 
 

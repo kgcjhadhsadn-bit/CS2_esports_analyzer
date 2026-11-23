@@ -9,9 +9,15 @@ Only ``.dem`` members are extracted, always *flattened* into ``dest_dir`` under 
 so a hostile archive cannot write outside the destination (zip-slip) and cannot fill the disk past
 ``max_member_bytes`` per file.
 
-RAR needs an external tool (the format is proprietary): :func:`ensure_rar_backend` looks for
-``unrar`` / ``unar`` / ``bsdtar`` / ``7z`` on PATH (via the ``rarfile`` package) and additionally in
-the usual Windows install folders (7-Zip, WinRAR) and Windows' built-in ``tar.exe`` (libarchive).
+RAR needs an external tool (the format is proprietary). The member list is read with the pure-Python
+``rarfile`` package; the data is extracted by running a tool directly, trying every tool found until
+one succeeds, because no free tool reads every RAR variant: checked on this project's build machine,
+``bsdtar`` (libarchive 3.7) refuses solid RAR3 archives and ``unar`` 1.10 fails on solid RAR5 ones,
+while each handles the other. (``rarfile``'s own piping is not used: with the ``bsdtar`` backend
+rarfile 4.5 builds ``bsdtar -x --to-stdout -f -- <archive>``, which bsdtar reads as an archive named
+``--``.) :func:`find_rar_tools` looks for ``unrar`` / ``7z`` / ``7zz`` / ``unar`` / ``bsdtar`` on PATH,
+in the usual Windows install folders (7-Zip, WinRAR) and for Windows' built-in ``tar.exe``, which is
+bsdtar.
 """
 
 from __future__ import annotations
@@ -22,8 +28,10 @@ import os
 import re
 import shutil
 import subprocess
+import tempfile
 import zipfile
 from collections.abc import Callable, Iterable, Sequence
+from dataclasses import dataclass
 from pathlib import Path
 from typing import IO, Any, Literal
 
@@ -54,8 +62,9 @@ _DEMO_MAGICS = (b"PBDEMS2\x00", b"HL2DEMO\x00")
 
 _RAR_TOOL_HELP = (
     "No RAR extraction tool was found. HLTV demo archives are .rar files: install 7-Zip "
-    "(https://www.7-zip.org) or WinRAR/UnRAR on Windows (7z.exe / UnRAR.exe on PATH or in the default "
-    "'Program Files' folder), or 'unar' / 'bsdtar' (libarchive-tools) / 'unrar' on Linux and macOS."
+    "(https://www.7-zip.org) or WinRAR on Windows (7z.exe / UnRAR.exe on PATH or in the default "
+    "'Program Files' folder; Windows 10 and later also ship a usable tar.exe), or 'unrar' / '7zip' / "
+    "'unar' / 'libarchive-tools' (bsdtar) on Linux and macOS."
 )
 
 
@@ -96,58 +105,112 @@ def detect_archive_kind(path: Path) -> ArchiveKind:
 
 # ---------------------------------------------------------------------------------------- rar tools
 
+RarToolKind = Literal["unrar", "7z", "unar", "bsdtar"]
+RAR_TOOL_TIMEOUT_S = 1800.0
+
+
+@dataclass(frozen=True)
+class RarTool:
+    """An external program that can extract RAR archives."""
+
+    kind: RarToolKind
+    executable: str
+
+    def command(self, archive: Path, dest_dir: Path, members: Sequence[str] = ()) -> list[str]:
+        """Command line extracting ``members`` (everything when empty) of ``archive`` into ``dest_dir``."""
+        if self.kind == "unrar":
+            # -p-: never ask for a password, -o+: overwrite; the target needs a trailing separator
+            return [
+                self.executable,
+                "x",
+                "-inul",
+                "-y",
+                "-o+",
+                "-p-",
+                str(archive),
+                *members,
+                f"{dest_dir}{os.sep}",
+            ]
+        if self.kind == "7z":
+            return [self.executable, "x", "-y", "-bd", "-p", f"-o{dest_dir}", str(archive), *members]
+        if self.kind == "unar":
+            # -D: no extra containing directory, -f: overwrite
+            return [self.executable, "-q", "-f", "-D", "-o", str(dest_dir), str(archive), *members]
+        return [self.executable, "-x", "-f", str(archive), "-C", str(dest_dir), *members]
+
 
 def _is_bsdtar(executable: str) -> bool:
     try:
         out = subprocess.run(
-            [executable, "--version"], capture_output=True, text=True, timeout=10, check=False
+            [executable, "--version"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+            stdin=subprocess.DEVNULL,
         )
     except (OSError, subprocess.SubprocessError):
         return False
     return "bsdtar" in (out.stdout + out.stderr).lower()
 
 
-def _windows_tool_candidates() -> list[tuple[str, str]]:
-    """(rarfile module attribute, executable path) pairs for tools that are usually not on PATH."""
-    roots = [os.environ.get(var) for var in ("ProgramFiles", "ProgramFiles(x86)", "ProgramW6432")]
-    found: list[tuple[str, str]] = []
+def _windows_install_candidates() -> list[tuple[RarToolKind, str]]:
+    """Tools in their default Windows install folders (they are usually not on PATH)."""
+    roots = [os.environ.get(var) for var in ("ProgramFiles", "ProgramW6432", "ProgramFiles(x86)")]
+    found: list[tuple[RarToolKind, str]] = []
     for root in dict.fromkeys(r for r in roots if r):
-        for attr, relative in (("SEVENZIP_TOOL", "7-Zip/7z.exe"), ("UNRAR_TOOL", "WinRAR/UnRAR.exe")):
+        layout: tuple[tuple[RarToolKind, str], ...] = (("unrar", "WinRAR/UnRAR.exe"), ("7z", "7-Zip/7z.exe"))
+        for kind, relative in layout:
             candidate = Path(root) / relative
             if candidate.is_file():
-                found.append((attr, str(candidate)))
-    system_root = os.environ.get("SYSTEMROOT")
-    tar_candidates = [shutil.which("tar")]
-    if system_root:
-        tar_candidates.append(str(Path(system_root) / "System32" / "tar.exe"))
-    for tar in dict.fromkeys(t for t in tar_candidates if t):
-        if Path(tar).is_file() and _is_bsdtar(tar):
-            found.append(("BSDTAR_TOOL", tar))
-            break
+                found.append((kind, str(candidate)))
     return found
 
 
-def ensure_rar_backend() -> None:
-    """Make sure ``rarfile`` can run an extraction tool; raise :class:`ArchiveToolMissingError` if not.
+def find_rar_tools() -> list[RarTool]:
+    """Every usable RAR extraction tool on this machine, best first (empty list: none installed).
 
-    ``rarfile`` only searches PATH for ``unrar`` / ``unar`` / ``bsdtar`` / ``7z`` / ``7zz``. When that
-    fails, well-known install locations are tried (7-Zip, WinRAR, Windows' ``tar.exe`` which is
-    bsdtar) by pointing the corresponding ``rarfile.*_TOOL`` setting at the executable.
+    Order: ``unrar`` (the reference implementation), ``7z`` / ``7zz``, ``unar``, ``bsdtar`` and finally a
+    ``tar`` that turns out to be bsdtar (Windows 10+ ships one as ``System32\\tar.exe``).
     """
-    try:
-        rarfile.tool_setup()
-        return
-    except rarfile.RarCannotExec:
-        pass
-    for attr, executable in _windows_tool_candidates():
-        setattr(rarfile, attr, executable)
-        try:
-            rarfile.tool_setup(force=True)
-            log.info("using %s for RAR extraction", executable)
-            return
-        except rarfile.RarCannotExec:
-            continue
-    raise ArchiveToolMissingError(_RAR_TOOL_HELP)
+    tools: list[RarTool] = []
+    seen: set[str] = set()
+
+    def add(kind: RarToolKind, executable: str | None) -> None:
+        if executable and executable not in seen:
+            seen.add(executable)
+            tools.append(RarTool(kind, executable))
+
+    add("unrar", shutil.which("unrar"))
+    for kind, executable in _windows_install_candidates():
+        if kind == "unrar":
+            add(kind, executable)
+    for name in ("7z", "7zz"):
+        add("7z", shutil.which(name))
+    for kind, executable in _windows_install_candidates():
+        if kind == "7z":
+            add(kind, executable)
+    add("unar", shutil.which("unar"))
+    add("bsdtar", shutil.which("bsdtar"))
+    tar_candidates = [shutil.which("tar")]
+    system_root = os.environ.get("SYSTEMROOT")
+    if system_root:
+        tar_candidates.append(str(Path(system_root) / "System32" / "tar.exe"))
+    for tar in dict.fromkeys(t for t in tar_candidates if t):
+        if tar not in seen and Path(tar).is_file() and _is_bsdtar(tar):
+            add("bsdtar", tar)
+    return tools
+
+
+def ensure_rar_backend() -> list[RarTool]:
+    """The available RAR tools; raises :class:`ArchiveToolMissingError` (with install advice) if none.
+
+    ``cs2bot doctor`` can call this to tell the owner whether ``.rar`` demos can be unpacked.
+    """
+    tools = find_rar_tools()
+    if not tools:
+        raise ArchiveToolMissingError(_RAR_TOOL_HELP)
+    return tools
 
 
 # --------------------------------------------------------------------------------------- extraction
@@ -219,29 +282,83 @@ def _extract_zip(path: Path, dest_dir: Path, max_bytes: int) -> list[Path]:
     return out
 
 
-def _extract_rar(path: Path, dest_dir: Path, max_bytes: int) -> list[Path]:
-    ensure_rar_backend()
-    out: list[Path] = []
-    taken: set[str] = set()
+def _list_rar_dem_members(path: Path, max_bytes: int) -> list[str] | None:
+    """Names of the ``.dem`` members according to the archive headers (``None`` if they are unreadable).
+
+    Raises :class:`ArchiveError` when the listing works and shows no demo, or a demo above the limit.
+    """
     try:
         with rarfile.RarFile(path) as archive:
-            for info in archive.infolist():
-                if info.is_dir() or not _is_dem_member(info.filename or ""):
-                    continue
-                target = _unique_target(dest_dir, info.filename, taken)
-                with archive.open(info) as src:
-                    _copy_limited(src, target, max_bytes)
-                out.append(target)
-    except rarfile.RarCannotExec as exc:
-        _remove_all(out)
-        raise ArchiveToolMissingError(_RAR_TOOL_HELP) from exc
-    except (rarfile.Error, OSError) as exc:
-        _remove_all(out)
-        raise ArchiveError(f"cannot extract rar archive {path.name}: {type(exc).__name__}: {exc}") from exc
-    except ArchiveError:
-        _remove_all(out)
-        raise
+            infos = [info for info in archive.infolist() if not info.is_dir()]
+    except (rarfile.Error, OSError, ValueError) as exc:
+        log.warning("cannot list %s with rarfile (%s); extracting everything", path.name, exc)
+        return None
+    members = [info for info in infos if _is_dem_member(info.filename or "")]
+    if not members:
+        raise ArchiveError(f"{path.name} contains no .dem file")
+    for info in members:
+        if (info.file_size or 0) > max_bytes:
+            raise ArchiveError(f"{info.filename} in {path.name} is larger than the {max_bytes}-byte limit")
+    return [str(info.filename) for info in members]
+
+
+def _collect_dem_files(work_dir: Path, dest_dir: Path, max_bytes: int, taken: set[str]) -> list[Path]:
+    """Move the demos a tool unpacked below ``work_dir`` into ``dest_dir`` (flat, sanitised names)."""
+    found: list[Path] = []
+    for root, _dirs, files in os.walk(work_dir, followlinks=False):
+        for name in files:
+            candidate = Path(root) / name
+            if candidate.is_symlink() or not candidate.is_file() or not _is_dem_member(name):
+                continue
+            found.append(candidate)
+    out: list[Path] = []
+    for candidate in sorted(found, key=lambda p: str(p.relative_to(work_dir)).lower()):
+        if candidate.stat().st_size > max_bytes:
+            _remove_all(out)
+            raise ArchiveError(f"{candidate.name} is larger than the {max_bytes}-byte limit")
+        target = _unique_target(dest_dir, candidate.name, taken)
+        os.replace(candidate, target)
+        out.append(target)
     return out
+
+
+def _extract_rar(path: Path, dest_dir: Path, max_bytes: int) -> list[Path]:
+    """Unpack the demos of a RAR archive with the first installed tool that manages to do it."""
+    members = _list_rar_dem_members(path, max_bytes)
+    tools = ensure_rar_backend()
+    # Names that a tool could read as an option / list file are not passed on: extract everything then.
+    explicit = members if members and not any(m.startswith(("-", "@")) for m in members) else []
+    failures: list[str] = []
+    for tool in tools:
+        work_dir = Path(tempfile.mkdtemp(prefix=".unrar-", dir=dest_dir))
+        try:
+            command = tool.command(path.resolve(), work_dir, explicit)
+            try:
+                result = subprocess.run(
+                    command,
+                    capture_output=True,
+                    text=True,
+                    errors="replace",
+                    timeout=RAR_TOOL_TIMEOUT_S,
+                    check=False,
+                    stdin=subprocess.DEVNULL,
+                )
+            except (OSError, subprocess.SubprocessError) as exc:
+                failures.append(f"{tool.kind}: {type(exc).__name__}: {exc}")
+                continue
+            extracted = _collect_dem_files(work_dir, dest_dir, max_bytes, set())
+            expected = len(members) if members is not None else 1
+            if result.returncode == 0 and len(extracted) >= expected:
+                return extracted
+            _remove_all(extracted)
+            detail = (result.stderr or result.stdout or "").strip().splitlines()
+            failures.append(
+                f"{tool.kind}: exit code {result.returncode}, {len(extracted)} of {expected} demo files"
+                + (f" ({detail[-1][:200]})" if detail else "")
+            )
+        finally:
+            shutil.rmtree(work_dir, ignore_errors=True)
+    raise ArchiveError(f"cannot extract rar archive {path.name}: " + "; ".join(failures))
 
 
 def _extract_stream(path: Path, dest_dir: Path, max_bytes: int, kind: ArchiveKind) -> list[Path]:
@@ -270,7 +387,7 @@ def _remove_all(paths: Iterable[Path]) -> None:
 def extract_archive(path: Path, dest_dir: Path, *, max_member_bytes: int = MAX_DEM_BYTES) -> list[Path]:
     """Extract every ``.dem`` of an archive into ``dest_dir``; returns the paths sorted by name.
 
-    Supported: ``.rar`` (external tool, see :func:`ensure_rar_backend`), ``.zip``, single-file
+    Supported: ``.rar`` (external tool, see :func:`find_rar_tools`), ``.zip``, single-file
     ``.zst`` / ``.gz`` / ``.bz2`` and a plain ``.dem``, which is returned as-is (not copied).
     Raises :class:`ArchiveToolMissingError` when a RAR tool is needed but missing, and
     :class:`ArchiveError` for corrupt / unknown archives or archives without a demo file.

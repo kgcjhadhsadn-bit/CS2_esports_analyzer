@@ -64,6 +64,16 @@ behaviour:
   dismiss_cookie_banner: true
   # Close promo / reminder modals that appear after a page load (popup_close).
   dismiss_popups: true
+  # true  = if the bet slip shows a market name (slip_item_market) that does not fit the ordered market,
+  #         the bet is aborted with SELECTOR_ERROR (protects against a click landing on another market
+  #         while the page re-renders). Set to false only if Betclic words the market differently in the
+  #         slip than on the event page; a mismatch is then only logged.
+  require_slip_market_match: true
+  # true  = selections that exist in the slip's DOM but are hidden also count: more than one -> the bet
+  #         is aborted (a hidden stale selection would turn the single bet into a combination bet).
+  #         Set to false only if the page keeps hidden duplicates of the visible slip (check the saved
+  #         <...>_selector_error.html), or better: make slip_item more specific.
+  count_hidden_slip_items: true
 
 # DOM attributes that may carry Betclic's external ids (from the odds collector). Ids are only used to
 # tell apart markets/selections with identical names, never to override a name mismatch.
@@ -75,9 +85,13 @@ attributes:
   locked_classes: ["is-locked", "is-disabled", "is-suspended", "disabled", "locked"]
 
 texts:
-  # Message classification (bet slip errors / notices). Checked in this order: pending,
-  # bet_accepted (after the click), insufficient_balance, stake_limit, odds_changed, market_suspended,
-  # login_required, rejected. Unknown messages after the final click -> UNCERTAIN.
+  # Message classification (bet slip errors / notices). Checked in this order: ignore, pending,
+  # bet_accepted, insufficient_balance, stake_limit, odds_changed, market_suspended, login_required,
+  # rejected. An unknown message BEFORE the final click aborts the bet (nothing is clicked); an unknown
+  # message AFTER it that is not followed by a receipt or a known error -> UNCERTAIN.
+  # "ignore": harmless informational notices that slip_error also matches (add phrases here if a bet is
+  # refused with "Betclic bet slip shows: ..." for a message that is not an error).
+  ignore: []
   pending:
     - "przetwarzan"
     - "trwa weryfikacja"
@@ -342,7 +356,9 @@ elements:
       - {css: "[data-qa='betslip-selection-name']"}
       - {css: ".betBox_selectionName, .betBox_label"}
   slip_item_market:
-    description: Market name inside a bet-slip item (mismatch only logs a warning).
+    description: >-
+      Market name inside a bet-slip item. Must fit the ordered market (equal, or one contains the
+      other), else SELECTOR_ERROR - see behaviour.require_slip_market_match.
     scope: slip_item
     verified: false
     optional: true
@@ -386,15 +402,29 @@ elements:
     locators:
       - {css: "[data-qa='betslip-count'], .betslip_count, .betslip_badge"}
   slip_stake_input:
-    description: Stake field of the single bet. The stake is typed Polish-style ("12,50") and read back.
+    description: >-
+      Stake field of the single bet. The stake is typed Polish-style ("12,50"), read back, and read
+      again right before the final click. Exactly ONE visible element must match.
     verified: false
     locators:
       - {css: "[data-qa='betslip-stake-input'] input, input[data-qa='betslip-stake-input']"}
       - {css: ".betBox_stake input, .betslip_stake input, bcdk-bet-slip-stake input"}
       - {role: textbox, name: "/stawka/i"}
       - {css: "input[inputmode='decimal']"}
+  slip_potential_win:
+    description: >-
+      Potential payout shown in the slip ("Możliwa wygrana: 20,35 zł"), containing exactly one amount.
+      Cross-check that Betclic understood the typed stake: it must lie between 70% and 105% of
+      stake x odds (0.88 after the 12% tax), otherwise the bet is aborted. Skipped when not found.
+    verified: false
+    optional: true
+    locators:
+      - {css: "[data-qa='betslip-potential-win'], [data-qa='betslip-winnings'], [data-qa='potential-winnings']"}
+      - {css: ".betslip_winnings, .betslip_potentialWin, .betBox_winnings, .betslip_gain"}
   slip_place_button:
-    description: The final "Postaw zakład" button. Never clicked in dry-run mode.
+    description: >-
+      The final "Postaw zakład" button. Never clicked in dry-run mode. Exactly ONE visible element must
+      match (several -> SELECTOR_ERROR: the bot never guesses which button to press).
     verified: false
     locators:
       - {role: button, name: "Postaw zakład"}

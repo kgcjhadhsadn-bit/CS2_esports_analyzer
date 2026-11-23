@@ -140,7 +140,9 @@ def api_status_error(status: int) -> anthropic.APIStatusError:
 
 
 def connection_error() -> anthropic.APIConnectionError:
-    return anthropic.APIConnectionError(request=httpx2.Request("POST", "https://api.anthropic.com/v1/messages"))
+    return anthropic.APIConnectionError(
+        request=httpx2.Request("POST", "https://api.anthropic.com/v1/messages")
+    )
 
 
 def make_settings(**llm_overrides: Any) -> Settings:
@@ -275,12 +277,18 @@ def make_prediction(**overrides: Any) -> MatchPrediction:
         "sigma_team1_win": 0.04,
         "map_estimates": {
             "mirage": MapWinEstimate(
-                map_name="mirage", p_team1_win=0.62, sigma=0.04, picked_by=TeamSlot.TEAM1, components={"glicko": 0.6}
+                map_name="mirage",
+                p_team1_win=0.62,
+                sigma=0.04,
+                picked_by=TeamSlot.TEAM1,
+                components={"glicko": 0.6},
             )
         },
         "veto_distribution": [
             MapSequenceProbability(
-                maps=["mirage", "inferno", "ancient"], pickers=[TeamSlot.TEAM1, TeamSlot.TEAM2, None], probability=0.4
+                maps=["mirage", "inferno", "ancient"],
+                pickers=[TeamSlot.TEAM1, TeamSlot.TEAM2, None],
+                probability=0.4,
             )
         ],
         "veto_known": False,

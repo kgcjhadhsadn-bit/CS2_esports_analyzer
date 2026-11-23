@@ -7,6 +7,11 @@ executed there, serialised. From async code use ``await asyncio.to_thread(wrappe
 
 A long ``open_login_window`` (the owner typing an SMS code) blocks queued ``place`` calls until it
 returns - intentionally, the bot cannot bet while logged out anyway.
+
+``place`` always waits for its result (``call_timeout_s`` does not apply): giving up on a placement that
+keeps running in the worker would report a failure for a bet that may still be placed. If the wrapped
+executor cannot even be created (broken selector file, bad tuning), ``place`` returns a ``FAILED``
+result - nothing was clicked - instead of raising; the other methods raise the error.
 """
 
 from __future__ import annotations
@@ -19,9 +24,10 @@ from decimal import Decimal
 from types import TracebackType
 from typing import TypeVar
 
-from cs2bot.domain.betting import BetOrder, ExecutorHealth, PlacementResult
+from cs2bot.domain.betting import BetOrder, ExecutorHealth, PlacementResult, PlacementStatus
 from cs2bot.executor.base import AccountExecutor, BookmakerBetRecord, ExecutorClosedError
 from cs2bot.utils.logging import get_logger
+from cs2bot.utils.time import utcnow
 
 log = get_logger(__name__)
 
@@ -43,7 +49,9 @@ class ThreadBoundExecutor:
         self._inner: AccountExecutor | None = None
         self._closed = False
         self._state_lock = threading.Lock()
-        self.call_timeout_s = call_timeout_s  # None = wait as long as it takes (recommended for place)
+        # Seconds to wait for get_balance / health_check / is_logged_in / fetch_bet_history (None = no
+        # limit). Never applied to place() (see the module docstring) nor to open_login_window().
+        self.call_timeout_s = call_timeout_s
 
     @property
     def started(self) -> bool:
@@ -65,8 +73,25 @@ class ThreadBoundExecutor:
 
     # ------------------------------------------------------------------ forwarded API
 
+    def _ensure_inner(self) -> None:
+        """Create the wrapped executor on the worker thread (raises what the factory raises)."""
+        self._call(lambda _ex: None)
+
     def place(self, order: BetOrder) -> PlacementResult:
-        return self._call(lambda ex: ex.place(order), timeout_s=self.call_timeout_s)
+        try:
+            self._ensure_inner()
+        except ExecutorClosedError:
+            raise
+        except Exception as exc:
+            # Nothing touched the browser: a definite "not placed" the caller can record as FAILED.
+            detail = str(exc).strip().splitlines()[0][:300] if str(exc).strip() else ""
+            log.error("the bet executor could not be created: %s: %s", type(exc).__name__, detail)
+            return PlacementResult(
+                status=PlacementStatus.FAILED,
+                message=f"the bet executor could not be created ({type(exc).__name__}: {detail})",
+                at=utcnow(),
+            )
+        return self._call(lambda ex: ex.place(order))
 
     def get_balance(self) -> Decimal | None:
         return self._call(lambda ex: ex.get_balance(), timeout_s=self.call_timeout_s)

@@ -35,6 +35,10 @@ _LOSS_PATTERN = re.compile(
 # A tag starts with a letter, "/" or "!" right after "<" - so "p < 0.75 and EV > 0.03" is left alone.
 _HTML_TAG = re.compile(r"</?[A-Za-z!][^>\n]{0,400}>")
 _MD_IMAGE = re.compile(r"!\[([^\]\n]*)\]\([^)\n]*\)")
+# Inline links "[text](target)" and reference definitions "[label]: target".
+_MD_LINK = re.compile(r"\[([^\]\n]*)\]\(\s*<?([^)\s>]*)[^)\n]*\)")
+_MD_LINK_DEFINITION = re.compile(r"^[ \t]{0,3}\[[^\]\n]+\]:[ \t]*<?(\S*).*$", re.MULTILINE)
+_SAFE_LINK = re.compile(r"^(https?://|#|/(?!/))", re.IGNORECASE)
 _MAX_SEQUENCES = 5
 _MAX_SCORES = 6
 
@@ -321,14 +325,22 @@ def render_template_rationale(
 
 
 def sanitize_markdown(text: str) -> str:
-    """Remove raw HTML tags and image embeds; keep everything else.
+    """Remove raw HTML tags, image embeds and links with an unsafe target; keep everything else.
 
     The rationale partly derives from untrusted news (via flag texts). The dashboard should render it
     as Markdown without raw HTML anyway; stripping here is defence in depth (no script tags, no
-    remote images that would leak that the page was opened).
+    remote images that would leak that the page was opened, no ``javascript:`` / ``data:`` links).
+    Links to ``http(s)://`` addresses, in-page anchors and site-relative paths are kept; any other
+    link is reduced to its text.
     """
     without_images = _MD_IMAGE.sub(lambda m: m.group(1), text)
-    return _HTML_TAG.sub("", without_images)
+    without_links = _MD_LINK.sub(
+        lambda m: m.group(0) if _SAFE_LINK.match(m.group(2)) else m.group(1), without_images
+    )
+    without_definitions = _MD_LINK_DEFINITION.sub(
+        lambda m: m.group(0) if _SAFE_LINK.match(m.group(1)) else "", without_links
+    )
+    return _HTML_TAG.sub("", without_definitions)
 
 
 def finalize_rationale(text: str) -> str:

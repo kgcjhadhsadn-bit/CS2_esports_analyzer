@@ -49,7 +49,9 @@ def _ok(*flags: Any) -> Any:
 
 def test_refresh_analyses_persists_and_marks_the_match(session: Session) -> None:
     ctx = seed_match(session)
-    news = add_news(session, 1, title="Bravo Foxes stand-in", team_ids=[TEAM2_ID], label="stand_in", relevance=0.9)
+    news = add_news(
+        session, 1, title="Bravo Foxes stand-in", team_ids=[TEAM2_ID], label="stand_in", relevance=0.9
+    )
     client = FakeClient([_ok(suggestion())])
     analyzer = ContextAnalyzer(make_settings(), client=client)
 
@@ -59,7 +61,12 @@ def test_refresh_analyses_persists_and_marks_the_match(session: Session) -> None
     assert [f.flag_type for f in result.flags] == [ContextFlagType.STAND_IN]
     assert result.flags[0].evidence == [news.url]
     rows = _flag_rows(session)
-    assert len(rows) == 1 and rows[0].active and rows[0].team_id == TEAM2_ID and rows[0].model == "claude-opus-5-5"
+    assert (
+        len(rows) == 1
+        and rows[0].active
+        and rows[0].team_id == TEAM2_ID
+        and rows[0].model == "claude-opus-5-5"
+    )
     marker = session.get(Match, 10).extra["llm"]["context"]  # type: ignore[union-attr]
     assert marker["fingerprint"] == result.fingerprint and marker["n_flags"] == 1 and marker["n_news"] == 1
     assert marker["analyzed_at"] == NOW.isoformat() and marker["note"] == "One stand-in reported."
@@ -70,7 +77,9 @@ def test_refresh_skips_the_call_while_inputs_are_unchanged_even_after_a_restart(
     ctx = seed_match(session)
     add_news(session, 1, team_ids=[TEAM2_ID], label="stand_in", relevance=0.9)
     first_client = FakeClient([_ok(suggestion())])
-    first = refresh_match_context(session, ContextAnalyzer(make_settings(), client=first_client), ctx, now=NOW)
+    first = refresh_match_context(
+        session, ContextAnalyzer(make_settings(), client=first_client), ctx, now=NOW
+    )
 
     # New analyzer = new process: the in-memory memo is empty, the database marker still applies.
     second_client = FakeClient()
@@ -110,7 +119,9 @@ def test_refresh_uses_the_memo_when_the_db_marker_is_missing(session: Session) -
 
     again = refresh_match_context(session, analyzer, ctx, now=NOW + timedelta(minutes=30))
     assert len(client.calls) == 1 and again.source == "memo" and len(again.flags) == 1
-    assert match.extra["llm"]["context"]["analyzed_at"] == NOW.isoformat()  # marker restored, original time kept
+    assert (
+        match.extra["llm"]["context"]["analyzed_at"] == NOW.isoformat()
+    )  # marker restored, original time kept
     assert len(_flag_rows(session)) == 1  # identical flags are not re-inserted
 
 
@@ -136,17 +147,25 @@ def test_failed_analysis_keeps_the_stored_flags(session: Session) -> None:
     assert refused.status is LLMStatus.REFUSED and refused.source == "stale"
     assert [f.veto for f in refused.flags] == [True]
     assert [r.active for r in _flag_rows(session)] == [True]
+    # The refused inputs are not sent again until the re-analysis interval has passed.
+    waiting = refresh_match_context(session, analyzer, ctx, now=NOW + timedelta(hours=3))
+    assert waiting.status is LLMStatus.BACKOFF and len(client.calls) == 2 and len(waiting.flags) == 1
 
-    failed = refresh_match_context(session, analyzer, ctx, now=NOW + timedelta(hours=3))
+    add_news(session, 3, team_ids=[TEAM1_ID], hours_ago=-3)  # inputs change again -> server error
+    failed = refresh_match_context(session, analyzer, ctx, now=NOW + timedelta(hours=4))
     assert failed.status is LLMStatus.FAILED and [f.veto for f in failed.flags] == [True]
-    backoff = refresh_match_context(session, analyzer, ctx, now=NOW + timedelta(hours=3, seconds=30))
+    backoff = refresh_match_context(session, analyzer, ctx, now=NOW + timedelta(hours=4, seconds=30))
     assert backoff.status is LLMStatus.BACKOFF and len(client.calls) == 3 and len(backoff.flags) == 1
+    assert [r.active for r in _flag_rows(session)] == [True]
 
 
 def test_refresh_when_disabled_returns_stored_flags_without_calls(session: Session) -> None:
     ctx = seed_match(session)
     refresh_match_context(
-        session, ContextAnalyzer(make_settings(), client=FakeClient([_ok(suggestion(evidence=["context"]))])), ctx, now=NOW
+        session,
+        ContextAnalyzer(make_settings(), client=FakeClient([_ok(suggestion(evidence=["context"]))])),
+        ctx,
+        now=NOW,
     )
     client = FakeClient()
     disabled = ContextAnalyzer(make_settings(enabled=False), client=client)
@@ -258,5 +277,42 @@ def test_triage_pending_news_when_disabled(session: Session) -> None:
     seed_match(session)
     add_news(session, 1)
     client = FakeClient()
-    report = triage_pending_news(session, ContextAnalyzer(make_settings(enabled=False), client=client), now=NOW)
+    report = triage_pending_news(
+        session, ContextAnalyzer(make_settings(enabled=False), client=client), now=NOW
+    )
     assert report.status is LLMStatus.DISABLED and report.candidates == 1 and client.calls == []
+
+
+def test_given_up_items_do_not_starve_older_pending_news(session: Session) -> None:
+    seed_match(session)
+    older = [add_news(session, n, hours_ago=20 - n) for n in (1, 2)]
+    for n in range(3, 13):  # ten newer items the model could never classify
+        add_news(session, n, hours_ago=1, extra={"llm": {"triage_attempts": 3}})
+    client = FakeClient(_answer_all())
+    analyzer = ContextAnalyzer(make_settings(), client=client)
+
+    report = triage_pending_news(session, analyzer, limit=2, now=NOW)
+
+    assert (report.candidates, report.triaged) == (2, 2)
+    assert all(row.triaged_at == NOW for row in older)
+
+
+def test_rejected_requests_do_not_burn_triage_attempts(session: Session) -> None:
+    """HTTP 400 (e.g. exhausted credit, unknown model) says nothing about the articles themselves."""
+    seed_match(session)
+    rows = [add_news(session, n) for n in (1, 2, 3)]
+    client = FakeClient(lambda *_: api_status_error(400))
+    analyzer = ContextAnalyzer(make_settings(), client=client, tuning=LLMTuning(triage_max_attempts=2))
+    for _ in range(4):
+        report = triage_pending_news(session, analyzer, now=NOW)
+        assert (report.status, report.candidates, report.unanswered, report.deferred) == (
+            LLMStatus.FAILED,
+            3,
+            0,
+            3,
+        )
+    assert len(client.calls) == 4  # one request per run, no item-by-item retries
+    assert all("llm" not in (row.extra or {}) for row in rows)
+    # Once the account works again, everything is still waiting to be triaged.
+    working = ContextAnalyzer(make_settings(), client=FakeClient(_answer_all()))
+    assert triage_pending_news(session, working, now=NOW).triaged == 3

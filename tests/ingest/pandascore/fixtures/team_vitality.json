@@ -1,0 +1,101 @@
+{
+ "acronym": "VIT",
+ "dark_mode_image_url": null,
+ "id": 3455,
+ "image_url": "https://cdn.pandascore.co/images/team/image/3455/vitality-cs-go.png",
+ "location": "FR",
+ "modified_at": "2026-11-10T09:14:51Z",
+ "name": "Vitality",
+ "slug": "vitality-cs-go",
+ "current_videogame": {
+  "id": 3,
+  "name": "Counter-Strike",
+  "slug": "cs-go"
+ },
+ "players": [
+  {
+   "active": true,
+   "age": null,
+   "birthday": null,
+   "first_name": "Mathieu",
+   "id": 17512,
+   "image_url": "https://cdn.pandascore.co/images/player/image/17512/zywoo.png",
+   "last_name": "Herbaut",
+   "modified_at": "2026-11-02T11:20:07Z",
+   "name": "ZywOo",
+   "nationality": "FR",
+   "role": null,
+   "slug": "zywoo"
+  },
+  {
+   "active": true,
+   "age": null,
+   "birthday": null,
+   "first_name": "Dan",
+   "id": 17497,
+   "image_url": "https://cdn.pandascore.co/images/player/image/17497/apex.png",
+   "last_name": "Madesclaire",
+   "modified_at": "2026-11-02T11:20:07Z",
+   "name": "apEX",
+   "nationality": "FR",
+   "role": null,
+   "slug": "apex"
+  },
+  {
+   "active": true,
+   "age": null,
+   "birthday": null,
+   "first_name": "Shahar",
+   "id": 25107,
+   "image_url": "https://cdn.pandascore.co/images/player/image/25107/flamez.png",
+   "last_name": "Shushan",
+   "modified_at": "2026-11-02T11:20:07Z",
+   "name": "flameZ",
+   "nationality": "IL",
+   "role": null,
+   "slug": "flamez"
+  },
+  {
+   "active": true,
+   "age": null,
+   "birthday": null,
+   "first_name": "William",
+   "id": 24817,
+   "image_url": "https://cdn.pandascore.co/images/player/image/24817/mezii.png",
+   "last_name": "Merriman",
+   "modified_at": "2026-11-02T11:20:07Z",
+   "name": "mezii",
+   "nationality": "GB",
+   "role": null,
+   "slug": "mezii"
+  },
+  {
+   "active": true,
+   "age": null,
+   "birthday": null,
+   "first_name": "Robin",
+   "id": 18234,
+   "image_url": "https://cdn.pandascore.co/images/player/image/18234/ropz.png",
+   "last_name": "Kool",
+   "modified_at": "2026-11-02T11:20:07Z",
+   "name": "ropz",
+   "nationality": "EE",
+   "role": null,
+   "slug": "ropz"
+  },
+  {
+   "active": false,
+   "age": null,
+   "birthday": null,
+   "first_name": "Remy",
+   "id": 40122,
+   "image_url": "https://cdn.pandascore.co/images/player/image/40122/xtqzzz.png",
+   "last_name": "Quoniam",
+   "modified_at": "2026-11-02T11:20:07Z",
+   "name": "XTQZZZ",
+   "nationality": "FR",
+   "role": null,
+   "slug": "xtqzzz"
+  }
+ ]
+}

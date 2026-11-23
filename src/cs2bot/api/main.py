@@ -28,6 +28,7 @@ from cs2bot.api.deps import (
     ExecutorHealthProvider,
     LoginLauncher,
     LoginLauncherRunner,
+    SchedulerStatusProvider,
 )
 from cs2bot.api.options import ApiOptions
 from cs2bot.api.routes import ROUTERS
@@ -75,6 +76,22 @@ async def _validation_failed(request: Request, exc: Exception) -> JSONResponse:
     return JSONResponse({"detail": detail}, status_code=422)
 
 
+def _pick[T](override: T | None, configured: T) -> T:
+    """An :class:`ApiOptions` override when given, else the value from ``settings.api``."""
+    return configured if override is None else override
+
+
+_UVICORN_LOG_LEVELS = frozenset({"critical", "error", "warning", "info", "debug", "trace"})
+
+
+def _uvicorn_log_level(name: str) -> str:
+    """uvicorn only knows its own level names (``settings.log_level`` may be e.g. ``WARN``)."""
+    level = name.strip().lower()
+    if level in _UVICORN_LOG_LEVELS:
+        return level
+    return {"warn": "warning", "fatal": "critical", "notset": "debug"}.get(level, "info")
+
+
 def create_app(
     settings: Settings | None = None,
     session_factory: sessionmaker[Session] | None = None,
@@ -82,6 +99,7 @@ def create_app(
     login_launcher: LoginLauncher | None = None,
     executor_health_provider: ExecutorHealthProvider | None = None,
     event_remapper: EventRemapper | None = None,
+    scheduler_status_provider: SchedulerStatusProvider | None = None,
     options: ApiOptions | None = None,
 ) -> FastAPI:
     """Build the dashboard API.
@@ -96,7 +114,14 @@ def create_app(
     * ``event_remapper(session, event_row)`` - re-maps an event's markets right after a manual link
       review changed its match / orientation (wire ``cs2bot.odds.collector.remap_event`` with the
       market mapper). Without it the mappings stay cleared until the collector's next pass.
-    * ``options`` - API tunables (rate limits, extra allowed hosts, ...), see :class:`ApiOptions`.
+    * ``scheduler_status_provider`` - ``Scheduler.status`` of the built-in scheduler
+      (:mod:`cs2bot.flows.scheduler`); ``/api/health`` then shows each job's next due time and
+      failure count and stops flagging jobs the scheduler no longer runs.
+    * ``options`` - API tunables (page sizes, health thresholds, overrides of the login rate limit
+      and extra allowed hosts for tests), see :class:`ApiOptions`.
+
+    The login rate limit (``login_max_failures``, ``login_global_max_failures``, ``login_window_s``)
+    and extra Host-header names (``allowed_hosts``) are read from ``settings.api``.
     """
     settings = settings or get_settings()
     options = options or ApiOptions()
@@ -120,13 +145,14 @@ def create_app(
         options=options,
         auth=auth,
         login_limiter=LoginRateLimiter(
-            max_failures=options.login_max_failures,
-            global_max_failures=options.login_global_max_failures,
-            window_s=options.login_window_s,
+            max_failures=_pick(options.login_max_failures, api.login_max_failures),
+            global_max_failures=_pick(options.login_global_max_failures, api.login_global_max_failures),
+            window_s=_pick(options.login_window_s, api.login_window_s),
         ),
         login_runner=LoginLauncherRunner(login_launcher),
         executor_health_provider=executor_health_provider,
         event_remapper=event_remapper,
+        scheduler_status_provider=scheduler_status_provider,
     )
 
     app = FastAPI(
@@ -148,7 +174,7 @@ def create_app(
     )
     app.state.cs2bot = ctx
 
-    allowed_hosts = build_allowed_hosts(api, options.extra_allowed_hosts)
+    allowed_hosts = build_allowed_hosts(api, (*api.allowed_hosts, *options.extra_allowed_hosts))
     # add_middleware() wraps: the last one added is the outermost
     app.add_middleware(CSRFMiddleware, allowed_origins=build_allowed_origins(api, allowed_hosts))
     app.add_middleware(
@@ -180,6 +206,7 @@ def make_server(
     login_launcher: LoginLauncher | None = None,
     executor_health_provider: ExecutorHealthProvider | None = None,
     event_remapper: EventRemapper | None = None,
+    scheduler_status_provider: SchedulerStatusProvider | None = None,
     options: ApiOptions | None = None,
     log_level: str | None = None,
 ) -> uvicorn.Server:
@@ -195,13 +222,14 @@ def make_server(
         login_launcher=login_launcher,
         executor_health_provider=executor_health_provider,
         event_remapper=event_remapper,
+        scheduler_status_provider=scheduler_status_provider,
         options=options,
     )
     config = uvicorn.Config(
         app,
         host=settings.api.host,
         port=settings.api.port,
-        log_level=(log_level or settings.log_level).lower(),
+        log_level=_uvicorn_log_level(log_level or settings.log_level),
         proxy_headers=False,  # no reverse proxy: never trust X-Forwarded-For (login rate limiting)
         server_header=False,
         access_log=True,
@@ -216,6 +244,7 @@ def run(
     login_launcher: LoginLauncher | None = None,
     executor_health_provider: ExecutorHealthProvider | None = None,
     event_remapper: EventRemapper | None = None,
+    scheduler_status_provider: SchedulerStatusProvider | None = None,
     options: ApiOptions | None = None,
 ) -> None:
     """Serve the API + dashboard until interrupted (blocking)."""
@@ -226,6 +255,7 @@ def run(
         login_launcher=login_launcher,
         executor_health_provider=executor_health_provider,
         event_remapper=event_remapper,
+        scheduler_status_provider=scheduler_status_provider,
         options=options,
     )
     log.info("dashboard on http://%s:%d", settings.api.host, settings.api.port)

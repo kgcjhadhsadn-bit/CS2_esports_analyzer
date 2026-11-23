@@ -71,6 +71,7 @@ from cs2bot.ingest.pandascore.entities import (
     upsert_tournament,
 )
 from cs2bot.ingest.pandascore.errors import (
+    PandaScoreAuthError,
     PandaScoreError,
     PandaScoreNotFoundError,
     PandaScorePlanError,
@@ -90,7 +91,7 @@ from cs2bot.ingest.pandascore.mapping import (
 )
 from cs2bot.ingest.pandascore.models import PSGame, PSMatch, PSPlayer
 from cs2bot.ingest.scope import refresh_match_scope
-from cs2bot.utils.time import utcnow
+from cs2bot.utils.time import ensure_utc, utcnow
 
 logger = logging.getLogger(__name__)
 
@@ -134,6 +135,10 @@ class PandaScoreSyncOptions:
     # A finished match whose stats are still marked incomplete is re-fetched until it is this old.
     games_final_after_hours: float = 48.0
     max_pages: int | None = None  # hard cap on list pages per call (None = all)
+    # sync_past: the time range is listed in windows of this many days (None = one request series).
+    # Keeps a multi-year backfill away from very deep pagination, where rows shifting between pages
+    # (matches being edited while we read) would otherwise be missed.
+    past_window_days: int | None = 30
     commit_every: int | None = None  # sync_past / sync_modified: commit after every N matches
 
 
@@ -150,6 +155,7 @@ class _Run:
     tournaments: dict[int, tuple[int, tuple[Any, ...]]] = field(default_factory=dict)
     rosters: dict[int, dict[int, list[PSPlayer]] | None] = field(default_factory=dict)
     seen_match_ids: set[int] = field(default_factory=set)
+    touched_match_ids: set[int] = field(default_factory=set)  # DB ids already in report.match_ids
     games_unavailable: bool = False  # 403 on the games endpoint: stop asking in this run
     rosters_unavailable: bool = False
     stop: bool = False  # rate limit exhausted / auth failure: no further API calls
@@ -161,13 +167,19 @@ class _Run:
         self.report.details[key] = int(self.report.details.get(key, 0)) + n
 
     def api_failure(self, what: str, exc: PandaScoreError) -> None:
-        """Record a failed API call; rate-limit exhaustion stops the run (``report.blocked``)."""
+        """Record a failed API call.
+
+        Rate-limit exhaustion stops the run and sets ``report.blocked`` (try again later); a missing
+        or rejected token stops it too (every further call would fail the same way).
+        """
         if isinstance(exc, PandaScoreRateLimitError):
             self.stop = True
             self.report.blocked = True
             wait = f"; retry after {exc.retry_after_s:.0f} s" if exc.retry_after_s is not None else ""
             self.report.add_error(f"{what}: PandaScore rate limit reached{wait}")
         else:
+            if isinstance(exc, PandaScoreAuthError):
+                self.stop = True
             self.report.add_error(f"{what}: {exc}")
 
 
@@ -214,7 +226,11 @@ def sync_upcoming(
         (
             "upcoming matches",
             client.iter_upcoming_matches(
-                hours, videogame_title=title, max_pages=run.options.max_pages, on_invalid=_invalid(run)
+                hours,
+                videogame_title=title,
+                max_pages=run.options.max_pages,
+                on_invalid=_invalid(run),
+                now=run.now,
             ),
         )
     ]
@@ -249,16 +265,22 @@ def sync_past(
 
     Pages are processed as they arrive (constant memory); set ``options.commit_every`` for long
     backfills so progress survives an interruption - the sync is idempotent, simply run it again.
+    The range is walked oldest first in windows of ``options.past_window_days``; the first window that
+    cannot be listed completely ends the run (its error is in the report), so a re-run can resume
+    from ``report.details['completed_until']``.
     """
     run = _start(client, settings, options, now, "pandascore.sync_past")
-    matches = client.iter_past_matches(
-        since,
-        until or run.now,
-        videogame_title=run.options.videogame_title,
-        max_pages=run.options.max_pages,
-        on_invalid=_invalid(run),
-    )
-    _consume(session, run, "past matches", matches)
+    for lo, hi in _windows(since, until or run.now, run.options.past_window_days):
+        matches = client.iter_past_matches(
+            lo,
+            hi,
+            videogame_title=run.options.videogame_title,
+            max_pages=run.options.max_pages,
+            on_invalid=_invalid(run),
+        )
+        if not _consume(session, run, "past matches", matches):
+            break
+        run.report.details["completed_until"] = hi.isoformat()
     return _finish(session, run)
 
 
@@ -381,6 +403,28 @@ def _start(
     )
 
 
+def _windows(since: datetime, until: datetime, days: int | None) -> Iterator[tuple[datetime, datetime]]:
+    """``[since, until]`` cut into consecutive windows of ``days`` days (one window when ``days`` is None).
+
+    Neighbouring windows share their boundary instant (PandaScore ranges are inclusive); a match that
+    began exactly then is simply seen twice, which the idempotent upsert absorbs.
+    """
+    since, until = ensure_utc(since), ensure_utc(until)
+    if since > until:
+        return
+    if not days or days <= 0:
+        yield since, until
+        return
+    step = timedelta(days=days)
+    lo = since
+    while True:
+        hi = min(lo + step, until)
+        yield lo, hi
+        if hi >= until:
+            return
+        lo = hi
+
+
 def _finish(session: Session, run: _Run) -> SyncReport:
     session.flush()
     run.report.fetched_pages = run.client.stats.pages - run.pages_before
@@ -465,7 +509,8 @@ def _process_match(session: Session, run: _Run, ps: PSMatch, *, force_details: b
         logger.debug("PandaScore match %s updated: %s", ps.id, ", ".join(core.tracker.fields))
     else:
         run.count("unchanged")
-    if match.id not in run.report.match_ids:
+    if match.id not in run.touched_match_ids:
+        run.touched_match_ids.add(match.id)
         run.report.match_ids.append(match.id)
 
 
@@ -1046,7 +1091,12 @@ def _sync_lineups(
     size = run.options.lineup_size
     kickoff = match.scheduled_at
     recent = kickoff is None or kickoff >= run.now - timedelta(days=run.options.current_team_window_days)
-    seen_at = min(kickoff, run.now) if kickoff is not None else run.now
+    if kickoff is not None and kickoff <= run.now:
+        seen_at = kickoff
+    else:
+        # Not played yet: the roster is a sighting "as of today". Truncated to the UTC day so that
+        # repeated runs on one day write the same stamp (idempotent) instead of a new one every run.
+        seen_at = run.now.replace(hour=0, minute=0, second=0, microsecond=0)
     all_rows = list(session.scalars(select(MatchLineup).where(MatchLineup.match_id == match.id)))
     hltv_has_lineups = _hltv_has_lineups(session, match)
     resolved: dict[int, int] = {}
@@ -1056,6 +1106,8 @@ def _sync_lineups(
             continue
         team_rows = [row for row in all_rows if row.team_id == team.id]
         candidates = [p for p in (session.get(Player, row.player_id) for row in team_rows) if p is not None]
+        # Players another source marked as stand-ins for this match keep their own team.
+        stand_ins = {row.player_id for row in team_rows if row.is_standin}
         wanted: dict[int, PSPlayer] = {}
         for ps_player in roster:
             player = resolve_ps_player(
@@ -1063,8 +1115,10 @@ def _sync_lineups(
                 ps_player,
                 team,
                 seen_at=seen_at,
-                move_team=recent,
+                # a roster entry flagged inactive (former player, coach) says nothing about today's team
+                move_team=recent and (actual or ps_player.active is not False),
                 same_match_candidates=candidates,
+                keep_team_player_ids=stand_ins,
             )
             if player is None or ps_player.id is None:
                 continue

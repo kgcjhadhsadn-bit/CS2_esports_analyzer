@@ -12,8 +12,9 @@ URL. A row left in ``DOWNLOADING`` / ``DOWNLOADED`` by a crash is picked up agai
 than ``stale_after``.
 
 A downloader that raises an "I am being blocked" error (any exception class named
-``HLTVBlockedError`` in its MRO, i.e. the HLTV fetcher's) stops the batch immediately: the row goes
-back to ``PENDING`` without using up an attempt and ``report.blocked`` is set so the caller backs off.
+``HLTVBlockedError`` or ``DemoDownloadBlockedError`` in its MRO, i.e. the HLTV fetcher's or the
+browser downloader's) stops the batch immediately: the row goes back to ``PENDING`` without using up
+an attempt and ``report.blocked`` is set so the caller backs off.
 """
 
 from __future__ import annotations
@@ -106,8 +107,12 @@ class _Blocked(Exception):
     """Internal signal: the download source is blocking us; stop the batch."""
 
 
+_BLOCK_ERROR_NAMES = frozenset({"HLTVBlockedError", "DemoDownloadBlockedError"})
+
+
 def _is_block_error(exc: BaseException) -> bool:
-    return any(cls.__name__ == "HLTVBlockedError" for cls in type(exc).__mro__)
+    """Recognised by class name so that this package does not have to import the HLTV package."""
+    return any(cls.__name__ in _BLOCK_ERROR_NAMES for cls in type(exc).__mro__)
 
 
 def select_pending_demo_ids(
@@ -226,7 +231,9 @@ def _process_one(
                 with session_factory() as session:
                     demo = session.get(Demo, demo_id)
                     if demo is not None:
-                        demo.status = previous_status if previous_status is DemoStatus.FAILED else DemoStatus.PENDING
+                        demo.status = (
+                            previous_status if previous_status is DemoStatus.FAILED else DemoStatus.PENDING
+                        )
                         demo.attempts = max(0, demo.attempts - 1)
                         session.commit()
                 raise _Blocked(str(exc)) from exc
@@ -256,6 +263,11 @@ def _process_one(
             raise ArchiveError(f"no demo file matches the maps of match {match_id} (files: {names})")
         for extra in sorted(set(dem_paths) - set(assignment.values())):
             report.warnings.append(f"demo {demo_id}: {extra.name} matches no map of match {match_id}")
+        if len(dem_paths) > 1:
+            # A whole-match archive (a per-map download holds a single demo): say which maps it lacks.
+            for number, name, _id in sorted(maps):
+                if number not in assignment:
+                    report.warnings.append(f"demo {demo_id}: no demo file for map {number} ({name})")
 
         map_ids = {number: map_id for number, _name, map_id in maps}
         map_errors: list[str] = []
@@ -304,7 +316,9 @@ def _process_one(
             if demo is not None:
                 demo.status = DemoStatus.FAILED
                 demo.error = message
-                demo.archive_path = str(archive) if archive is not None and settings.demos.keep_archives else None
+                demo.archive_path = (
+                    str(archive) if archive is not None and settings.demos.keep_archives else None
+                )
                 session.commit()
         report.failed += 1
         report.errors.append(f"demo {demo_id}: {message}")

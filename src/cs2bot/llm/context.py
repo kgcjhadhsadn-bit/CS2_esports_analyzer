@@ -18,11 +18,17 @@ Claude API usage (anthropic SDK 2.x)
   ``client.messages.parse`` endpoint is used.
 * Claude Haiku 5.5 (``settings.llm.triage_model``) has no server-side fallback: triage requests never
   carry ``fallbacks`` / ``betas``.
-* ``stop_reason`` is checked before the parsed output is read: ``"refusal"`` and ``"max_tokens"`` both
-  yield an empty result (logged).
+* ``stop_reason`` is checked before the parsed output is read: ``"refusal"`` (its
+  ``stop_details.category`` is logged) and ``"max_tokens"`` both yield an empty result.
+  Caveat of the SDK helper: ``parse()`` validates the response text *inside* the call, so a response
+  whose JSON is incomplete (cut off at ``max_tokens``, or refused after partial output) surfaces as a
+  ``pydantic.ValidationError`` before any ``stop_reason`` can be read. That case is recognised by its
+  ``json_invalid`` error and handled like a truncation (empty result + warning).
 * Errors are caught most-specific-first (``RateLimitError``, ``APIStatusError``,
-  ``APIConnectionError``); the SDK has already retried twice by then. Nothing here raises into the
-  pipeline: every failure degrades to "no flags" / "template rationale".
+  ``APIConnectionError``); the SDK has already retried twice by then. A 4xx other than 429 means the
+  request or the account is the problem (unknown model, changed API, exhausted credit), never the
+  news content, so it is not retried item by item. Nothing here raises into the pipeline: every
+  failure degrades to "no flags" / "template rationale".
 * System prompts are stable and marked cacheable; volatile data lives in the user message.
 
 Disabled mode: ``settings.llm.enabled`` false, or no credentials (neither ``settings.llm.api_key``
@@ -47,11 +53,12 @@ import pydantic
 from cs2bot.config import LLMSettings, Settings
 from cs2bot.domain.betting import BetDecision
 from cs2bot.domain.context import ContextFlag, NewsItemIn
+from cs2bot.domain.enums import ContextFlagType, TeamSlot
 from cs2bot.domain.match import MatchContext
 from cs2bot.domain.predictions import MatchPrediction
 from cs2bot.llm import prompts
 from cs2bot.llm.combine import clip, combine_flags
-from cs2bot.llm.memo import AnalysisMemo, MemoEntry, context_fingerprint
+from cs2bot.llm.memo import AnalysisMemo, MemoEntry, context_fingerprint, rationale_fingerprint
 from cs2bot.llm.rationale import (
     RISK_DISCLAIMER,
     build_rationale_digest,
@@ -76,6 +83,7 @@ from cs2bot.utils.time import ensure_utc, parse_datetime, utcnow
 log = get_logger(__name__)
 
 __all__ = [
+    "ADVERSE_FLAG_TYPES",
     "ContextAnalyzer",
     "LLMStatus",
     "MatchAnalysisOutcome",
@@ -97,6 +105,17 @@ _IRRELEVANT_MAX_RELEVANCE = 0.2
 _NEWS_REF = re.compile(r"^(?:news)?[\s:_#-]*(\d+)$", re.IGNORECASE)
 _CONTEXT_TOKENS = {"context", "match_context", "match context", "match-context"}
 _EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
+# Situations that can only hurt the team they are about (see LLMTuning.enforce_adverse_direction).
+ADVERSE_FLAG_TYPES: frozenset[ContextFlagType] = frozenset(
+    {
+        ContextFlagType.STAND_IN,
+        ContextFlagType.ILLNESS,
+        ContextFlagType.VISA_ISSUE,
+        ContextFlagType.TRAVEL_FATIGUE,
+        ContextFlagType.INTERNAL_CONFLICT,
+        ContextFlagType.FORM_SLUMP,
+    }
+)
 
 
 class LLMStatus(StrEnum):
@@ -105,7 +124,7 @@ class LLMStatus(StrEnum):
     OK = "ok"
     DISABLED = "disabled"  # LLM switched off or no credentials - no call made
     REFUSED = "refused"  # stop_reason == "refusal"
-    TRUNCATED = "truncated"  # stop_reason == "max_tokens"
+    TRUNCATED = "truncated"  # stop_reason == "max_tokens", or the SDK could not parse incomplete JSON
     FAILED = "failed"  # API / connection / validation error
     BACKOFF = "backoff"  # the same inputs failed recently - no call made
 
@@ -169,11 +188,17 @@ class MatchAnalysisOutcome:
 
 @dataclass(frozen=True)
 class RationaleOutcome:
-    """Result of :meth:`ContextAnalyzer.write_rationale_detailed`. ``model`` is None for the template."""
+    """Result of :meth:`ContextAnalyzer.write_rationale_detailed`. ``model`` is None for the template.
+
+    ``from_cache``: the text was written earlier for the same picture (see
+    :func:`cs2bot.llm.memo.rationale_fingerprint`); the numbers it quotes are those of ``written_at``.
+    """
 
     text: str
     status: LLMStatus
     model: str | None = None
+    from_cache: bool = False
+    written_at: datetime | None = None
 
 
 @dataclass(frozen=True)
@@ -183,7 +208,7 @@ class _CallResult:
     model: str | None = None
     detail: str = ""
     content_related: bool = False  # the failure is tied to this request's content (do not just retry)
-    stop_all: bool = False  # further requests are pointless right now (auth failure, rate limit)
+    stop_all: bool = False  # further requests are pointless right now (auth, rate limit, rejected request)
 
 
 def supports_server_fallback(model: str) -> bool:
@@ -257,7 +282,12 @@ def suggestion_to_flag(
     * evidence must point at supplied news items or the match context (anything else is dropped);
     * severity / confidence are clamped to [0, 1], ``logit_shift`` to ``+-max_flag_logit_shift``;
     * a veto below ``tuning.veto_min_confidence`` is demoted to a plain flag (and the rationale says
-      so), so that every consumer of the stored ``veto`` bit agrees with ``combine_flags``.
+      so), so that every consumer of the stored ``veto`` bit agrees with ``combine_flags``
+      (``engine.decision`` blocks a match on any active veto row, whatever its confidence);
+    * direction check (``tuning.enforce_adverse_direction``): for :data:`ADVERSE_FLAG_TYPES` about one
+      team, a shift that would *help* that team is a sign slip - with ``logit_shift`` defined from
+      team1's perspective this is the easiest mistake to make - so it is set to 0 (and the rationale
+      says so) instead of moving the probability the wrong way.
     """
     tune = tuning or LLMTuning()
     evidence = resolve_evidence(suggestion.evidence, evidence_index, limit=tune.max_evidence_items)
@@ -274,17 +304,39 @@ def suggestion_to_flag(
             f"{rationale} [No-bet veto suggested but not enforced: confidence {confidence:.2f} "
             f"is below {tune.veto_min_confidence:.2f}.]"
         ).strip()
+    shift = clip(suggestion.logit_shift, settings.max_flag_logit_shift)
+    if tune.enforce_adverse_direction and _contradicts_direction(
+        suggestion.flag_type, suggestion.team, shift
+    ):
+        log.warning(
+            "context flag %s for %s suggested a shift of %+.3f that favours the affected team - not applied",
+            suggestion.flag_type.value,
+            suggestion.team.value if suggestion.team else None,
+            shift,
+        )
+        shift = 0.0
+        rationale = (
+            f"{rationale} [Adjustment not applied: its direction contradicts a {suggestion.flag_type.value} "
+            "flag about this team.]"
+        ).strip()
     return ContextFlag(
         flag_type=suggestion.flag_type,
         team=suggestion.team,
         severity=clamp01(suggestion.severity),
         confidence=confidence,
-        logit_shift=clip(suggestion.logit_shift, settings.max_flag_logit_shift),
+        logit_shift=shift,
         veto=veto,
         rationale=rationale or "(no rationale given)",
         evidence=evidence,
         expires_at=_parse_expiry(suggestion.expires_at, now),
     )
+
+
+def _contradicts_direction(flag_type: ContextFlagType, team: TeamSlot | None, shift: float) -> bool:
+    """True when an adverse flag about one team carries a shift in that team's favour."""
+    if flag_type not in ADVERSE_FLAG_TYPES or team is None:
+        return False
+    return shift > 0.0 if team is TeamSlot.TEAM1 else shift < 0.0
 
 
 def _strength(flag: ContextFlag) -> tuple[int, float, float]:
@@ -383,9 +435,11 @@ class ContextAnalyzer:
         self._tuning = tuning or LLMTuning()
         self._client: Any | None = client
         self._client_resolved = client is not None
+        self._owns_client = False
         self._auth_failed = False
         self._lock = threading.Lock()
         self.memo = memo if memo is not None else AnalysisMemo(self._tuning.memo_max_entries)
+        self.rationale_memo = AnalysisMemo(self._tuning.memo_max_entries)
         self.usage = UsageTotals()
 
     # -- availability ---------------------------------------------------------------------
@@ -426,7 +480,17 @@ class ContextAnalyzer:
                 _close_quietly(client)
                 return None
             self._client = client
+            self._owns_client = True
             return client
+
+    def close(self) -> None:
+        """Release the HTTP client this analyzer created (an injected client is left alone)."""
+        with self._lock:
+            client, owned = self._client, self._owns_client
+            if owned:
+                self._client, self._client_resolved, self._owns_client = None, False, False
+        if owned and client is not None:
+            _close_quietly(client)
 
     # -- low-level request ----------------------------------------------------------------
 
@@ -481,14 +545,33 @@ class ContextAnalyzer:
             if status_code >= 500:
                 log.warning("Claude %s request failed with server error %s (retryable)", kind, status_code)
                 return _CallResult(LLMStatus.FAILED, detail=f"server_{status_code}")
-            log.error("Claude %s request rejected (HTTP %s): %s", kind, status_code, _brief(exc))
-            return _CallResult(LLMStatus.FAILED, detail=f"http_{status_code}", content_related=True)
+            # Any other 4xx: the request itself or the account is at fault (unknown model, a changed
+            # API, exhausted credit balance) - the same would happen to every other request right now.
+            log.error(
+                "Claude %s request rejected (HTTP %s): %s - check the model names in the LLM settings "
+                "and the Anthropic account",
+                kind,
+                status_code,
+                _brief(exc),
+            )
+            return _CallResult(LLMStatus.FAILED, detail=f"http_{status_code}", stop_all=True)
         except anthropic.APIConnectionError as exc:
             self.usage.failures += 1
             log.warning("Claude %s request failed (%s: connection/timeout)", kind, type(exc).__name__)
             return _CallResult(LLMStatus.FAILED, detail="connection")
         except pydantic.ValidationError as exc:
+            # parse() validates the response text before returning, so the stop reason is out of reach
+            # here. Structured outputs guarantee schema-valid JSON for a *complete* answer; JSON that
+            # does not even parse therefore means the answer was cut short.
             self.usage.failures += 1
+            if _is_incomplete_json(exc):
+                log.warning(
+                    "Claude %s response was not complete JSON - most likely cut off at max_tokens=%d "
+                    "(or refused after partial output); discarded",
+                    kind,
+                    max_tokens,
+                )
+                return _CallResult(LLMStatus.TRUNCATED, detail="incomplete_output", content_related=True)
             log.warning("Claude %s response did not match the schema (%d errors)", kind, exc.error_count())
             return _CallResult(LLMStatus.FAILED, detail="invalid_output", content_related=True)
         except Exception as exc:  # never raise into the pipeline (SDK parsing errors, bad fakes, ...)
@@ -552,7 +635,10 @@ class ContextAnalyzer:
 
         Requests carry ``tuning.triage_batch_size`` items (~20). A batch that is refused, truncated or
         returns invalid output is split in half and retried, so one problematic article cannot block
-        the others. A rate limit or authentication failure stops the remaining batches (deferred).
+        the others. A rate limit, an authentication failure or a rejected request (4xx) stops the
+        remaining batches, and so do ``tuning.triage_max_transient_failures`` consecutive network /
+        server errors (each of those has already cost up to three timed-out attempts inside the SDK);
+        the items left over are reported as deferred and picked up by the next run.
 
         Team ids in the verdicts are restricted to the candidates offered for that item (ids already
         attached to it plus exact name matches from ``known_teams``) and to names the model returned
@@ -577,6 +663,7 @@ class ContextAnalyzer:
             size = max(1, self._tuning.triage_batch_size)
             queue = [order[i : i + size] for i in range(0, len(order), size)]
             stopped = False
+            transient_failures = 0
             while queue:
                 batch_ids = queue.pop(0)
                 if stopped:
@@ -597,6 +684,8 @@ class ContextAnalyzer:
                     output_format=TriageBatch,
                     allow_fallback=False,  # Haiku: never send fallbacks / betas
                 )
+                transient = not (result.status is LLMStatus.OK or result.stop_all or result.content_related)
+                transient_failures = transient_failures + 1 if transient else 0
                 if result.status is LLMStatus.OK:
                     model_used = result.model or model_used
                     answered = self._accept_verdicts(result.parsed, batch_ids, candidates, index, verdicts)
@@ -611,6 +700,7 @@ class ContextAnalyzer:
                     unanswered.extend(batch_ids)
                 else:
                     deferred.extend(batch_ids)
+                    stopped = transient_failures >= max(1, self._tuning.triage_max_transient_failures)
             ordered = [verdicts[nid] for nid in order if nid in verdicts]
             status = LLMStatus.OK if ordered or not (unanswered or deferred) else LLMStatus.FAILED
             if unanswered or deferred:
@@ -692,7 +782,10 @@ class ContextAnalyzer:
         The memo returns the previous result for identical inputs (same news URLs, lineups, veto)
         while it is younger than ``tuning.reanalysis_interval_s`` (``near_start_interval_s`` inside the
         last ``near_start_window_s`` before the start, when "lineup still unknown" becomes urgent).
-        A failed / refused analysis of the same inputs is not retried for ``failure_backoff_s``.
+        After a transient failure the same inputs are not retried for ``failure_backoff_s``; after a
+        refusal or a truncated / invalid answer (tied to the inputs, billed, likely to repeat) not
+        before the re-analysis interval has passed. New news or a lineup change is a new fingerprint
+        and is analysed at once either way.
         """
         current = ensure_utc(now) if now is not None else utcnow()
         fingerprint = ""
@@ -728,7 +821,14 @@ class ContextAnalyzer:
             if result.status is not LLMStatus.OK:
                 if not self._auth_failed:
                     self.memo.put(
-                        MemoEntry(ctx.match_id, fingerprint, current, ok=False, status=result.status.value)
+                        MemoEntry(
+                            ctx.match_id,
+                            fingerprint,
+                            current,
+                            ok=False,
+                            status=result.status.value,
+                            content_related=result.content_related,
+                        )
                     )
                 return MatchAnalysisOutcome(
                     result.status,
@@ -802,7 +902,12 @@ class ContextAnalyzer:
                 n_news=n_news,
                 analyzed_at=entry.analyzed_at,
             )
-        if not entry.ok and age < timedelta(seconds=self._tuning.failure_backoff_s):
+        backoff = (
+            self.reanalysis_interval(ctx, now)
+            if entry.content_related
+            else timedelta(seconds=self._tuning.failure_backoff_s)
+        )
+        if not entry.ok and age < backoff:
             return MatchAnalysisOutcome(
                 LLMStatus.BACKOFF,
                 fingerprint=fingerprint,
@@ -855,20 +960,40 @@ class ContextAnalyzer:
     # -- rationale (Opus) -----------------------------------------------------------------
 
     def write_rationale(
-        self, prediction: MatchPrediction, decisions: list[BetDecision], ctx: MatchContext
+        self,
+        prediction: MatchPrediction,
+        decisions: list[BetDecision],
+        ctx: MatchContext,
+        *,
+        now: datetime | None = None,
     ) -> str:
         """Markdown rationale for the dashboard (the deterministic template when Claude is unavailable)."""
-        return self.write_rationale_detailed(prediction, decisions, ctx).text
+        return self.write_rationale_detailed(prediction, decisions, ctx, now=now).text
 
     def write_rationale_detailed(
-        self, prediction: MatchPrediction, decisions: Sequence[BetDecision], ctx: MatchContext
+        self,
+        prediction: MatchPrediction,
+        decisions: Sequence[BetDecision],
+        ctx: MatchContext,
+        *,
+        now: datetime | None = None,
+        use_memo: bool = True,
     ) -> RationaleOutcome:
         """Like :meth:`write_rationale`, plus the status and the model that wrote the text.
 
         Store ``outcome.model`` in ``match_analyses.rationale_model`` (``None`` = template).
         The text never promises certainty: the prompt forbids it, and a sentence stating that losses
         are possible is appended if the model's text lacks one.
+
+        Cost guard: predictions are refreshed every few minutes, but the story rarely changes. While
+        the picture is the same (:func:`cs2bot.llm.memo.rationale_fingerprint`: same bets, flags, veto
+        state, lineups and probability band) the text written earlier is returned for up to
+        ``tuning.rationale_reuse_interval_s`` (``from_cache=True``; the numbers it quotes are those of
+        ``written_at``). After a failed request the template is returned without a new call for
+        ``failure_backoff_s`` (the reuse interval after a refusal / truncated answer); status
+        ``BACKOFF``. ``use_memo=False`` always asks Claude.
         """
+        current = ensure_utc(now) if now is not None else utcnow()
         try:
             template = render_template_rationale(prediction, decisions, ctx)
         except Exception:  # malformed prediction payload - still return something readable
@@ -878,6 +1003,13 @@ class ContextAnalyzer:
             client = self._get_client()
             if client is None:
                 return RationaleOutcome(template, LLMStatus.DISABLED)
+            fingerprint = rationale_fingerprint(
+                prediction, decisions, ctx, probability_step=self._tuning.rationale_probability_step
+            )
+            if use_memo:
+                cached = self._rationale_from_memo(prediction.match_id, fingerprint, current, template)
+                if cached is not None:
+                    return cached
             digest = build_rationale_digest(
                 prediction, decisions, ctx, max_rejected=self._tuning.rationale_max_rejected
             )
@@ -892,18 +1024,54 @@ class ContextAnalyzer:
                 output_format=RationaleOutput,
                 allow_fallback=True,
             )
-            if result.status is not LLMStatus.OK:
-                return RationaleOutcome(template, result.status)
-            text = finalize_rationale(result.parsed.markdown)
+            text = finalize_rationale(result.parsed.markdown) if result.status is LLMStatus.OK else ""
             if not text:
-                log.warning(
-                    "Claude returned an empty rationale for match %s - using the template", ctx.match_id
-                )
-                return RationaleOutcome(template, LLMStatus.FAILED)
-            return RationaleOutcome(text, LLMStatus.OK, result.model)
+                status = result.status
+                if status is LLMStatus.OK:
+                    log.warning(
+                        "Claude returned an empty rationale for match %s - using the template", ctx.match_id
+                    )
+                    status = LLMStatus.FAILED
+                if not self._auth_failed:
+                    self.rationale_memo.put(
+                        MemoEntry(
+                            prediction.match_id,
+                            fingerprint,
+                            current,
+                            ok=False,
+                            status=status.value,
+                            content_related=result.content_related or result.status is LLMStatus.OK,
+                        )
+                    )
+                return RationaleOutcome(template, status)
+            self.rationale_memo.put(
+                MemoEntry(prediction.match_id, fingerprint, current, ok=True, note=text, model=result.model)
+            )
+            return RationaleOutcome(text, LLMStatus.OK, result.model, written_at=current)
         except Exception:  # defensive: the rationale is cosmetic and must never break a bet run
             log.exception("rationale generation failed unexpectedly for match %s", prediction.match_id)
             return RationaleOutcome(template, LLMStatus.FAILED)
+
+    def _rationale_from_memo(
+        self, match_id: int, fingerprint: str, now: datetime, template: str
+    ) -> RationaleOutcome | None:
+        entry = self.rationale_memo.lookup(match_id, fingerprint)
+        if entry is None:
+            return None
+        age = now - entry.analyzed_at
+        if age < timedelta(0):
+            return None
+        reuse = timedelta(seconds=self._tuning.rationale_reuse_interval_s)
+        if entry.ok:
+            if age < reuse and entry.note:
+                return RationaleOutcome(
+                    entry.note, LLMStatus.OK, entry.model, from_cache=True, written_at=entry.analyzed_at
+                )
+            return None
+        backoff = reuse if entry.content_related else timedelta(seconds=self._tuning.failure_backoff_s)
+        if age < backoff:
+            return RationaleOutcome(template, LLMStatus.BACKOFF, from_cache=True)
+        return None
 
 
 # ---------------------------------------------------------------------------------------------
@@ -921,6 +1089,14 @@ def _close_quietly(client: Any) -> None:
         client.close()
     except Exception:  # pragma: no cover - best effort
         return
+
+
+def _is_incomplete_json(exc: pydantic.ValidationError) -> bool:
+    """Whether the SDK failed on JSON *syntax* (a cut-off answer) rather than on schema content."""
+    try:
+        return any(error.get("type") == "json_invalid" for error in exc.errors(include_url=False))
+    except Exception:  # pragma: no cover - error introspection must never be the thing that raises
+        return False
 
 
 def _brief(exc: Exception) -> str:

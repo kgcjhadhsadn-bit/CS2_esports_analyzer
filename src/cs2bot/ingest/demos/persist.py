@@ -44,7 +44,7 @@ from cs2bot.ingest.demos._values import records, to_bool, to_float, to_int, to_s
 from cs2bot.ingest.demos.errors import DemoPersistError
 from cs2bot.ingest.demos.parse import ParsedDemo
 from cs2bot.utils.logging import get_logger
-from cs2bot.utils.names import normalize_player_name, team_name_similarity
+from cs2bot.utils.names import normalize_map_name, normalize_player_name, team_name_similarity
 from cs2bot.utils.time import utcnow
 
 log = get_logger(__name__)
@@ -163,16 +163,19 @@ def resolve_steamids(session: Session, match_id: int, parsed: ParsedDemo) -> dic
         for steamid in known_steamids(player):
             by_steamid.setdefault(steamid, player_id)
     for steamid, name, _roster in demo_players:
-        player_id = by_steamid.get(steamid)
-        if player_id is None or player_id in taken:
+        owner_id = by_steamid.get(steamid)
+        if owner_id is None or owner_id in taken:
             continue
         exact = nick_exact.get(normalize_player_name(name), []) if name else []
-        if exact and player_id not in exact:
+        if exact and owner_id not in exact:
             log.warning(
-                "steam id %s is stored for player %s but is used by '%s' in this demo", steamid, player_id, name
+                "steam id %s is stored for player %s but is used by '%s' in this demo",
+                steamid,
+                owner_id,
+                name,
             )
             continue
-        assign(steamid, player_id, learn=False)
+        assign(steamid, owner_id, learn=False)
 
     # 2) exact nickname
     for steamid, name, _roster in demo_players:
@@ -188,7 +191,11 @@ def resolve_steamids(session: Session, match_id: int, parsed: ParsedDemo) -> dic
         if steamid in result or not name:
             continue
         options = sorted(
-            ((name_similarity(name, player.nickname), pid) for pid, (player, _t) in candidates.items() if pid not in taken),
+            (
+                (name_similarity(name, player.nickname), pid)
+                for pid, (player, _t) in candidates.items()
+                if pid not in taken
+            ),
             reverse=True,
         )
         if not options or options[0][0] < MIN_NAME_SIMILARITY:
@@ -344,6 +351,9 @@ def persist_parsed_demo(
     rewritten, so the call is idempotent. Steam ids missing from ``steamid_to_player_id`` become
     ``NULL`` player ids on kills and are skipped for per-player rows (those need a player). The
     session is flushed, not committed. A summary is written to ``maps_played.extra["demo"]``.
+
+    Raises :class:`DemoPersistError` - before anything is deleted - when the map row is missing, the
+    demo is of another map, has no rounds, or it cannot be told which demo roster is team1.
     """
     map_played = session.get(MapPlayed, map_played_id)
     if map_played is None:
@@ -354,13 +364,19 @@ def persist_parsed_demo(
     round_rows = records(parsed.rounds)
     if not round_rows:
         raise DemoPersistError(f"map {map_played_id}: the parsed demo has no rounds")
+    if parsed.map_name and normalize_map_name(map_played.map_name) != normalize_map_name(parsed.map_name):
+        raise DemoPersistError(
+            f"map {map_played_id} is {map_played.map_name!r} but the demo was played on {parsed.map_name!r}"
+        )
     team1_roster, method = determine_team1_roster(session, match, map_played, parsed, steamid_to_player_id)
     team_of_roster = {team1_roster: match.team1_id, _other(team1_roster): match.team2_id}
     warnings = list(parsed.warnings)
 
     for model in (Round, Kill, PlayerRoundStats, PlayerPositionSample):
         session.execute(
-            delete(model).where(model.map_played_id == map_played_id).execution_options(synchronize_session=False)
+            delete(model)
+            .where(model.map_played_id == map_played_id)
+            .execution_options(synchronize_session="fetch")
         )
 
     def player_id(raw: Any) -> int | None:
@@ -374,7 +390,9 @@ def persist_parsed_demo(
         winner_side = _enum_or_none(Side, row.get("winner_side"))
         ct_roster = to_str(row.get("ct_roster"))
         if number is None or winner_side is None or ct_roster not in ("a", "b") or number in seen_rounds:
-            warnings.append(f"round row skipped (number={number}, winner={winner_side}, ct_roster={ct_roster})")
+            warnings.append(
+                f"round row skipped (number={number}, winner={winner_side}, ct_roster={ct_roster})"
+            )
             continue
         seen_rounds.add(number)
         team1_side = Side.CT if ct_roster == team1_roster else Side.T

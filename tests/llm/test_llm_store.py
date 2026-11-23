@@ -47,9 +47,13 @@ def _rows(session: Session) -> list[ContextFlagRow]:
 def test_flags_round_trip(session: Session) -> None:
     seed_match(session)
     flags = [
-        make_flag(team=TeamSlot.TEAM2, logit_shift=0.12, confidence=0.8, expires_at=NOW + timedelta(hours=40)),
+        make_flag(
+            team=TeamSlot.TEAM2, logit_shift=0.12, confidence=0.8, expires_at=NOW + timedelta(hours=40)
+        ),
         make_flag(flag_type=ContextFlagType.ILLNESS, team=TeamSlot.TEAM1, logit_shift=-0.05, severity=0.3),
-        make_flag(flag_type=ContextFlagType.OTHER, team=None, veto=True, logit_shift=0.0, evidence=["context"]),
+        make_flag(
+            flag_type=ContextFlagType.OTHER, team=None, veto=True, logit_shift=0.0, evidence=["context"]
+        ),
     ]
     rows = persist_flags(session, 10, flags, model="claude-opus-5-5", team_ids=TEAMS, now=NOW)
 
@@ -57,7 +61,9 @@ def test_flags_round_trip(session: Session) -> None:
     assert all(r.active and r.model == "claude-opus-5-5" and r.created_at == NOW for r in rows)
     loaded = load_active_flags(session, 10, now=NOW)
     assert loaded == flags
-    assert combine_flags(loaded, make_settings().llm, now=NOW) == combine_flags(flags, make_settings().llm, now=NOW)
+    assert combine_flags(loaded, make_settings().llm, now=NOW) == combine_flags(
+        flags, make_settings().llm, now=NOW
+    )
 
 
 def test_persist_replaces_previous_active_flags(session: Session) -> None:
@@ -75,7 +81,9 @@ def test_persist_is_idempotent_for_identical_flags(session: Session) -> None:
     seed_match(session)
     flags = [make_flag(expires_at=NOW + timedelta(hours=3)), make_flag(flag_type=ContextFlagType.BOOTCAMP)]
     first = persist_flags(session, 10, flags, model="m1", team_ids=TEAMS, now=NOW)
-    second = persist_flags(session, 10, list(reversed(flags)), model="m1", team_ids=TEAMS, now=NOW + timedelta(hours=1))
+    second = persist_flags(
+        session, 10, list(reversed(flags)), model="m1", team_ids=TEAMS, now=NOW + timedelta(hours=1)
+    )
     assert [r.id for r in second] == [r.id for r in first]
     assert len(_rows(session)) == 2 and all(r.created_at == NOW for r in _rows(session))
     # A different model (e.g. a fallback served the request) is recorded as a new generation.
@@ -107,7 +115,9 @@ def test_load_skips_expired_flags_with_the_combine_rule(session: Session) -> Non
 def test_load_handles_unknown_match_foreign_team_and_long_model(session: Session) -> None:
     seed_match(session)
     assert load_active_flags(session, 999, now=NOW) == []
-    persist_flags(session, 10, [make_flag(team=TeamSlot.TEAM1)], model="x" * 100, team_ids=(3, TEAM2_ID), now=NOW)
+    persist_flags(
+        session, 10, [make_flag(team=TeamSlot.TEAM1)], model="x" * 100, team_ids=(3, TEAM2_ID), now=NOW
+    )
     row = _rows(session)[0]
     assert row.team_id == 3 and row.model is not None and len(row.model) == 64
     assert load_active_flags(session, 10, now=NOW)[0].team is None  # team 3 does not play match 10
@@ -120,7 +130,9 @@ def test_flags_of_other_matches_are_untouched(session: Session) -> None:
     seed_match(session)
     session.add(Match(id=11, team1_id=TEAM2_ID, team2_id=TEAM1_ID, format=MatchFormat.BO1))
     session.flush()
-    persist_flags(session, 11, [make_flag(team=TeamSlot.TEAM1)], model="m", team_ids=(TEAM2_ID, TEAM1_ID), now=NOW)
+    persist_flags(
+        session, 11, [make_flag(team=TeamSlot.TEAM1)], model="m", team_ids=(TEAM2_ID, TEAM1_ID), now=NOW
+    )
     persist_flags(session, 10, [], model="m", team_ids=TEAMS, now=NOW)
     other = load_active_flags(session, 11, now=NOW)
     assert len(other) == 1 and other[0].team is TeamSlot.TEAM1
@@ -130,7 +142,9 @@ def test_persisted_veto_is_seen_by_the_decision_engine(session: Session) -> None
     from cs2bot.engine.decision import load_match_decision_info
 
     seed_match(session)
-    persist_flags(session, 10, [make_flag(veto=True, rationale="forfeit risk")], model="m", team_ids=TEAMS, now=NOW)
+    persist_flags(
+        session, 10, [make_flag(veto=True, rationale="forfeit risk")], model="m", team_ids=TEAMS, now=NOW
+    )
     info = load_match_decision_info(session, match_id=10, now=NOW)
     assert info.context_veto and "forfeit risk" in (info.context_veto_reason or "")
     persist_flags(session, 10, [], model="m", team_ids=TEAMS, now=NOW)
@@ -165,6 +179,7 @@ def test_store_triage_sets_fields_and_merges_teams(session: Session) -> None:
     assert stored.extra["llm"]["triage"] == {
         "summary": "Bravo Foxes arrive late.",
         "team_names": ["Bravo Foxes"],
+        "team_ids": [TEAM2_ID],
         "model": "claude-haiku-5-5",
     }
 
@@ -203,7 +218,9 @@ def test_select_news_filters_by_mention_relevance_and_recency(session: Session) 
     add_news(session, 3, title="other team", team_ids=[3], label="stand_in", relevance=0.9)
     add_news(session, 4, title="irrelevant label", team_ids=[TEAM1_ID], label="irrelevant", relevance=0.9)
     add_news(session, 5, title="low relevance", team_ids=[TEAM1_ID], label="bootcamp", relevance=0.1)
-    add_news(session, 6, title="too old", team_ids=[TEAM1_ID], label="stand_in", relevance=0.9, hours_ago=15 * 24)
+    add_news(
+        session, 6, title="too old", team_ids=[TEAM1_ID], label="stand_in", relevance=0.9, hours_ago=15 * 24
+    )
     add_news(session, 7, title="untriaged", team_ids=[TEAM1_ID])
     add_news(session, 8, title="unrelated player", player_ids=[999], label="stand_in", relevance=0.9)
 
@@ -213,7 +230,9 @@ def test_select_news_filters_by_mention_relevance_and_recency(session: Session) 
         "team2 relevant",
         "player relevant",
     ]
-    assert "low relevance" in _titles(select_news_for_match(session, ctx, limit=25, now=NOW, min_relevance=0.05))
+    assert "low relevance" in _titles(
+        select_news_for_match(session, ctx, limit=25, now=NOW, min_relevance=0.05)
+    )
     assert "too old" in _titles(select_news_for_match(session, ctx, days=30, limit=25, now=NOW))
 
 
@@ -222,7 +241,10 @@ def test_select_news_never_looks_ahead(session: Session) -> None:
     add_news(session, 1, title="known", team_ids=[TEAM1_ID], label="stand_in", relevance=0.9, hours_ago=5)
     add_news(session, 2, title="future", team_ids=[TEAM1_ID], label="stand_in", relevance=0.9, hours_ago=-2)
     assert _titles(select_news_for_match(session, ctx, limit=25, now=NOW)) == ["known"]
-    assert _titles(select_news_for_match(session, ctx, limit=25, now=NOW + timedelta(hours=3))) == ["known", "future"]
+    assert _titles(select_news_for_match(session, ctx, limit=25, now=NOW + timedelta(hours=3))) == [
+        "known",
+        "future",
+    ]
     assert select_news_for_match(session, ctx, limit=25, now=NOW - timedelta(hours=6)) == []
 
 
@@ -254,7 +276,12 @@ def test_select_news_adds_a_few_global_meta_items(session: Session) -> None:
     add_news(session, 6, title="format news", label="tournament_format", relevance=0.9, hours_ago=3)
     add_news(session, 7, title="weak patch", label="meta_patch", relevance=0.1, hours_ago=2)
 
-    assert _titles(select_news_for_match(session, ctx, limit=25, now=NOW)) == ["patch 3", "patch 4", "patch 5", "team"]
+    assert _titles(select_news_for_match(session, ctx, limit=25, now=NOW)) == [
+        "patch 3",
+        "patch 4",
+        "patch 5",
+        "team",
+    ]
     assert _titles(select_news_for_match(session, ctx, limit=25, now=NOW, max_global=0)) == ["team"]
     assert _titles(select_news_for_match(session, ctx, limit=2, now=NOW, max_global=1)) == ["patch 5", "team"]
 
@@ -279,3 +306,21 @@ def test_news_row_to_input_falls_back_to_the_lead(session: Session) -> None:
     item = news_row_to_input(row)
     assert item.body == "Short lead." and item.url == row.url and item.published_at == row.published_at
     assert news_row_to_input(add_news(session, 2, body=None)).body is None
+
+
+def test_select_news_still_finds_triage_teams_after_the_scraper_rewrites_team_ids(session: Session) -> None:
+    """The HLTV sync overwrites ``team_ids`` when it refreshes an article; the verdict's ids survive."""
+    ctx = seed_match(session)
+    row = add_news(session, 1, title="visa trouble", team_ids=[])
+    verdict = triage_item(row.id, label=TriageLabel.VISA_TRAVEL, relevance=0.8, team_ids=[TEAM2_ID])
+    store_triage(session, row.id, verdict, now=NOW)
+    assert _titles(select_news_for_match(session, ctx, limit=25, now=NOW)) == ["visa trouble"]
+
+    row.team_ids = []  # what a refresh by the scraper does when its own detection finds nothing
+    session.flush()
+    session.expire_all()
+    assert _titles(select_news_for_match(session, ctx, limit=25, now=NOW)) == ["visa trouble"]
+
+    row.extra = {"llm": {"triage": "corrupted"}}  # malformed section: ignored, not fatal
+    session.flush()
+    assert select_news_for_match(session, ctx, limit=25, now=NOW) == []

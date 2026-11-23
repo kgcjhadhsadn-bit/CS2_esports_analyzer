@@ -138,7 +138,10 @@ team1, negative values favour team2 - so a problem for team1 is negative and a p
 positive, whichever team the flag is about. It must stay within -{max_shift} and +{max_shift}; larger \
 values are clipped. As a guide, 0.05 is a slight effect, 0.10 a moderate one, and {max_shift} the \
 largest effect you can express (at even odds, 0.10 is about 2.5 percentage points). Use 0 for flags \
-that are informational or whose direction is unclear.
+that are informational or whose direction is unclear. A stand_in, illness, visa_issue, travel_fatigue, \
+internal_conflict or form_slump flag about one team can only count against that team: the code \
+discards an adjustment that points the other way. If a change makes a team stronger, report it as \
+roster_change or other.
 - veto: true only for extreme situations in which no bet should be placed on this match at all: a \
 lineup that is still unknown or disputed within hours of the start, a real risk of forfeit or walkover, \
 match-fixing or integrity allegations involving the match or a participant, or server and technical \

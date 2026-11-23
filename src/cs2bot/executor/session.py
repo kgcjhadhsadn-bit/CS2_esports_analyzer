@@ -23,7 +23,7 @@ from playwright.sync_api import BrowserContext, Page, Playwright, sync_playwrigh
 
 from cs2bot.config import Settings
 from cs2bot.executor.base import BrowserStartError, ExecutorThreadError
-from cs2bot.executor.lock import ProfileLock
+from cs2bot.executor.lock import ProfileLock, ProfileLockedError
 from cs2bot.executor.tuning import ExecutorTuning
 from cs2bot.utils.logging import get_logger
 from cs2bot.utils.paths import resolve_path
@@ -136,6 +136,23 @@ class BrowserSession:
         self._start()
         assert self._page is not None
         return self._page
+
+    def ensure_lock(self) -> None:
+        """Make sure the profile lock is still ours; raise :class:`ProfileLockedError` otherwise.
+
+        The lock can be lost while the browser runs (another process broke it as stale after this PC
+        slept, or the file was deleted). A deleted lock is simply taken again. If another process holds
+        it now, two bots would share one logged-in profile: our browser is closed and the error raised,
+        so nothing that moves money continues on this side.
+        """
+        if self.lock.verify():
+            return
+        log.error("the browser-profile lock %s was lost - trying to take it again", self.lock.path)
+        try:
+            self.lock.acquire()
+        except ProfileLockedError:
+            self._close_context()
+            raise
 
     # ------------------------------------------------------------------ lifecycle
 

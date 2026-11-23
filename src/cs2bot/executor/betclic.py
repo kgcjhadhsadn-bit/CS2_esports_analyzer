@@ -3,17 +3,23 @@
 The owner logs in by hand once (incl. SMS / 2FA) via :meth:`BetclicExecutor.open_login_window`; the
 profile keeps the session. :meth:`BetclicExecutor.place` then places single pre-match bets:
 
+0. the idempotency key was already clicked (this process or the placement journal) -> ``UNCERTAIN``
 1. halt check (kill switch / pause)                -> ``KILL_SWITCH``
 2. open the event page (``order.event_url`` or find the event on the CS2 listing by its id)
 3. logged in?                                      -> ``LOGIN_REQUIRED``
 4. clear stale bet-slip selections
 5. find the market and the selection by normalised name (ids only disambiguate; never guess)
-6. read the displayed odds (``"1,85"``); below ``min_acceptable_odds`` -> ``ODDS_MOVED``
-7. click the selection; the slip must hold exactly that one selection with acceptable odds
-8. type the stake Polish-style (``"12,50"``) and verify the field
+6. read the displayed odds (``"1,85"``); below ``min_acceptable_odds`` (or implausibly far above the
+   requested odds) -> ``ODDS_MOVED``; after the human-like pause the chosen elements are read AGAIN
+   (they are addressed by position, and a live page may re-render) before the click
+7. click the selection; the slip must hold exactly that one selection (hidden ones count), showing the
+   ordered selection and market, with acceptable odds
+8. type the stake Polish-style (``"12,50"``) and verify the field; when the slip shows a potential win
+   it must be consistent with stake x odds
 9. dry run -> screenshot, clear the slip, ``DRY_RUN_OK`` (the final button is never clicked)
-10. re-read the slip (still one selection, odds still >= minimum), then the halt check again,
-    immediately before the click
+10. re-read the slip (still one selection, odds still acceptable, stake field still equal to the order
+    stake), make sure the button is clickable, write the write-ahead journal record, then the halt
+    check again, immediately before the click
 11. click "Postaw zakład"; handle the odds-changed dialog (accept only at >= min odds); wait for the
     receipt (bet id, new balance) -> ``PLACED``; known errors -> their status; anything unclear after the
     click -> ``UNCERTAIN`` (never retried; reconcile via :meth:`BetclicExecutor.fetch_bet_history`).
@@ -23,6 +29,10 @@ resolve aborts with ``SELECTOR_ERROR`` (plus screenshot and page HTML) before an
 Real bets need BOTH ``order.dry_run`` and ``settings.executor.dry_run`` to be false. Each attempt is
 screenshotted into ``settings.executor.screenshot_dir``. No stealth / anti-detection tricks: a real,
 visible Chromium with random human-like pauses and a minimum gap between bets.
+
+Never twice: a key whose final button was clicked with a ``PLACED`` / ``UNCERTAIN`` outcome is refused
+from then on - also after a restart or crash, through the write-ahead
+:class:`~cs2bot.executor.journal.PlacementJournal` kept in the browser-profile directory.
 
 Not thread-safe: use one thread (or :class:`~cs2bot.executor.threaded.ThreadBoundExecutor`).
 """
@@ -60,6 +70,7 @@ from cs2bot.executor.base import (
     HaltCheck,
     LoginRequiredError,
 )
+from cs2bot.executor.journal import JOURNAL_FILENAME, JournalError, PlacementJournal
 from cs2bot.executor.lock import ProfileLockedError
 from cs2bot.executor.matching import Candidate, MatchKind, pick_candidate
 from cs2bot.executor.safety import HumanPacer
@@ -83,9 +94,12 @@ from cs2bot.utils.time import ensure_utc, utcnow
 
 log = get_logger(__name__)
 
-# Order matters: the first matching category wins.
-ERROR_CATEGORY_ORDER: tuple[str, ...] = (
+# Classification order of bet-slip messages (``texts`` section): the first matching category wins.
+# "ignore" = harmless notices, "pending" = keep waiting, "bet_accepted" = confirmation.
+MESSAGE_CATEGORY_ORDER: tuple[str, ...] = (
+    "ignore",
     "pending",
+    "bet_accepted",
     "insufficient_balance",
     "stake_limit",
     "odds_changed",
@@ -107,6 +121,18 @@ HISTORY_STATUS_ORDER: tuple[tuple[str, BookmakerBetStatus], ...] = (
     ("history_status_lost", BookmakerBetStatus.LOST),
     ("history_status_won", BookmakerBetStatus.WON),
     ("history_status_open", BookmakerBetStatus.OPEN),
+)
+# After the final click only these statuses mean "definitely no bet"; anything else that is not PLACED
+# is reported as UNCERTAIN (never retried automatically).
+POST_CLICK_DEFINITE: frozenset[PlacementStatus] = frozenset(
+    {
+        PlacementStatus.INSUFFICIENT_BALANCE,
+        PlacementStatus.REJECTED_BY_BOOKMAKER,
+        PlacementStatus.ODDS_MOVED,
+        PlacementStatus.MARKET_UNAVAILABLE,
+        PlacementStatus.LOGIN_REQUIRED,
+        PlacementStatus.KILL_SWITCH,
+    }
 )
 DEFAULT_LOCKED_CLASSES = ("is-locked", "is-disabled", "is-suspended", "disabled", "locked")
 _BET_ID_TOKEN = re.compile(r"[A-Za-z0-9][A-Za-z0-9-]{3,}")
@@ -143,6 +169,7 @@ class _Abort(Exception):
 class _Attempt:
     order: BetOrder
     dry_run: bool
+    journaled: bool = False  # the write-ahead "click" record exists (set right before the final click)
     place_clicked: bool = False
     odds: Decimal | None = None  # latest known odds of the selection
 
@@ -162,7 +189,7 @@ class BetclicExecutor:
         rng: random.Random | None = None,
     ) -> None:
         self.settings = settings
-        self.tuning = tuning or ExecutorTuning()
+        self.tuning = tuning if tuning is not None else ExecutorTuning.from_settings(settings)
         self.selectors = selectors if selectors is not None else load_selectors(settings=settings)
         self._halt_check = halt_check
         self._pacer = HumanPacer(
@@ -176,6 +203,10 @@ class BetclicExecutor:
         self._base_url = settings.betclic.base_url.rstrip("/")
         self._base_host = _host_key(urlsplit(self._base_url).netloc)
         self._attempted: dict[str, PlacementStatus] = {}  # keys whose final click may have placed a bet
+        self._journal = PlacementJournal(
+            self._session.profile_dir / JOURNAL_FILENAME, retention_days=self.tuning.journal_retention_days
+        )
+        self._journal.compact()  # best effort, never raises
         self._last_attempt_end: float | None = None
         self._closed = False
 
@@ -209,22 +240,17 @@ class BetclicExecutor:
         problem = self._validate_order(order)
         if problem is not None:
             return self._result(attempt, PlacementStatus.FAILED, problem, take_screenshot=False)
-        previous = self._attempted.get(order.idempotency_key)
-        if previous is not None:
-            return self._result(
-                attempt,
-                PlacementStatus.UNCERTAIN,
-                f"refusing to place twice: the place button was already clicked for idempotency key "
-                f"{order.idempotency_key!r} (previous result {previous.value}); reconcile via bet history",
-                take_screenshot=False,
-            )
+        refusal = self._refuse_if_already_clicked(attempt)
+        if refusal is not None:
+            return refusal
+        halted, reason = self._halted()
+        if halted:  # checked before the pacing gap: a halted bot answers at once
+            return self._result(attempt, PlacementStatus.KILL_SWITCH, f"trading halted: {reason}")
         self._respect_min_gap()
         try:
-            halted, reason = self._halted()
-            if halted:
-                return self._result(attempt, PlacementStatus.KILL_SWITCH, f"trading halted: {reason}")
             try:
                 page = self._session.ensure_page()
+                self._session.ensure_lock()
             except (BrowserStartError, ProfileLockedError) as exc:
                 return self._result(attempt, PlacementStatus.FAILED, str(exc), take_screenshot=False)
             try:
@@ -377,6 +403,10 @@ class BetclicExecutor:
             problems.append(f"browser error: {_short_error(exc)}")
         except (ValueError, ExecutorError) as exc:  # e.g. a misconfigured listing URL
             problems.append(f"configuration: {exc}")
+        try:
+            self._journal.entries()
+        except JournalError as exc:  # real bets are refused while the journal cannot be read
+            problems.append(str(exc))
         ok = not problems and logged_in is True and balance is not None
         return ExecutorHealth(
             ok=ok,
@@ -417,7 +447,7 @@ class BetclicExecutor:
             for row in rows[parsed:]:
                 try:
                     record = self._parse_history_row(row, now)
-                except PlaywrightError as exc:
+                except (PlaywrightError, ValueError) as exc:  # one bad row must not lose the others
                     log.warning("skipping unreadable bet-history row: %s", _short_error(exc))
                     continue
                 if record is not None:
@@ -432,11 +462,15 @@ class BetclicExecutor:
             self._pacer.pause(0.5)
             more.first.click()
             deadline = time.monotonic() + t.slip_update_timeout_s
-            while time.monotonic() < deadline:
+            grew = False
+            while time.monotonic() < deadline and not grew:
                 now_rows = self.selectors.probe(page, "history_item")
-                if now_rows is not None and now_rows.count > parsed:
-                    break
-                page.wait_for_timeout(t.poll_interval_s * 1000)
+                grew = now_rows is not None and now_rows.count > parsed
+                if not grew:
+                    page.wait_for_timeout(t.poll_interval_s * 1000)
+            if not grew:  # nothing more was loaded: do not keep clicking
+                log.info("bet history: 'load more' added no rows; stopping at %d row(s)", parsed)
+                break
         return [r for r in records if r.placed_at is None or r.placed_at >= since_utc]
 
     def close(self) -> None:
@@ -473,24 +507,22 @@ class BetclicExecutor:
             )
         displayed = self._read_selection_odds(selection)
         attempt.odds = displayed
-        if displayed < order.min_acceptable_odds:
-            raise _Abort(
-                PlacementStatus.ODDS_MOVED,
-                f"displayed odds {displayed} are below the minimum acceptable {order.min_acceptable_odds} "
-                f"(requested {order.requested_odds})",
-            )
+        self._require_acceptable_odds(displayed, order, "displayed odds")
 
         self._pacer.pause()
+        # ``market`` / ``selection`` address elements by POSITION. While we paused, a live page may have
+        # re-rendered (a market added, removed or suspended above ours), so the same position can now be
+        # another market's outcome with the same name. Read everything again right before the click.
+        displayed = self._confirm_pick(market, selection, order)
+        attempt.odds = displayed
+        self._require_acceptable_odds(displayed, order, "displayed odds")
         selection.click()
         slip_odds = self._verify_slip_single(page, order, displayed)
         attempt.odds = slip_odds
-        if slip_odds < order.min_acceptable_odds:
-            raise _Abort(
-                PlacementStatus.ODDS_MOVED,
-                f"bet-slip odds {slip_odds} are below the minimum acceptable {order.min_acceptable_odds}",
-            )
+        self._require_acceptable_odds(slip_odds, order, "bet-slip odds")
         self._enter_stake(page, order.stake)
-        self._raise_if_slip_error(page, after_click=False)
+        self._raise_if_slip_message(page)
+        self._check_potential_win(page, order, slip_odds, wait=True)
 
         if attempt.dry_run:
             shot = self._screenshot(attempt, PlacementStatus.DRY_RUN_OK)
@@ -506,14 +538,15 @@ class BetclicExecutor:
             )
 
         self._dismiss_stale_receipt(page, strict=True)
-        button = self.selectors.resolve(page, "slip_place_button", t.element_timeout_s).first
+        button = self._resolve_single(page, "slip_place_button")
         if not button.is_enabled():
-            self._raise_if_slip_error(page, after_click=False)
+            self._raise_if_slip_message(page)
             raise _Abort(
                 PlacementStatus.SELECTOR_ERROR, "the place-bet button is disabled and no error is shown"
             )
         self._pacer.pause()
-        # The slip may have changed silently while we typed/paused (odds update without a dialog).
+        # The slip may have changed silently while we typed/paused (odds update without a dialog, a
+        # re-render resetting the stake, a late stale selection): verify all of it again.
         current = self._read_slip_odds(page)
         if current is None:
             raise _Abort(
@@ -521,21 +554,107 @@ class BetclicExecutor:
                 "the bet slip changed before confirming (expected one selection with readable odds)",
                 dump_html=True,
             )
-        if current < order.min_acceptable_odds:
-            raise _Abort(
-                PlacementStatus.ODDS_MOVED,
-                f"bet-slip odds dropped to {current} (below {order.min_acceptable_odds}) before confirming",
-            )
+        self._require_acceptable_odds(current, order, "bet-slip odds right before confirming")
         if current != slip_odds:
             log.info("bet-slip odds changed from %s to %s before confirming", slip_odds, current)
             slip_odds = attempt.odds = current
+        self._verify_stake_field(page, order.stake)
+        self._check_potential_win(page, order, slip_odds, wait=False)
+        self._raise_if_slip_message(page)
+        self._ensure_clickable(button)
+        self._journal_click(attempt)  # write-ahead: durable BEFORE the click, or no click at all
         halted, reason = self._halted()  # immediately before the click (after the human-like pause)
         if halted:
             raise _Abort(PlacementStatus.KILL_SWITCH, f"trading halted right before confirming: {reason}")
         attempt.place_clicked = True  # set BEFORE the click: a failing click must count as "maybe placed"
         log.info("clicking 'Postaw zakład' for bet_id=%s key=%s", order.bet_id, order.idempotency_key)
-        button.click()
+        self._click_place_button(button)
         return self._await_outcome(page, attempt, slip_odds, pre_balance)
+
+    def _click_place_button(self, button: Locator) -> None:
+        """The only place where "Postaw zakład" is clicked (never reached in dry-run mode)."""
+        button.click()
+
+    def _ensure_clickable(self, button: Locator) -> None:
+        """Actionability check WITHOUT clicking (Playwright ``trial``): visible, stable, enabled, not
+        covered. A button that cannot be clicked is a definite "nothing happened", not an UNCERTAIN."""
+        timeout_s = min(self.tuning.action_timeout_s, self.tuning.element_timeout_s)
+        try:
+            button.click(trial=True, timeout=timeout_s * 1000)
+        except PlaywrightError as exc:
+            raise _Abort(
+                PlacementStatus.SELECTOR_ERROR,
+                f"the place-bet button is not clickable (covered by a popup, moving or disabled): "
+                f"{_short_error(exc)}; nothing was clicked",
+                dump_html=True,
+            ) from None
+
+    def _journal_click(self, attempt: _Attempt) -> None:
+        """Record the imminent final click durably; without the record the button is not clicked."""
+        order = attempt.order
+        try:
+            self._journal.record_click(order.idempotency_key, order.bet_id)
+        except JournalError as exc:
+            raise _Abort(
+                PlacementStatus.FAILED,
+                f"{exc}; refusing to click 'Postaw zakład' without a durable record of the attempt",
+            ) from None
+        attempt.journaled = True
+        self._attempted[order.idempotency_key] = PlacementStatus.UNCERTAIN
+
+    def _refuse_if_already_clicked(self, attempt: _Attempt) -> PlacementResult | None:
+        """``UNCERTAIN`` (without touching the page) if the final button was already clicked for this key.
+
+        Checks this process's memory and the placement journal (earlier runs, crashes). An unreadable
+        journal refuses real bets (``FAILED``). Dry runs never click the final button, so they are never
+        refused here.
+        """
+        if attempt.dry_run:
+            return None
+        key = attempt.order.idempotency_key
+        previous = self._attempted.get(key)
+        detail = f"previous result {previous.value}" if previous is not None else None
+        if detail is None:
+            try:
+                entry = self._journal.blocking_entry(key)
+            except JournalError as exc:
+                return self._result(
+                    attempt,
+                    PlacementStatus.FAILED,
+                    f"{exc}; refusing to place real bets without the placement journal",
+                    take_screenshot=False,
+                )
+            if entry is None:
+                return None
+            outcome = entry.status or "unknown - the bot stopped right after the click"
+            detail = f"journal: clicked at {entry.at:%Y-%m-%d %H:%M:%S}Z, result {outcome}"
+        return self._result(
+            attempt,
+            PlacementStatus.UNCERTAIN,
+            f"refusing to place twice: the place button was already clicked for idempotency key "
+            f"{key!r} ({detail}); reconcile via bet history",
+            take_screenshot=False,
+        )
+
+    def _odds_problem(self, odds: Decimal, order: BetOrder) -> str | None:
+        """Why ``odds`` must not be taken: below the minimum, or implausibly far above the request."""
+        if odds < order.min_acceptable_odds:
+            return (
+                f"{odds} are below the minimum acceptable {order.min_acceptable_odds} "
+                f"(requested {order.requested_odds})"
+            )
+        factor = self.tuning.max_odds_rise_factor
+        if factor is not None and odds > order.requested_odds * Decimal(str(factor)):
+            return (
+                f"{odds} are more than {factor:g}x above the requested {order.requested_odds}: the price "
+                "moved too far to trust the prediction (news, or the wrong outcome) - re-price first"
+            )
+        return None
+
+    def _require_acceptable_odds(self, odds: Decimal, order: BetOrder, where: str) -> None:
+        problem = self._odds_problem(odds, order)
+        if problem is not None:
+            raise _Abort(PlacementStatus.ODDS_MOVED, f"{where} {problem}")
 
     def _await_outcome(
         self, page: Page, attempt: _Attempt, odds: Decimal, pre_balance: Decimal | None
@@ -545,10 +664,17 @@ class BetclicExecutor:
         deadline = time.monotonic() + t.confirmation_timeout_s
         rounds = 0
         reclick_pending = False
+        unknown_message = ""
+        odds_text_since: float | None = None  # an "odds changed" text is shown but no dialog (yet)
         while True:
             receipt = self.selectors.probe(page, "bet_receipt")
             if receipt is not None:
-                return self._on_receipt(page, attempt, receipt, odds, pre_balance)
+                receipt_text = _text(receipt.first)
+                if self.selectors.classify(receipt_text, ("pending",)) is None:
+                    return self._on_receipt(page, attempt, receipt.first, odds, pre_balance)
+                # "przyjęty, oczekuje na akceptację": the bookmaker may still refuse it. Keep waiting for
+                # the final word; without one the attempt ends UNCERTAIN (reconciled via bet history).
+                unknown_message = receipt_text
             if self.selectors.probe(page, "odds_changed_notice") is not None:
                 accept = self.selectors.probe(page, "odds_changed_accept")
                 if accept is not None:
@@ -556,16 +682,44 @@ class BetclicExecutor:
                     odds = self._handle_odds_change(page, attempt, accept, rounds)
                     reclick_pending = not accept_places
                     deadline = time.monotonic() + t.confirmation_timeout_s
+                    unknown_message = ""
+                    odds_text_since = None
                     continue
-            message = self.selectors.probe(page, "slip_error")
-            if message is not None and self.selectors.classify(_joined_text(message), ("bet_accepted",)):
+            category, text, message = self._slip_message(page)
+            if category == "bet_accepted" and message is not None:
                 return self._on_receipt(page, attempt, message, odds, pre_balance)
-            self._raise_if_slip_error(page, after_click=True)
+            if category == "odds_changed" and rounds > 0:
+                # We already accepted new odds, which may have submitted the bet: an "odds changed"
+                # text still on screen is probably the old notice lingering while the bet is processed.
+                # It must not be read as a rejection (the bet would exist unknown to the bot). A new
+                # dialog with an accept button is handled above; otherwise keep waiting.
+                unknown_message = text
+            elif category == "odds_changed":
+                # The page is probed piece by piece: the dialog with its accept button may render an
+                # instant after this text. Look again for a moment before giving the bet up.
+                if odds_text_since is None:
+                    odds_text_since = time.monotonic()
+                if time.monotonic() - odds_text_since >= t.optional_timeout_s:
+                    raise _Abort(CATEGORY_STATUS[category], f"Betclic: {text}")
+            elif category in CATEGORY_STATUS:
+                raise _Abort(CATEGORY_STATUS[category], f"Betclic: {text}")
+            elif category is None and text:
+                # Not a known error and not (yet) a confirmation: keep waiting - a receipt or a known
+                # message may follow. If nothing does, the attempt ends as UNCERTAIN below.
+                unknown_message = text
             if reclick_pending and self._reclick_place(page, attempt):
                 reclick_pending = False
                 deadline = time.monotonic() + t.confirmation_timeout_s
                 continue
             if time.monotonic() >= deadline:
+                if unknown_message:
+                    raise _Abort(
+                        PlacementStatus.UNCERTAIN,
+                        f"inconclusive Betclic message after the place click: {unknown_message!r} and no "
+                        f"confirmation within {t.confirmation_timeout_s:g}s - do NOT retry; reconcile via "
+                        "bet history",
+                        clear_slip=False,
+                    )
                 raise _Abort(
                     PlacementStatus.UNCERTAIN,
                     f"the place-bet button was clicked but neither a confirmation nor an error appeared "
@@ -585,13 +739,10 @@ class BetclicExecutor:
             raise _Abort(
                 PlacementStatus.ODDS_MOVED, "Betclic reported changed odds that could not be read; declined"
             )
-        if new_odds < order.min_acceptable_odds:
+        problem = self._odds_problem(new_odds, order)
+        if problem is not None:
             self._decline_odds_change(page)
-            raise _Abort(
-                PlacementStatus.ODDS_MOVED,
-                f"odds changed to {new_odds} (below the minimum acceptable {order.min_acceptable_odds}); "
-                "declined",
-            )
+            raise _Abort(PlacementStatus.ODDS_MOVED, f"odds changed: the new odds {problem}; declined")
         if rounds > t.max_odds_change_rounds:
             self._decline_odds_change(page)
             raise _Abort(PlacementStatus.ODDS_MOVED, f"odds changed {rounds} times in a row; declined")
@@ -617,23 +768,37 @@ class BetclicExecutor:
         return new_odds
 
     def _read_new_odds(self, page: Page, old_odds: Decimal | None) -> Decimal | None:
-        """New price from the odds-change notice; falls back to the slip only if it visibly changed."""
+        """The price the bet would get if the odds-change dialog were accepted (``None`` = unknown).
+
+        Two independent sources are read: the dialog (its ``odds_changed_new_odds`` element, else the
+        single number / the number that is not the old price in its text) and the bet-slip item. The
+        dialog text is free-form, so a number in it may not be the price at all (a stake, a date):
+
+        * both readable -> the LOWER one (never accept on the strength of the more optimistic source);
+        * only the slip -> used if it differs from the old price (else nothing tells us the new price);
+        * only the dialog -> used only when it came from the explicit ``odds_changed_new_odds`` element.
+        """
+        from_notice: Decimal | None = None
+        explicit = False
         notice = self.selectors.probe(page, "odds_changed_notice")
         if notice is not None:
-            explicit = self.selectors.probe(notice.first, "odds_changed_new_odds", state="attached")
-            if explicit is not None:
-                value = try_parse_polish_decimal(_text(explicit.first))
+            element = self.selectors.probe(notice.first, "odds_changed_new_odds", state="attached")
+            if element is not None:
+                value = try_parse_polish_decimal(_text(element.first))
                 if value is not None and value > 1:
-                    return value
-            numbers = [n for n in find_polish_decimals(_text(notice.first)) if n > 1]
-            if len(numbers) == 1:
-                return numbers[0]
-            if len(numbers) == 2 and old_odds is not None and old_odds in numbers:
-                return numbers[1] if numbers[0] == old_odds else numbers[0]
+                    from_notice, explicit = value, True
+            if from_notice is None:
+                numbers = [n for n in find_polish_decimals(_text(notice.first)) if n > 1]
+                if len(numbers) == 1:
+                    from_notice = numbers[0]
+                elif len(numbers) == 2 and old_odds is not None and old_odds in numbers:
+                    from_notice = numbers[1] if numbers[0] == old_odds else numbers[0]
         slip_odds = self._read_slip_odds(page)
-        if slip_odds is not None and old_odds is not None and slip_odds != old_odds:
-            return slip_odds
-        return None
+        if from_notice is not None and slip_odds is not None:
+            return min(from_notice, slip_odds)
+        if slip_odds is not None:
+            return slip_odds if old_odds is not None and slip_odds != old_odds else None
+        return from_notice if explicit else None
 
     def _decline_odds_change(self, page: Page) -> None:
         try:
@@ -644,12 +809,26 @@ class BetclicExecutor:
             log.warning("could not click the decline button of the odds-change dialog: %s", _short_error(exc))
 
     def _reclick_place(self, page: Page, attempt: _Attempt) -> bool:
-        """Acknowledge-mode only: click "Postaw zakład" once more after accepting new odds."""
+        """Acknowledge-mode only: click "Postaw zakład" once more after accepting new odds.
+
+        The accept click may have submitted the bet after all (the site behaves differently from
+        ``behaviour.odds_change_accept_places_bet: false``), so after a pause everything is checked
+        again: a receipt or any message -> back to the main loop; a slip that no longer holds the one
+        selection with the ordered stake -> ``UNCERTAIN`` (the bet may be in), never a second click.
+        """
+        order = attempt.order
         if self.selectors.probe(page, "odds_changed_notice") is not None:
             return False
         button = self.selectors.probe(page, "slip_place_button")
-        if button is None or not button.first.is_enabled():
+        if button is None or button.count != 1 or not button.first.is_enabled():
             return False
+        self._pacer.pause(0.5)
+        page.wait_for_timeout(self.tuning.slip_settle_s * 1000)
+        if self.selectors.probe(page, "bet_receipt") is not None:
+            return False
+        category, text, _ = self._slip_message(page)
+        if category == "pending" or (text and category != "odds_changed"):
+            return False  # (a lingering "odds changed" text is expected: we have just acknowledged it)
         current = self._read_slip_odds(page)
         if current is None:
             raise _Abort(
@@ -658,30 +837,41 @@ class BetclicExecutor:
                 "not clicking again - reconcile via bet history",
                 clear_slip=False,
             )
-        if current < attempt.order.min_acceptable_odds:
+        stake_field = self.selectors.probe(page, "slip_stake_input")
+        shown: str | None = None
+        if stake_field is not None and stake_field.count == 1:
+            shown = stake_field.first.input_value()
+        if shown is None or try_parse_polish_decimal(shown) != order.stake:
             raise _Abort(
-                PlacementStatus.ODDS_MOVED,
-                f"slip odds {current} below the minimum acceptable {attempt.order.min_acceptable_odds}",
+                PlacementStatus.UNCERTAIN,
+                f"the stake field shows {shown!r} after accepting new odds (expected "
+                f"{format_polish_decimal(order.stake)!r}): the bet may already be placed; not clicking "
+                "again - reconcile via bet history",
+                clear_slip=False,
             )
-        self._pacer.pause(0.5)
+        problem = self._odds_problem(current, order)
+        if problem is not None:
+            raise _Abort(PlacementStatus.ODDS_MOVED, f"bet-slip odds after accepting new odds {problem}")
         halted, reason = self._halted()
         if halted:
             raise _Abort(
                 PlacementStatus.KILL_SWITCH, f"trading halted before re-confirming new odds: {reason}"
             )
+        if not button.first.is_enabled():
+            return False
         log.info("re-clicking 'Postaw zakład' after accepting new odds (acknowledge-mode dialog)")
-        button.first.click()
+        self._click_place_button(button.first)
         return True
 
     def _on_receipt(
         self,
         page: Page,
         attempt: _Attempt,
-        receipt: ResolvedElement,
+        root: Locator,
         odds: Decimal,
         pre_balance: Decimal | None,
     ) -> PlacementResult:
-        root = receipt.first
+        """The bet is confirmed (``root`` = the receipt or the confirming message): collect the details."""
         receipt_text = _text(root)
         bet_id: str | None = None
         id_el = self.selectors.probe(root, "receipt_bet_id", state="attached")
@@ -706,12 +896,33 @@ class BetclicExecutor:
         if close is not None:
             try:
                 close.first.click()
+                # give the page a moment to really close it (the next bet must not find it)
+                deadline = time.monotonic() + self.tuning.optional_timeout_s
+                while self.selectors.probe(page, "bet_receipt") is not None and time.monotonic() < deadline:
+                    page.wait_for_timeout(self.tuning.poll_interval_s * 1000)
             except PlaywrightError as exc:
                 log.info("could not close the bet receipt: %s", _short_error(exc))
+        order = attempt.order
         message = f"bet placed at odds {placed_odds}"
         message += f", Betclic bet id {bet_id}" if bet_id else ", Betclic bet id not found on the receipt"
         if balance_after is None:
             message += ", new balance not shown yet"
+        elif pre_balance is not None and pre_balance - balance_after != order.stake:
+            # Cannot be undone, but must be loud: a misread stake or another bet on the account.
+            warning = (
+                f"the balance changed by {pre_balance - balance_after} but the stake was {order.stake} - "
+                "check this bet in 'Moje zakłady'"
+            )
+            log.error("bet_id=%s: %s", order.bet_id, warning)
+            message += f"; WARNING: {warning}"
+        if placed_odds < order.min_acceptable_odds:
+            log.error(
+                "bet_id=%s was accepted at odds %s, below the minimum acceptable %s",
+                order.bet_id,
+                placed_odds,
+                order.min_acceptable_odds,
+            )
+            message += f"; WARNING: accepted below the minimum acceptable odds {order.min_acceptable_odds}"
         return self._result(
             attempt,
             PlacementStatus.PLACED,
@@ -732,17 +943,7 @@ class BetclicExecutor:
                 url = self._safe_url(order.event_url)
             except ValueError as exc:
                 raise _Abort(PlacementStatus.FAILED, str(exc), clear_slip=False) from None
-            self._goto(page, url)
-            if (
-                order.external_event_id
-                and order.external_event_id in url
-                and order.external_event_id not in page.url
-            ):
-                raise _Abort(
-                    PlacementStatus.MARKET_UNAVAILABLE,
-                    f"the event page redirected to {page.url} (event finished or removed?)",
-                    clear_slip=False,
-                )
+            self._goto_event(page, url, order)
         else:
             self._goto(page, self.listing_url)
             params = {"event_id": order.external_event_id}
@@ -777,10 +978,26 @@ class BetclicExecutor:
                 url = self._safe_url(urljoin(page.url, href))
             except ValueError as exc:
                 raise _Abort(PlacementStatus.FAILED, str(exc), clear_slip=False) from None
-            self._goto(page, url)
+            self._goto_event(page, url, order)
         if self.selectors.probe(page, "event_unavailable") is not None:
             raise _Abort(
                 PlacementStatus.MARKET_UNAVAILABLE, "Betclic shows the event as unavailable", clear_slip=False
+            )
+
+    def _goto_event(self, page: Page, url: str, order: BetOrder) -> None:
+        """Open the event page; if the URL names the event id, the page we land on must name it too.
+
+        Betclic redirects finished / removed events (to the listing, the home page or another event).
+        Markets and selections are matched by name only ("Zwycięzca meczu" exists on every event), so a
+        redirect must never be mistaken for the ordered event.
+        """
+        expected = _url_mentions_id(url, order.external_event_id)
+        self._goto(page, url)
+        if expected and not _url_mentions_id(page.url, order.external_event_id):
+            raise _Abort(
+                PlacementStatus.MARKET_UNAVAILABLE,
+                f"the event page redirected to {page.url} (event finished or removed?)",
+                clear_slip=False,
             )
 
     def _require_logged_in(self, page: Page) -> None:
@@ -859,14 +1076,27 @@ class BetclicExecutor:
         self.selectors.try_resolve(page, "slip_container", self.tuning.slip_update_timeout_s)
 
     def _slip_count(self, page: Page) -> int:
+        """Visible bet-slip selections."""
         items = self.selectors.probe(page, "slip_item")
         return items.count if items is not None else 0
+
+    def _slip_total(self, page: Page) -> int:
+        """Bet-slip selections including hidden ones (``behaviour.count_hidden_slip_items``).
+
+        A selection that sits in the slip's DOM but is not displayed would still be part of the bet
+        (turning the single into a combination), so by default hidden ones count as well.
+        """
+        visible = self._slip_count(page)
+        if not self.selectors.behaviour.count_hidden_slip_items:
+            return visible
+        attached = self.selectors.probe(page, "slip_item", state="attached")
+        return max(visible, attached.count if attached is not None else 0)
 
     def _clear_slip(self, page: Page, *, strict: bool) -> None:
         """Remove every bet-slip selection; ``strict`` raises SELECTOR_ERROR if that fails."""
         t = self.tuning
         self._open_slip_if_collapsed(page)
-        count = self._slip_count(page)
+        count = self._slip_total(page)
         if count == 0:
             return
         log.info("clearing %d selection(s) from the bet slip", count)
@@ -889,13 +1119,20 @@ class BetclicExecutor:
                 remove.first.click()
                 page.wait_for_timeout(t.poll_interval_s * 1000)
         deadline = time.monotonic() + t.slip_update_timeout_s
-        while self._slip_count(page) > 0:
+        while self._slip_total(page) > 0:
             if time.monotonic() >= deadline:
-                remaining = self._slip_count(page)
+                remaining = self._slip_total(page)
+                hint = ""
+                if self._slip_count(page) == 0:
+                    hint = (
+                        " - they are hidden: if the page always keeps hidden slip items, make 'slip_item' "
+                        "more specific or set behaviour.count_hidden_slip_items: false in "
+                        "config/betclic_selectors.yaml"
+                    )
                 if strict:
                     raise _Abort(
                         PlacementStatus.SELECTOR_ERROR,
-                        f"could not clear the bet slip ({remaining} selection(s) remain)",
+                        f"could not clear the bet slip ({remaining} selection(s) remain){hint}",
                         clear_slip=False,
                         dump_html=True,
                     )
@@ -1034,7 +1271,10 @@ class BetclicExecutor:
             full = _text(button)
             odds_el = self.selectors.probe(button, "selection_odds", state="attached")
             odds_text = _text(odds_el.first) if odds_el is not None else ""
-            rest = full.replace(odds_text, " ") if odds_text else full
+            rest = full
+            if odds_text and odds_text in full:  # drop the odds once, from the end (label first, odds last)
+                head, _, tail = full.rpartition(odds_text)
+                rest = f"{head} {tail}"
             names = tuple(dict.fromkeys(n for n in (normalise_text(label), normalise_text(rest)) if n))
             candidates.append(
                 Candidate(
@@ -1081,9 +1321,49 @@ class BetclicExecutor:
             raise _Abort(PlacementStatus.SELECTOR_ERROR, f"implausible displayed odds {text!r}")
         return value
 
+    def _confirm_pick(self, market: Locator, selection: Locator, order: BetOrder) -> Decimal:
+        """Re-read the chosen market and selection right before the click; return the current odds.
+
+        The locators are positional (n-th market box, n-th outcome in it). If the page re-rendered since
+        the elements were chosen, the position may hold something else: abort without clicking. A
+        vanished element makes the reads time out, which :meth:`place` reports as ``FAILED``.
+        """
+        title_el = self.selectors.probe(market, "market_title", state="attached")
+        title = _text(title_el.first) if title_el is not None else ""
+        candidate = self._selection_candidates([selection])[0]
+        if (
+            normalise_text(title) != normalise_text(order.market_raw_name)
+            or normalise_text(order.selection_raw_name) not in candidate.names
+        ):
+            raise _Abort(
+                PlacementStatus.FAILED,
+                f"the event page changed while selecting: the chosen position now shows market {title!r} / "
+                f"selection {candidate.display!r} instead of {order.market_raw_name!r} / "
+                f"{order.selection_raw_name!r}; nothing was clicked",
+            )
+        if self._is_locked(selection):
+            raise _Abort(
+                PlacementStatus.MARKET_UNAVAILABLE, "the selection is suspended / locked on the event page"
+            )
+        return self._read_selection_odds(selection)
+
+    def _resolve_single(self, page: Page, key: str) -> Locator:
+        """The one visible element of ``key``; several matches are ambiguous -> SELECTOR_ERROR."""
+        found = self.selectors.resolve(page, key, self.tuning.element_timeout_s)
+        if found.count != 1:
+            raise _Abort(
+                PlacementStatus.SELECTOR_ERROR,
+                f"selector '{key}' matches {found.count} visible elements ({found.spec.describe()}); exactly "
+                "one is required - make it more specific in config/betclic_selectors.yaml",
+                dump_html=True,
+            )
+        return found.first
+
     def _read_slip_odds(self, page: Page) -> Decimal | None:
+        """Odds of the slip's single selection; ``None`` unless the slip holds exactly one (hidden
+        selections included) with readable odds."""
         items = self.selectors.probe(page, "slip_item")
-        if items is None or items.count != 1:
+        if items is None or items.count != 1 or self._slip_total(page) != 1:
             return None
         odds_el = self.selectors.probe(items.first, "slip_item_odds", state="attached")
         if odds_el is None:
@@ -1110,6 +1390,16 @@ class BetclicExecutor:
             raise _Abort(
                 PlacementStatus.SELECTOR_ERROR, f"the bet slip must hold exactly one selection, found {count}"
             )
+        total = self._slip_total(page)
+        if total != 1:
+            raise _Abort(
+                PlacementStatus.SELECTOR_ERROR,
+                f"the bet slip holds {total} selections in the page but only 1 is visible (hidden stale "
+                "selections would turn the single into a combination bet); refusing to bet. If the page "
+                "keeps hidden duplicates of the slip, make 'slip_item' more specific or set "
+                "behaviour.count_hidden_slip_items: false in config/betclic_selectors.yaml",
+                dump_html=True,
+            )
         badge = self.selectors.probe(page, "slip_count_badge")
         if badge is not None:
             numbers = find_polish_decimals(_text(badge.first))
@@ -1134,14 +1424,22 @@ class BetclicExecutor:
                 f"the bet slip shows selection {shown!r}, expected {order.selection_raw_name!r}",
             )
         market_el = self.selectors.probe(item, "slip_item_market", state="attached")
-        if market_el is not None:
-            shown_market = _text(market_el.first)
-            if not names_compatible(normalise_text(shown_market), normalise_text(order.market_raw_name)):
-                log.warning(
-                    "bet-slip market %r differs from the ordered market %r",
-                    shown_market,
-                    order.market_raw_name,
+        shown_market = _text(market_el.first) if market_el is not None else ""
+        if shown_market and not names_compatible(
+            normalise_text(shown_market), normalise_text(order.market_raw_name)
+        ):
+            if self.selectors.behaviour.require_slip_market_match:
+                raise _Abort(
+                    PlacementStatus.SELECTOR_ERROR,
+                    f"the bet slip shows market {shown_market!r}, expected {order.market_raw_name!r} (the "
+                    "click may have landed on another market). If Betclic words the market differently in "
+                    "the slip, fix 'slip_item_market' or set behaviour.require_slip_market_match: false "
+                    "in config/betclic_selectors.yaml",
+                    dump_html=True,
                 )
+            log.warning(
+                "bet-slip market %r differs from the ordered market %r", shown_market, order.market_raw_name
+            )
         odds_el = self.selectors.try_resolve(item, "slip_item_odds", t.optional_timeout_s, state="attached")
         if odds_el is None:
             raise _Abort(
@@ -1156,42 +1454,153 @@ class BetclicExecutor:
         return slip_odds
 
     def _enter_stake(self, page: Page, stake: Decimal) -> None:
-        field = self.selectors.resolve(page, "slip_stake_input", self.tuning.element_timeout_s).first
+        """Type the stake Polish-style ("12,50") into the one stake field and read it back."""
         text = format_polish_decimal(stake)
         self._pacer.pause(0.5)
+        field = self._resolve_single(page, "slip_stake_input")
         field.click()
         field.press("ControlOrMeta+A")
         field.press("Backspace")
         field.press_sequentially(text, delay=self._pacer.typing_delay_ms())
         value = field.input_value()
+        if try_parse_polish_decimal(value) == stake:
+            return
+        log.warning("stake field shows %r after typing %r; retrying with fill()", value, text)
+        try:
+            if (field.get_attribute("type") or "").lower() == "number":
+                # <input type="number">: the DOM value is locale-independent ("12.50") by the HTML spec,
+                # whatever decimal separator the browser accepts from the keyboard.
+                field.fill(format(stake.quantize(Decimal("0.01")), "f"))
+            else:
+                field.fill(text)
+        except PlaywrightError as exc:
+            raise _Abort(
+                PlacementStatus.SELECTOR_ERROR,
+                f"could not enter the stake {text!r} into the stake field: {_short_error(exc)}",
+            ) from None
+        value = field.input_value()
         if try_parse_polish_decimal(value) != stake:
-            log.warning("stake field shows %r after typing %r; retrying with fill()", value, text)
-            field.fill(text)
-            value = field.input_value()
-            if try_parse_polish_decimal(value) != stake:
-                raise _Abort(
-                    PlacementStatus.SELECTOR_ERROR, f"the stake field shows {value!r} instead of {text!r}"
-                )
+            raise _Abort(
+                PlacementStatus.SELECTOR_ERROR, f"the stake field shows {value!r} instead of {text!r}"
+            )
 
-    def _raise_if_slip_error(self, page: Page, *, after_click: bool) -> None:
-        found = self.selectors.probe(page, "slip_error")
+    def _verify_stake_field(self, page: Page, stake: Decimal) -> None:
+        """Right before the final click: the one stake field must still hold exactly the order stake."""
+        field = self._resolve_single(page, "slip_stake_input")
+        value = field.input_value()
+        if try_parse_polish_decimal(value) != stake:
+            raise _Abort(
+                PlacementStatus.SELECTOR_ERROR,
+                f"the stake field shows {value!r} right before confirming instead of "
+                f"{format_polish_decimal(stake)!r} (the page changed it); nothing was clicked",
+                dump_html=True,
+            )
+
+    def _check_potential_win(self, page: Page, order: BetOrder, odds: Decimal, *, wait: bool) -> None:
+        """Cross-check the stake Betclic understood via the potential win shown in the slip.
+
+        The stake field can read "12,50" while the site computes with 1250 (or 12): the field alone
+        cannot reveal that, the displayed potential payout can. It must lie within
+        ``potential_win_min_ratio .. potential_win_max_ratio`` of stake x odds (Poland: x0.88 after the
+        12% stake tax). Optional: skipped when ``slip_potential_win`` does not resolve or shows no single
+        amount. ``wait`` allows the value to catch up with the stake just typed.
+        """
+        t = self.tuning
+        if not self.selectors.has("slip_potential_win"):
+            return
+        found = self.selectors.try_resolve(page, "slip_potential_win", t.optional_timeout_s if wait else 0)
         if found is None:
             return
-        text = _joined_text(found)
+        gross = order.stake * odds
+        low = gross * Decimal(str(t.potential_win_min_ratio))
+        high = gross * Decimal(str(t.potential_win_max_ratio))
+        deadline = time.monotonic() + (t.slip_update_timeout_s if wait else 0.0)
+        while True:
+            text = _text(found.first)
+            numbers = find_polish_decimals(text)
+            value = numbers[0] if len(numbers) == 1 else None
+            if value is not None and low <= value <= high:
+                return
+            if time.monotonic() >= deadline:
+                break
+            page.wait_for_timeout(t.poll_interval_s * 1000)
+            again = self.selectors.probe(page, "slip_potential_win")
+            if again is None:
+                return
+            found = again
+        if value is None:
+            log.warning(
+                "cannot read one amount from the potential-win text %r (selector 'slip_potential_win'); "
+                "skipping the stake cross-check",
+                text,
+            )
+            return
+        raise _Abort(
+            PlacementStatus.SELECTOR_ERROR,
+            f"the bet slip shows a potential win of {value} for stake {order.stake} at odds {odds} "
+            f"(expected {low.quantize(Decimal('0.01'))} to {high.quantize(Decimal('0.01'))}): Betclic may "
+            "have read the stake differently; nothing was clicked. If 'slip_potential_win' points at the "
+            "wrong element, fix or remove it in config/betclic_selectors.yaml",
+            dump_html=True,
+        )
+
+    def _slip_message(self, page: Page) -> tuple[str | None, str, Locator | None]:
+        """``(category, text, element)`` of the bet-slip message(s), classified with the ``texts`` section.
+
+        Every matched element is classified on its own (a harmless notice next to a real error must not
+        hide it), then combined, most decisive first:
+
+        * a known error -> that category - unless a confirmation is displayed as well: contradictory,
+          reported as an unknown message (``None``);
+        * a confirmation -> ``"bet_accepted"`` (``element`` is the confirming element);
+        * an unrecognised message -> ``None`` with its text;
+        * only "pending" / "ignore" notices, or nothing -> empty ``text`` (nothing to act on yet).
+        """
+        found = self.selectors.probe(page, "slip_error")
+        if found is None:
+            return None, "", None
+        classified: list[tuple[str | None, str, Locator]] = []
+        for element in found.all(limit=5):
+            text = _text(element)
+            if not text:
+                continue
+            category = self.selectors.classify(text, MESSAGE_CATEGORY_ORDER[1:])  # everything but "ignore"
+            if category is None and self.selectors.classify(text, ("ignore",)) is not None:
+                continue
+            classified.append((category, text, element))
+        decisive = [(c, t, el) for c, t, el in classified if c != "pending"]
+        if not decisive:
+            return ("pending" if classified else None), "", None
+        joined = " ".join(t for _, t, _ in decisive)
+        kinds = {c for c, _, _ in decisive}
+        accepted = next((el for c, _, el in decisive if c == "bet_accepted"), None)
+        errors = [c for c in MESSAGE_CATEGORY_ORDER if c in kinds and c in CATEGORY_STATUS]
+        if errors:
+            return (None if accepted is not None else errors[0]), joined, decisive[0][2]
+        if accepted is not None:
+            return "bet_accepted", joined, accepted
+        return None, joined, decisive[0][2]
+
+    def _raise_if_slip_message(self, page: Page) -> None:
+        """BEFORE the final click: any bet-slip message stops the attempt (nothing was clicked)."""
+        category, text, _ = self._slip_message(page)
         if not text:
             return
-        category = self.selectors.classify(text, ("bet_accepted", *ERROR_CATEGORY_ORDER))
-        if category in ("pending", "bet_accepted"):
-            return  # "bet_accepted" after the click is handled by _await_outcome; before it, it is stale
+        if category == "bet_accepted":
+            # A confirmation that is on screen before we click belongs to an earlier bet; left there it
+            # would be read as THIS bet's confirmation right after the click.
+            raise _Abort(
+                PlacementStatus.SELECTOR_ERROR,
+                f"a confirmation message from an earlier bet is still displayed ({text!r}); refusing to "
+                "continue (it could be mistaken for this bet's confirmation)",
+                dump_html=True,
+            )
         if category is None:
-            if after_click:
-                raise _Abort(
-                    PlacementStatus.UNCERTAIN,
-                    f"unrecognised Betclic message after the place click: {text!r} - reconcile via bet "
-                    "history",
-                    clear_slip=False,
-                )
-            raise _Abort(PlacementStatus.FAILED, f"Betclic bet slip shows: {text!r}")
+            raise _Abort(
+                PlacementStatus.FAILED,
+                f"Betclic bet slip shows: {text!r} (unknown message; if it is harmless add a phrase to "
+                "texts.ignore in config/betclic_selectors.yaml)",
+            )
         raise _Abort(CATEGORY_STATUS[category], f"Betclic: {text}")
 
     # ================================================================== history
@@ -1371,8 +1780,12 @@ class BetclicExecutor:
             return f"stake {order.stake} has more than 2 decimal places"
         if order.stake < self.settings.betclic.min_stake:
             return f"stake {order.stake} is below the Betclic minimum {self.settings.betclic.min_stake}"
+        if not order.idempotency_key.strip():
+            return "the order has no idempotency_key"
         if order.min_acceptable_odds <= 1:
             return f"min_acceptable_odds must be > 1 (got {order.min_acceptable_odds})"
+        if order.requested_odds <= 1:
+            return f"requested_odds must be > 1 (got {order.requested_odds})"
         if not order.market_raw_name.strip() or not order.selection_raw_name.strip():
             return "market and selection names are required"
         if not order.event_url and not order.external_event_id:
@@ -1386,13 +1799,21 @@ class BetclicExecutor:
             raise ExecutorClosedError("this BetclicExecutor was closed")
 
     def _handle_abort(self, attempt: _Attempt, abort: _Abort) -> PlacementResult:
-        shot = self._screenshot(attempt, abort.status, dump_html=abort.dump_html)
-        if abort.clear_slip:
+        status, message, clear_slip = abort.status, abort.message, abort.clear_slip
+        definite = status in POST_CLICK_DEFINITE or status is PlacementStatus.PLACED
+        if attempt.place_clicked and not definite:
+            # After the click only an explicit bookmaker rejection means "no bet"; everything else
+            # (a selector that broke, an internal check) leaves the outcome open.
+            if status is not PlacementStatus.UNCERTAIN:
+                message = f"{message} [after the place click: outcome unknown - reconcile via bet history]"
+            status, clear_slip = PlacementStatus.UNCERTAIN, False
+        shot = self._screenshot(attempt, status, dump_html=abort.dump_html)
+        if clear_slip:
             self._safe_clear_slip()
         return self._result(
             attempt,
-            abort.status,
-            abort.message,
+            status,
+            message,
             placed_odds=abort.placed_odds,
             screenshot_path=shot,
             take_screenshot=False,
@@ -1441,9 +1862,17 @@ class BetclicExecutor:
     ) -> PlacementResult:
         if take_screenshot and screenshot_path is None:
             screenshot_path = self._screenshot(attempt, status)
-        if attempt.place_clicked and status in (PlacementStatus.PLACED, PlacementStatus.UNCERTAIN):
-            # money may be at risk: never click again for this key (definite rejections may be retried)
-            self._attempted[attempt.order.idempotency_key] = status
+        if attempt.journaled:
+            key = attempt.order.idempotency_key
+            if attempt.place_clicked and status in (PlacementStatus.PLACED, PlacementStatus.UNCERTAIN):
+                # money may be at risk: never click again for this key
+                self._attempted[key] = status
+            else:  # never clicked after all, or a definite rejection: the bet may be retried
+                self._attempted.pop(key, None)
+            try:
+                self._journal.record_result(key, attempt.order.bet_id, status)
+            except JournalError as exc:  # the "click" record stays last: blocked after a restart (safe)
+                log.error("%s - key %r stays blocked in the journal", exc, key)
         level = (
             logging.INFO
             if status in (PlacementStatus.PLACED, PlacementStatus.DRY_RUN_OK)
@@ -1528,6 +1957,19 @@ class BetclicExecutor:
 def _host_key(netloc: str) -> str:
     host = netloc.lower()
     return host[4:] if host.startswith("www.") else host
+
+
+def _url_mentions_id(url: str, event_id: str) -> bool:
+    """Whether ``url`` contains ``event_id`` as a whole id (numeric ids: not as part of a longer number).
+
+    Betclic event URLs end in ``-m<event id>``, so ``3002201001`` must not be found in
+    ``...-m30022010015`` nor ``300220100`` in ``...-m3002201001``.
+    """
+    if not event_id:
+        return False
+    if event_id.isdigit():
+        return re.search(rf"(?<!\d){re.escape(event_id)}(?!\d)", url) is not None
+    return event_id in url
 
 
 def _text(locator: Locator, timeout_ms: float = 5_000) -> str:

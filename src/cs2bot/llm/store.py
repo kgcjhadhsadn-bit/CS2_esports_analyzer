@@ -237,7 +237,9 @@ def store_triage(
 
     Sets ``triage_label`` / ``relevance`` / ``triaged_at``, merges the verdict's team ids into
     ``team_ids`` (union with what the scraper detected; ids that are not in ``teams`` are ignored) and
-    keeps the one-line summary under ``extra["llm"]["triage"]``.
+    keeps the one-line summary under ``extra["llm"]["triage"]``. The verdict's team ids are stored
+    there as well: the HLTV sync rewrites ``team_ids`` from its own detection when it refreshes an
+    article, and :func:`select_news_for_match` reads both places.
     """
     row = session.get(NewsItem, news_item_id)
     if row is None:
@@ -248,6 +250,7 @@ def store_triage(
     row.relevance = float(item.relevance)
     row.triaged_at = current
     suggested = {int(t) for t in item.team_ids}
+    known: set[int] = set()
     if suggested:
         known = set(session.scalars(select(Team.id).where(Team.id.in_(suggested))))
         merged = sorted(_int_set(row.team_ids) | known)
@@ -255,7 +258,14 @@ def store_triage(
             row.team_ids = merged
     row.extra = merge_llm_extra(
         row.extra,
-        {"triage": {"summary": item.summary, "team_names": list(item.team_names), "model": model}},
+        {
+            "triage": {
+                "summary": item.summary,
+                "team_names": list(item.team_names),
+                "team_ids": sorted(known),
+                "model": model,
+            }
+        },
     )
     session.flush()
     return True
@@ -306,8 +316,8 @@ def select_news_for_match(
 
     * **recent** - published (or, without a publication time, ingested) within ``days`` before
       ``now`` and **not after** ``now`` (no look-ahead when ``now`` is a historical instant);
-    * **about this match** - it mentions team1 / team2 (``team_ids``) or one of the players in the
-      context's lineups (``player_ids``);
+    * **about this match** - it mentions team1 / team2 (``team_ids``, or the teams a triage verdict
+      attached) or one of the players in the context's lineups (``player_ids``);
     * **relevant** - triaged with a label other than ``irrelevant`` and ``relevance >= min_relevance``.
       Items that have not been triaged yet are included too (``include_untriaged``), so a triage
       outage cannot hide a fresh roster story from the context model.
@@ -349,7 +359,7 @@ def select_news_for_match(
             continue
         if not triaged and not include_untriaged:
             continue
-        mentions = bool(team_ids & _int_set(row.team_ids)) or bool(player_ids & _int_set(row.player_ids))
+        mentions = bool(team_ids & _mentioned_team_ids(row)) or bool(player_ids & _int_set(row.player_ids))
         rank = relevance if triaged else _UNTRIAGED_RANK
         if mentions:
             specific.append((rank, when, row))
@@ -361,6 +371,13 @@ def select_news_for_match(
     chosen = specific[: max(0, limit - len(general))] + general
     chosen.sort(key=lambda entry: (entry[1], entry[2].id))  # oldest first for the prompt
     return [news_row_to_input(row) for _, _, row in chosen]
+
+
+def _mentioned_team_ids(row: NewsItem) -> set[int]:
+    """Team ids on the row plus those the triage verdict attached (kept under ``extra["llm"]``)."""
+    triage = llm_extra(row.extra).get("triage")
+    from_triage = _int_set(triage.get("team_ids")) if isinstance(triage, dict) else set()
+    return _int_set(row.team_ids) | from_triage
 
 
 def _int_set(values: Any) -> set[int]:

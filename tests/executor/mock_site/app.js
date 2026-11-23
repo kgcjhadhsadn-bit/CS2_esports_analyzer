@@ -29,6 +29,25 @@ function h(tag, attrs, ...children) {
   return node;
 }
 
+function formatPl(value) {
+  return value.toFixed(2).replace(".", ",");
+}
+
+function potentialWinText() {
+  const d = ui.data;
+  if (!d.slip.length) return "";
+  const stake = parsePl(ui.stakeText);
+  let odds = 1;
+  for (const box of document.querySelectorAll("#slip .betBox:not([hidden]) .oddValue")) odds *= parsePl(box.textContent) || 1;
+  if (stake === null) return "Możliwa wygrana: 0,00 zł";
+  return `Możliwa wygrana: ${formatPl(stake * d.stake_multiplier * odds * d.win_factor)} zł`;
+}
+
+function updatePotentialWin() {
+  const el = document.getElementById("slipWinnings");
+  if (el) el.textContent = potentialWinText();
+}
+
 function parsePl(text) {
   const cleaned = String(text || "").replace(/\s/g, "").replace(",", ".");
   const value = parseFloat(cleaned);
@@ -200,21 +219,36 @@ function renderSlip(items) {
       ),
     );
   }
+  if (items.length && ui.data.hidden_slip_item) {
+    const ghost = h("div", { class: "betBox", "data-selection-id": "S9999" },
+      h("div", { class: "betBox_contestantName", text: "FaZe" }),
+      h("div", { class: "betBox_marketName", text: "Zwycięzca meczu" }),
+      h("div", { class: "betBox_odds" }, h("span", { class: "oddValue", text: "1,70" })),
+    );
+    ghost.hidden = true;
+    slip.appendChild(ghost);
+  }
   if (items.length) {
     const input = h("input", {
       id: "stake", class: "input_field", inputmode: "decimal", "aria-label": "Stawka", autocomplete: "off",
-      oninput: (e) => { ui.stakeText = e.target.value; validateStake(); },
+      oninput: (e) => { ui.stakeText = e.target.value; validateStake(); updatePotentialWin(); },
     });
     input.value = ui.stakeText;
     slip.appendChild(h("div", { class: "betslip_stake" }, h("label", { for: "stake", text: "Stawka" }), input, " zł"));
+    if (ui.data.show_potential_win) {
+      slip.appendChild(h("div", { id: "slipWinnings", class: "betslip_winnings", text: "" }));
+    }
     const error = h("div", { id: "slipError", class: "betslip_error", role: "alert", text: ui.errorText });
     error.hidden = !ui.errorText;
     slip.appendChild(error);
+    if (ui.data.extra_slip_notice) {
+      slip.appendChild(h("div", { class: "betslip_notice", role: "alert", text: ui.data.extra_slip_notice }));
+    }
     if (ui.oddsDialog) {
       slip.appendChild(
         h("div", { id: "oddsChange", class: "betslip_oddsChange" },
           "Kurs uległ zmianie: ",
-          h("span", { class: "oddValue", text: ui.oddsDialog.new_odds }),
+          h("span", { class: "oddValue", text: ui.oddsDialog.dialog_odds || ui.oddsDialog.new_odds }),
           h("button", { class: "btn", text: "Akceptuj zmiany", onclick: acceptOdds }),
           h("button", { class: "btn", text: "Anuluj", onclick: declineOdds }),
         ),
@@ -227,10 +261,11 @@ function renderSlip(items) {
     button.disabled = Boolean(ui.pending || ui.oddsDialog || ui.stakeBlocked);
     slip.appendChild(button);
   }
+  updatePotentialWin();
   if (ui.receipt) {
     slip.appendChild(
       h("div", { class: "betslip_receipt" },
-        "Zakład przyjęty! Numer zakładu: ",
+        "Zakład przyjęty! " + (ui.receipt.note ? ui.receipt.note + " " : "") + "Numer zakładu: ",
         h("span", { class: "betslip_receiptId", text: ui.receipt.bet_id }),
         h("button", { class: "btn betslip_receiptClose", text: "Zamknij", onclick: closeReceipt }),
       ),
@@ -281,14 +316,15 @@ function applyPlaceResponse(r) {
   ui.pending = r.result === "hang";
   if (r.slip) ui.data.slip = r.slip;
   if (r.result === "ok") {
-    ui.receipt = { bet_id: r.bet_id };
+    ui.receipt = { bet_id: r.bet_id, note: r.note };
     ui.stakeText = "";
     ui.errorText = "";
     ui.oddsDialog = null;
     ui.data.balance_text = r.balance_text;
     renderHeader();
   } else if (r.result === "odds_changed") {
-    ui.oddsDialog = { new_odds: r.new_odds };
+    ui.oddsDialog = { new_odds: r.new_odds, dialog_odds: r.dialog_odds };
+    if (r.message) ui.errorText = r.message;  // inline notice that lingers until the next answer
   } else if (r.result === "error") {
     ui.errorText = r.message;
     ui.oddsDialog = null;
@@ -335,6 +371,12 @@ function render() {
   renderSlip(ui.data.slip);
 }
 
+// Test hook: re-fetch the server state and re-render (simulates a live re-render of the page).
+window.mockReload = async () => {
+  ui.data = await api("/api/state?path=" + encodeURIComponent(location.pathname));
+  render();
+};
+
 async function boot() {
   ui.data = await api("/api/state?path=" + encodeURIComponent(location.pathname));
   ui.receipt = ui.data.receipt ? { bet_id: ui.data.receipt } : null;
@@ -355,6 +397,7 @@ async function boot() {
         const el = box.querySelector(".oddValue");
         if (odds && el && el.textContent !== odds) el.textContent = odds;
       }
+      updatePotentialWin();
     } catch (e) { /* server stopped */ }
   }, 300);
 }

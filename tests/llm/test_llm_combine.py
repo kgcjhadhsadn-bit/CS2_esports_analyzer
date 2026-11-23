@@ -194,13 +194,17 @@ def test_property_total_is_always_finite_and_bounded(flags: list[ContextFlag], s
 
 
 @given(flags=_flags, settings=_settings, data=st.data())
-def test_property_order_does_not_matter(flags: list[ContextFlag], settings: LLMSettings, data: st.DataObject) -> None:
+def test_property_order_does_not_matter(
+    flags: list[ContextFlag], settings: LLMSettings, data: st.DataObject
+) -> None:
     shuffled = data.draw(st.permutations(flags))
     assert combine_flags(shuffled, settings, now=NOW) == combine_flags(flags, settings, now=NOW)
 
 
 @given(flags=_flags, settings=_settings)
-def test_property_expired_flags_never_change_the_result(flags: list[ContextFlag], settings: LLMSettings) -> None:
+def test_property_expired_flags_never_change_the_result(
+    flags: list[ContextFlag], settings: LLMSettings
+) -> None:
     live = [f for f in flags if f.expires_at is None or f.expires_at >= NOW]
     assert combine_flags(flags, settings, now=NOW) == combine_flags(live, settings, now=NOW)
 

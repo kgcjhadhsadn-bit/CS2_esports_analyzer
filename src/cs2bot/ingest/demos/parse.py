@@ -1,20 +1,36 @@
 """Demo parsing: one ``.dem`` file -> rounds, kills, per-player round stats and position samples.
 
-How demoparser2 is queried (all facts below were checked against the demoparser2 Rust source,
-``src/parser/src/second_pass/game_events.rs`` and ``maps.rs``, and against awpy 2.x which wraps it):
+How demoparser2 is queried (checked against the demoparser2 Rust source,
+``src/parser/src/second_pass/game_events.rs`` and ``maps.rs``, against awpy, which wraps it, and
+against six real demos - see "Validation" below):
 
 * ``parse_events([...], player=[...], other=[...])`` returns ``[(event_name, DataFrame), ...]`` for
-  the events that occur in the demo. ``player`` props are added per referenced player with the
-  prefixes ``user_`` / ``attacker_`` / ``assister_`` (``user_X``, ``attacker_last_place_name``, ...);
-  ``other`` props (game rules state) are added under their own name (``total_rounds_played``).
+  the events that occur in the demo (``parse_event`` returns an empty *list* for an event that never
+  occurs). ``player`` props are added per referenced player with the prefixes ``user_`` /
+  ``attacker_`` / ``assister_`` (``user_X``, ``attacker_last_place_name``, ...); ``other`` props
+  (game rules state) are added under their own name (``total_rounds_played``).
 * ``round_start`` / ``round_end`` / ``round_officially_ended`` are synthesised by the parser from
   game-rules counters: ``round_end`` carries ``winner`` (``"CT"`` / ``"T"``) and ``reason``
   (``"ct_killed"``, ``"t_killed"``, ``"bomb_exploded"``, ``"bomb_defused"``, ``"time_ran_out"``,
   ``"t_surrender"``, ``"ct_surrender"``, ...); older parser versions / real game events use the
   numeric codes (winner 2 = T, 3 = CT; reason 1, 7, 8, 9, 12, 17, 18) - both forms are accepted.
+  ``round_officially_ended`` shares its tick with the next ``round_start``. Demos open with a
+  ``round_end`` that has neither winner nor reason, and a backup restore produces another one.
 * Steam ids are strings in event frames and unsigned integers in tick frames; ``0`` means a bot.
 * ``parse_ticks(props, ticks=[...])`` returns one row per player per requested tick with the
   columns ``tick``, ``steamid``, ``name`` plus the props. ``team_num`` is 2 for T and 3 for CT.
+* GOTV demos (every HLTV demo) contain neither ``player_blind`` nor ``item_purchase``.
+
+Validation
+----------
+No demo file ships with the repository, so the unit tests script a fake parser. The logic was
+additionally run with the real demoparser2 (0.42.2) on the six public demos of the awpy-fixtures
+project - Valve matchmaking, FACEIT (knife round, overtime), ESEA (knife round) and three HLTV
+demos of professional matches, one of them with a round replayed after a backup restore. Scores,
+round counts and every published per-player number (kills, deaths, ADR, KAST, headshots, multi-kill
+rounds, enemies flashed) came out identical, except one player's ADR on csstats.gg (34.7 there,
+37.7 from the game events; awpy reports the same residual).
+``tests/ingest/demos/test_demos_real_fixtures.py`` repeats that check when the demos are downloaded.
 
 Round cleaning (the part that decides whether the data can be trusted)
 -----------------------------------------------------------------------
@@ -38,9 +54,12 @@ starts recording late still gets the true numbers - they decide pistol rounds an
 
 Definitions used for the derived statistics (assumptions are spelled out here on purpose)
 ----------------------------------------------------------------------------------------
-* Events between ``round_end`` and the official end of the round (post-round kills, bomb blast) are
-  attributed to that round, as the in-game scoreboard and awpy do. ``survived`` means "no death in
-  that whole window"; ``ct_survivors`` / ``t_survivors`` count players alive at the ``round_end`` tick.
+* A round owns the events from its freeze end until the next round starts: kills after ``round_end``
+  (saving players hunted down, the bomb blast) count for that round, as on the in-game scoreboard
+  and in awpy. Nothing that happens during freeze time counts: a backup restore "kills" all ten
+  players on the tick the replayed round starts (seen in a real HLTV demo), and those are no deaths.
+  ``survived`` means "no death in that whole window"; ``ct_survivors`` / ``t_survivors`` count players
+  alive at the ``round_end`` tick.
 * A *kill* credits the attacker only when the victim is an enemy (no suicides, no team kills).
 * *Opening kill*: the first enemy kill of the round before the round-end tick.
 * *Trade*: kill ``k2`` is a trade of kill ``k1`` when ``k2``'s victim is ``k1``'s attacker,
@@ -49,11 +68,19 @@ Definitions used for the derived statistics (assumptions are spelled out here on
 * *Damage* follows the victim's health: every hit is capped at the health the victim has left, so a
   victim can never give away more than 100 per round in total; team and self damage are excluded.
 * *Utility damage*: damage with HE grenades and molotov / incendiary fire.
-* *Enemies flashed*: ``player_blind`` on a living enemy for at least ``min_blind_duration_s``.
+* *Enemies flashed*: a living enemy blinded for at least ``min_blind_duration_s``. GOTV demos (all
+  HLTV demos) do not contain the ``player_blind`` event, so blinds are reconstructed the way awpy does
+  it: a player's ``flash_duration`` jumps from its old value to the new blind duration on the very
+  tick of a ``flashbang_detonate`` event, whose thrower gets the credit. ``player_blind`` is used
+  when a demo does have it (matchmaking / POV demos).
 * *Utility thrown* is counted from detonation events (``flashbang_detonate``, ``smokegrenade_detonate``,
   ``hegrenade_detonate``, ``inferno_startburn``): a grenade still in the air when the round is over,
   or a molotov that burns out mid-air, is not counted.
-* *KAST*: kill, assist (flash assists included), survived, or death that was traded.
+* *Assists* are the game's own attribution (``player_death.assister``), flash assists included, as
+  in the scoreboard's assist column.
+* *KAST*: kill, assist, survived, or death that was traded. As on HLTV a pure flash assist does not
+  count as the "A" (checked against HLTV's KAST of a real match: with flash assists one player came
+  out at 78.3 % instead of HLTV's 73.9 %).
 * *Clutch*: the moment a side is reduced to one living player while ``N >= 1`` enemies live, that
   player is in a ``1vN``; it is won when the player's side wins the round.
 * *Equipment value* is ``current_equip_value`` at freeze end, *money at round start* is
@@ -407,11 +434,25 @@ def demoparser_version() -> str | None:
         return None
 
 
+def _as_code(raw: Any) -> int | None:
+    """Integer value of a numeric cell (``3``, ``3.0``, ``"3"``, ``"3.0"``); ``None`` for names / missing."""
+    if isinstance(raw, bool):
+        return None
+    text = to_str(raw)
+    if text is None:
+        return None
+    try:
+        number = float(text)
+    except ValueError:
+        return None
+    return int(number) if math.isfinite(number) and number == int(number) else None
+
+
 def parse_side(raw: Any) -> Side | None:
     """``"CT"`` / ``3`` -> CT, ``"T"`` / ``"TERRORIST"`` / ``2`` -> T, anything else -> ``None``."""
-    number = to_int(raw) if not isinstance(raw, str) or raw.strip().lstrip("+-").isdigit() else None
-    if number is not None:
-        return {T_TEAM_NUM: Side.T, CT_TEAM_NUM: Side.CT}.get(number)
+    code = _as_code(raw)
+    if code is not None:
+        return {T_TEAM_NUM: Side.T, CT_TEAM_NUM: Side.CT}.get(code)
     text = (to_str(raw) or "").upper()
     if text in ("CT", "CTS", "COUNTER-TERRORIST", "COUNTERTERRORIST"):
         return Side.CT
@@ -421,15 +462,16 @@ def parse_side(raw: Any) -> Side | None:
 
 
 def _reason_key(raw: Any) -> tuple[int | None, str | None]:
+    """A round-end reason as ``(numeric code, None)`` or ``(None, lower-case name)``.
+
+    A numeric column that also holds a missing value (the winner-less pseudo round end) arrives as
+    floats (``9.0``), so codes are accepted in every numeric spelling.
+    """
+    code = _as_code(raw)
+    if code is not None:
+        return code, None
     text = to_str(raw)
-    if text is None:
-        return None, None
-    if text.lstrip("+-").isdigit():
-        return int(text), None
-    number = to_int(raw) if not isinstance(raw, str) else None
-    if number is not None:
-        return number, None
-    return None, text.lower()
+    return (None, text.lower()) if text is not None else (None, None)
 
 
 def map_round_end_reason(raw: Any) -> RoundEndReason:
@@ -515,10 +557,6 @@ class _RawRound:
     trp_eff: int = 0
     number: int = 0
 
-    @property
-    def window_start(self) -> int:
-        return self.start_tick if self.start_tick is not None else self.freeze_tick
-
 
 @dataclass
 class _Death:
@@ -586,6 +624,7 @@ class _PlayerRound:
     kills: int = 0
     deaths: int = 0
     assists: int = 0
+    kast_assists: int = 0  # assists that are not pure flash assists
     damage: int = 0
     utility_damage: int = 0
     enemies_flashed: int = 0
@@ -747,7 +786,8 @@ def _build_round_candidates(
     for end_tick in end_ticks:
         winner, reason_raw = ends[end_tick]
         freeze_tick = last_in(freeze_ticks, prev_end, end_tick)
-        start_tick = last_in(start_ticks, prev_end, freeze_tick if freeze_tick is not None else end_tick)
+        # ">= prev_end": demos open with a pseudo round_end (no winner) on the tick of the first round_start.
+        start_tick = last_in(start_ticks, prev_end - 1, freeze_tick if freeze_tick is not None else end_tick)
         lower = prev_end
         prev_end = end_tick
         if winner is None:
@@ -930,6 +970,70 @@ def _window(tick: int, window: int) -> range:
     return range(tick, tick + max(1, window))
 
 
+def _blinds_from_flash_duration(
+    parser: DemoParserLike,
+    detonations: list[dict[str, Any]],
+    options: ParseOptions,
+    warnings: list[str],
+) -> list[dict[str, Any]]:
+    """Rebuild ``player_blind``-like rows from ``flash_duration`` around each flashbang detonation.
+
+    For every detonation the players' ``flash_duration`` just before it (the last tick available in
+    the ``tick_search_window`` before the detonation tick) is compared with the value at the
+    detonation (the first tick available from the detonation tick on): a rise is a new blind of that
+    length, caused by this flashbang. A rise that an earlier detonation within the same window was
+    already credited with is not credited twice (two flashbangs popping on neighbouring ticks).
+    """
+    window = max(1, options.tick_search_window)
+    pops: list[tuple[int, int | None]] = []
+    for row in detonations:
+        tick = to_int(row.get("tick"))
+        if tick is not None:
+            pops.append((tick, to_steamid(row.get("user_steamid"))))
+    if not pops:
+        return []
+    pops.sort(key=lambda pop: pop[0])
+    wanted = sorted({t for tick, _thrower in pops for t in range(tick - window, tick + window) if t >= 0})
+    try:
+        frame = parser.parse_ticks(["flash_duration"], ticks=wanted)
+    except Exception as exc:
+        warnings.append(f"flash_duration unavailable ({exc}): enemies flashed cannot be counted")
+        return []
+    durations: dict[int, dict[int, float]] = defaultdict(dict)
+    for row in records(frame):
+        tick, steamid = to_int(row.get("tick")), to_steamid(row.get("steamid"))
+        if tick is not None and steamid is not None:
+            durations[tick][steamid] = to_float(row.get("flash_duration")) or 0.0
+
+    def first_available(ticks: Iterable[int]) -> dict[int, float] | None:
+        return next((durations[t] for t in ticks if t in durations), None)
+
+    out: list[dict[str, Any]] = []
+    credited: dict[int, tuple[int, float]] = {}  # victim -> (detonation tick, duration) of the last credit
+    for tick, thrower in pops:
+        before = first_available(range(tick - 1, tick - window - 1, -1))
+        after = first_available(range(tick, tick + window))
+        if after is None or before is None:
+            continue  # without a "before" value a rise cannot be told from an older blind
+        for victim, duration in after.items():
+            previous = before.get(victim, 0.0)
+            if duration <= previous + 1e-3:
+                continue  # not a rising edge: not blinded (again) by this flashbang
+            last = credited.get(victim)
+            if last is not None and tick - last[0] < window and abs(last[1] - duration) < 1e-3:
+                continue
+            credited[victim] = (tick, duration)
+            out.append(
+                {
+                    "tick": tick,
+                    "attacker_steamid": thrower,
+                    "user_steamid": victim,
+                    "blind_duration": duration,
+                }
+            )
+    return out
+
+
 # ------------------------------------------------------------------------------------- per-round logic
 
 
@@ -1086,6 +1190,15 @@ def _parse(
                 wanted.update(_window(tick, options.tick_search_window))
     by_tick = _load_ticks(parser, sorted(wanted), warnings)
 
+    blind_rows = events["player_blind"]
+    if not blind_rows:
+        in_match = [
+            row
+            for row in events["flashbang_detonate"]
+            if any(r.freeze_tick <= (to_int(row.get("tick")) or -1) <= r.official_tick for r in rounds)
+        ]
+        blind_rows = _blinds_from_flash_duration(parser, in_match, options, warnings)
+
     site_by_id = _resolve_bomb_sites(events["bomb_planted"])
     throw_events = (
         ("flashbang_detonate", "flashes_thrown"),
@@ -1109,7 +1222,7 @@ def _parse(
     position_rows: list[dict[str, Any]] = []
 
     for rnd in rounds:
-        lo, hi = rnd.window_start, rnd.official_tick
+        lo, hi = rnd.freeze_tick, rnd.official_tick
         freeze_snaps = _snaps_at(by_tick, rnd.freeze_tick, options.tick_search_window)
         stats: dict[int, _PlayerRound] = {}
         for snap in freeze_snaps.values():
@@ -1184,6 +1297,8 @@ def _parse(
                 and (death.victim_side is None or assister.side != death.victim_side)
             ):
                 assister.assists += 1
+                if not death.flash_assisted:
+                    assister.kast_assists += 1
             kill_rows.append(
                 {
                     "round_number": rnd.number,
@@ -1240,7 +1355,7 @@ def _parse(
 
         # -- flashes and thrown utility ---------------------------------------------------------------
         death_tick = {d.victim: d.tick for d in reversed(round_deaths) if d.victim is not None}
-        for row in _events_in(events["player_blind"], lo, hi):
+        for row in _events_in(blind_rows, lo, hi):
             thrower = stats.get(to_steamid(row.get("attacker_steamid")) or 0)
             victim_id = to_steamid(row.get("user_steamid"))
             tick = to_int(row.get("tick")) or 0
@@ -1343,7 +1458,7 @@ def _parse(
                     "equipment_value": pr.equipment_value,
                     "money_start": pr.money_start,
                     "survived": survived,
-                    "kast": pr.kills > 0 or pr.assists > 0 or survived or pr.traded,
+                    "kast": pr.kills > 0 or pr.kast_assists > 0 or survived or pr.traded,
                     "opening_kill": pr.opening_kill,
                     "opening_death": pr.opening_death,
                     "clutch_situation": pr.clutch_situation,

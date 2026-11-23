@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from playwright.sync_api import sync_playwright
 
 from cs2bot.config import BetclicSettings, ExecutorSettings, Settings
 from cs2bot.domain.betting import BetOrder
@@ -93,8 +94,47 @@ def selectors() -> SelectorSet:
 ExecutorFactory = Callable[..., BetclicExecutor]
 
 
+class _SharedPlaywright:
+    """One Playwright driver for all executors of a test module (starting it costs ~0.3 s each time).
+
+    ``BrowserSession.close()`` stops "its" Playwright; for the shared driver that is a no-op - the
+    module fixture stops the real one. Browsers and profiles are still launched and closed per test.
+    """
+
+    def __init__(self, playwright: Any) -> None:
+        self._playwright = playwright
+
+    @property
+    def chromium(self) -> Any:
+        return self._playwright.chromium
+
+    def stop(self) -> None:
+        return
+
+
+@pytest.fixture(scope="module")
+def shared_playwright() -> Iterator[Callable[[], Any]]:
+    """Factory for ``BetclicExecutor(playwright_factory=...)``; the driver starts on first use.
+
+    Module-scoped on purpose: Playwright's sync API allows one driver per thread, so it must be gone
+    before another package's browser tests start their own in the same pytest process.
+    """
+    started: list[Any] = []
+
+    def factory() -> Any:
+        if not started:
+            started.append(sync_playwright().start())
+        return _SharedPlaywright(started[0])
+
+    yield factory
+    for playwright in started:
+        playwright.stop()
+
+
 @pytest.fixture
-def make_executor(executor_settings: Settings) -> Iterator[ExecutorFactory]:
+def make_executor(
+    executor_settings: Settings, shared_playwright: Callable[[], Any]
+) -> Iterator[ExecutorFactory]:
     created: list[BetclicExecutor] = []
 
     def _make(**kwargs: Any) -> BetclicExecutor:
@@ -102,6 +142,7 @@ def make_executor(executor_settings: Settings) -> Iterator[ExecutorFactory]:
         kwargs.setdefault("halt_check", lambda: (False, None))
         kwargs.setdefault("sleep", lambda _s: None)
         kwargs.setdefault("tuning", FAST_TUNING)
+        kwargs.setdefault("playwright_factory", shared_playwright)
         executor = BetclicExecutor(settings, **kwargs)
         created.append(executor)
         return executor

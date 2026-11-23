@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import threading
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Annotated
@@ -26,6 +26,12 @@ ExecutorHealthProvider = Callable[[], ExecutorHealth | None]
 LoginLauncher = Callable[[], object]
 # Re-maps an event's stored markets after a manual link change (``cs2bot.odds.collector.remap_event``).
 EventRemapper = Callable[[Session, BookmakerEvent], object]
+# ``cs2bot.flows.scheduler.Scheduler.status``: one dict per job (name, lane, enabled, last_run,
+# next_due, failures). Must be fast (it only snapshots in-memory state).
+SchedulerStatusProvider = Callable[[], Sequence[Mapping[str, object]]]
+
+# ``audit_log.actor`` / ``system_state.updated_by`` are VARCHAR(64) (PostgreSQL rejects longer values).
+_ACTOR_MAX_LEN = 64
 
 
 class LoginLauncherRunner:
@@ -95,6 +101,7 @@ class ApiContext:
     login_runner: LoginLauncherRunner
     executor_health_provider: ExecutorHealthProvider | None = None
     event_remapper: EventRemapper | None = None
+    scheduler_status_provider: SchedulerStatusProvider | None = None
     clock: Callable[[], datetime] = field(default=utcnow)
 
     def now(self) -> datetime:
@@ -109,8 +116,9 @@ class AuthState:
 
     @property
     def actor(self) -> str:
-        """Audit-log actor for changes made through the dashboard."""
-        return f"dashboard:{self.username}" if self.username else "dashboard"
+        """Audit-log actor for changes made through the dashboard (at most 64 characters)."""
+        actor = f"dashboard:{self.username}" if self.username else "dashboard"
+        return actor[:_ACTOR_MAX_LEN]
 
 
 def get_ctx(request: Request) -> ApiContext:

@@ -11,6 +11,10 @@ class DemoDownloadError(DemoError):
     """The archive could not be downloaded (HTTP error, challenge page, size limit, empty file)."""
 
 
+class DemoDownloadBlockedError(DemoDownloadError):
+    """The source answered with a challenge / block page: stop downloading and try again later."""
+
+
 class ArchiveError(DemoError):
     """The archive is corrupt, of an unknown type or contains no ``.dem`` file."""
 

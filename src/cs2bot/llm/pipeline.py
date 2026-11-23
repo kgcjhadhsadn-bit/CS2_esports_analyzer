@@ -86,9 +86,11 @@ def triage_pending_news(
     """Triage up to ``limit`` not-yet-triaged news items (newest first) and store the verdicts.
 
     Items older than ``max_age_days`` are left alone (they cannot affect upcoming matches). An item
-    the model repeatedly fails to classify for content-related reasons is given up on after
-    ``tuning.triage_max_attempts`` attempts (counted in ``news_items.extra["llm"]``); transient
-    failures (rate limit, network, disabled) do not count as attempts.
+    the model repeatedly fails to classify for content-related reasons (refused, truncated, skipped)
+    is given up on after ``tuning.triage_max_attempts`` attempts (counted in
+    ``news_items.extra["llm"]``). It then stays untriaged, which ``select_news_for_match`` still shows
+    to the context model. Transient failures (rate limit, network, a rejected request, disabled) do
+    not count as attempts.
     """
     current = ensure_utc(now) if now is not None else utcnow()
     since = current - timedelta(days=max(0, max_age_days))
@@ -103,15 +105,17 @@ def triage_pending_news(
             ),
         )
         .order_by(NewsItem.id.desc())
-        .limit(max(0, limit) * 3)
     )
+    # Given-up items stay untriaged (``triaged_at`` NULL), so they are filtered here rather than with
+    # a SQL LIMIT - otherwise a pile of them at the top could starve newer work. The window is at
+    # most ``max_age_days`` of news (a few hundred rows).
     pending: dict[int, NewsItem] = {}
     for row in rows:
+        if len(pending) >= limit:
+            break
         if _attempts(row) >= max_attempts:
             continue
         pending[row.id] = row
-        if len(pending) >= limit:
-            break
     if not pending:
         return TriageReport(LLMStatus.OK)
     if not analyzer.enabled:

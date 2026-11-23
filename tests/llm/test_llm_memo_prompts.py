@@ -11,7 +11,7 @@ from anthropic.lib._parse._transform import transform_schema
 from cs2bot.domain.enums import TeamSlot, VetoAction
 from cs2bot.domain.records import VetoStep
 from cs2bot.llm import prompts
-from cs2bot.llm.memo import AnalysisMemo, MemoEntry, context_fingerprint
+from cs2bot.llm.memo import AnalysisMemo, MemoEntry, context_fingerprint, rationale_fingerprint
 from cs2bot.llm.schemas import (
     ContextFlagSuggestion,
     MatchContextResult,
@@ -22,7 +22,7 @@ from cs2bot.llm.schemas import (
     clamp01,
 )
 from cs2bot.llm.tuning import LLMTuning
-from tests.llm.llm_factories import NOW, make_ctx, make_flag, make_news
+from tests.llm.llm_factories import NOW, make_ctx, make_decision, make_flag, make_news, make_prediction
 
 # ---------------------------------------------------------------------------------------------
 # Fingerprint
@@ -38,13 +38,17 @@ def test_fingerprint_ignores_order_and_irrelevant_fields() -> None:
     assert context_fingerprint(ctx, [*news, make_news(1)]) == base  # duplicates
     shuffled = make_ctx(team1_lineup=list(reversed(ctx.team1_lineup)), tournament_name="renamed", stage="x")
     assert context_fingerprint(shuffled, news) == base
-    assert context_fingerprint(ctx, [make_news(1, title="edited title")]) == context_fingerprint(ctx, [make_news(1)])
+    assert context_fingerprint(ctx, [make_news(1, title="edited title")]) == context_fingerprint(
+        ctx, [make_news(1)]
+    )
 
 
 def test_fingerprint_changes_with_news_lineup_veto_schedule_and_match() -> None:
     ctx, news = make_ctx(), [make_news(1)]
     base = context_fingerprint(ctx, news)
-    standin = [p.model_copy(update={"is_standin": True}) if p.player_id == 101 else p for p in ctx.team1_lineup]
+    standin = [
+        p.model_copy(update={"is_standin": True}) if p.player_id == 101 else p for p in ctx.team1_lineup
+    ]
     veto = [VetoStep(step=1, action=VetoAction.BAN, team=TeamSlot.TEAM1, map_name="nuke")]
     variants = [
         context_fingerprint(ctx, [make_news(1), make_news(2)]),
@@ -135,7 +139,10 @@ def test_escape_untrusted() -> None:
 
 def test_truncate_visibly() -> None:
     assert prompts.truncate_visibly("short", 10) == "short"
-    assert prompts.truncate_visibly("x" * 12, 10) == "x" * 10 + "\n[... article cut here: 2 more characters not shown]"
+    assert (
+        prompts.truncate_visibly("x" * 12, 10)
+        == "x" * 10 + "\n[... article cut here: 2 more characters not shown]"
+    )
     assert prompts.truncate_visibly("abc", 0) == "abc" and prompts.truncate_visibly(None, 5) == ""
 
 
@@ -211,14 +218,19 @@ def test_triage_item_cleans_its_values() -> None:
     )
     assert item.label is TriageLabel.BOOTCAMP and item.relevance == 0.0
     assert item.team_names == ["FaZe Clan"] and item.team_ids == [1, 3]
-    assert len(item.summary) == 300 and item.summary.startswith("A very long word") and item.summary.endswith("…")
+    assert (
+        len(item.summary) == 300
+        and item.summary.startswith("A very long word")
+        and item.summary.endswith("…")
+    )
     assert clamp01(-1) == 0.0 and clamp01(2) == 1.0 and clamp01(float("inf")) == 0.0 and clamp01(0.25) == 0.25
 
 
 def test_suggestion_schema_parses_model_json() -> None:
     raw = (
         '{"flags": [{"flag_type": "visa_issue", "team": "team1", "severity": 0.7, "confidence": 0.9, '
-        '"logit_shift": -0.15, "veto": false, "rationale": "r", "evidence": ["news-1"], "expires_at": null}], '
+        '"logit_shift": -0.15, "veto": false, "rationale": "r", "evidence": ["news-1"], '
+        '"expires_at": null}], '
         '"note": "  Visa   trouble. "}'
     )
     parsed = MatchContextResult.model_validate_json(raw)
@@ -230,3 +242,55 @@ def test_tuning_defaults_follow_the_brief() -> None:
     tuning = LLMTuning()
     assert tuning.triage_batch_size == 20 and tuning.context_max_tokens == 16000
     assert tuning.veto_min_confidence == 0.6 and tuning.fallback_beta == "server-side-fallback-2026-07-01"
+
+
+# ---------------------------------------------------------------------------------------------
+# Rationale fingerprint
+# ---------------------------------------------------------------------------------------------
+
+
+def test_rationale_fingerprint_ignores_price_drift_and_ordering() -> None:
+    ctx, prediction = make_ctx(), make_prediction()
+    bets = [make_decision(accepted=True), make_decision(accepted=True, selection="team2")]
+    base = rationale_fingerprint(prediction, bets, ctx)
+    assert len(base) == 32
+    drifted = [
+        make_decision(accepted=True, selection="team2", odds="2.40", ev=0.09),
+        make_decision(accepted=True, odds="1.71", ev=0.031, p_win=0.8),
+        make_decision(accepted=False, selection="draw", reasons=["low_probability: 0.1 < 0.75"]),
+    ]
+    assert rationale_fingerprint(prediction, drifted, ctx) == base
+    reordered = make_ctx(team1_lineup=list(reversed(ctx.team1_lineup)), stage="Final")
+    assert rationale_fingerprint(prediction, bets, reordered) == base
+    later = make_prediction(created_at=NOW + timedelta(minutes=15), n_simulations=10_000)
+    assert rationale_fingerprint(later, bets, ctx) == base
+
+
+def test_rationale_fingerprint_probability_bands() -> None:
+    ctx, bets = make_ctx(), [make_decision(accepted=True)]
+
+    def at(p: float, step: float = 0.025) -> str:
+        central = make_prediction().central.model_copy(update={"p_team1_win": p})
+        return rationale_fingerprint(make_prediction(central=central), bets, ctx, probability_step=step)
+
+    assert at(0.626) == at(0.649)  # same 2.5 pp band [0.625, 0.650)
+    assert at(0.649) != at(0.651)
+    assert at(0.650) == at(0.6501)  # a value exactly on an edge is stable against float noise
+    assert at(0.626, step=0.1) == at(0.69, step=0.1)
+    assert at(0.64, step=0.0) == at(0.64)  # a non-positive step falls back to the default
+
+
+def test_rationale_fingerprint_tracks_flags_veto_and_bets() -> None:
+    ctx, bet = make_ctx(), make_decision(accepted=True)
+    base = rationale_fingerprint(make_prediction(), [bet], ctx)
+    veto_flag = make_prediction(context_flags=[make_flag(veto=True)])
+    stronger = make_prediction(context_flags=[make_flag(logit_shift=0.2)])
+    published = make_prediction(veto_known=True)
+    variants = {
+        rationale_fingerprint(veto_flag, [bet], ctx),
+        rationale_fingerprint(stronger, [bet], ctx),
+        rationale_fingerprint(published, [bet], ctx),
+        rationale_fingerprint(make_prediction(), [], ctx),
+        rationale_fingerprint(make_prediction(match_id=11), [bet], ctx),
+    }
+    assert base not in variants and len(variants) == 5

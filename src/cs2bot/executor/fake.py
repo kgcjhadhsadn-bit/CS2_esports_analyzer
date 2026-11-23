@@ -5,6 +5,10 @@ script it behaves like a well-behaved bookmaker: honours the halt check, ``LOGIN
 out, ``DRY_RUN_OK`` for dry-run orders, ``INSUFFICIENT_BALANCE`` when the stake exceeds the balance, else
 ``PLACED`` (balance reduced, an open bet added to the history for reconciliation tests). Every call is
 recorded in :attr:`FakeExecutor.calls`.
+
+Like the real executor it never places twice: once a real (non-dry-run) placement for an idempotency key
+ended ``PLACED`` or ``UNCERTAIN``, another ``place`` with that key answers ``UNCERTAIN`` ("refusing to
+place twice") without consuming the script (``enforce_idempotency=False`` switches this off).
 """
 
 from __future__ import annotations
@@ -42,6 +46,7 @@ class FakeExecutor:
         health: ExecutorHealth | None = None,
         history: Iterable[BookmakerBetRecord] = (),
         login_succeeds: bool = True,
+        enforce_idempotency: bool = True,
     ) -> None:
         self.script: deque[ScriptItem] = deque(script)
         self.balance = balance
@@ -51,6 +56,8 @@ class FakeExecutor:
         self.health = health
         self.history: list[BookmakerBetRecord] = list(history)
         self.login_succeeds = login_succeeds
+        self.enforce_idempotency = enforce_idempotency
+        self.clicked_keys: dict[str, PlacementStatus] = {}  # keys that ended PLACED / UNCERTAIN
         self.calls: list[tuple[str, Any]] = []
         self.orders: list[BetOrder] = []
         self.results: list[PlacementResult] = []
@@ -135,6 +142,22 @@ class FakeExecutor:
             raise ExecutorClosedError("this FakeExecutor was closed")
 
     def _next_result(self, order: BetOrder) -> PlacementResult:
+        result = self._decide(order)
+        is_dry_run = self.honour_dry_run and order.dry_run
+        if result.status in (PlacementStatus.PLACED, PlacementStatus.UNCERTAIN) and not is_dry_run:
+            self.clicked_keys.setdefault(order.idempotency_key, result.status)
+        return result
+
+    def _decide(self, order: BetOrder) -> PlacementResult:
+        previous = self.clicked_keys.get(order.idempotency_key)
+        is_dry_run = self.honour_dry_run and order.dry_run  # dry runs never click: never refused
+        if self.enforce_idempotency and previous is not None and not is_dry_run:
+            return self._make(
+                order,
+                PlacementStatus.UNCERTAIN,
+                f"fake executor: refusing to place twice: idempotency key {order.idempotency_key!r} "
+                f"already ended {previous.value}; reconcile via bet history",
+            )
         if self.halt_check is not None:
             halted, reason = self.halt_check()
             if halted:

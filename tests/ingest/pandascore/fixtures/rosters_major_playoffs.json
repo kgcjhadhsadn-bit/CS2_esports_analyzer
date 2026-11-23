@@ -1,0 +1,169 @@
+{
+ "rosters": [
+  {
+   "acronym": "TS",
+   "dark_mode_image_url": null,
+   "id": 124523,
+   "image_url": "https://cdn.pandascore.co/images/team/image/124523/team-spirit-cs-go.png",
+   "location": "RU",
+   "modified_at": "2026-11-10T09:14:51Z",
+   "name": "Team Spirit",
+   "slug": "team-spirit-cs-go",
+   "players": [
+    {
+     "active": true,
+     "age": null,
+     "birthday": null,
+     "first_name": "Danil",
+     "id": 30412,
+     "image_url": "https://cdn.pandascore.co/images/player/image/30412/donk.png",
+     "last_name": "Kryshkovets",
+     "modified_at": "2026-11-02T11:20:07Z",
+     "name": "donk",
+     "nationality": "RU",
+     "role": null,
+     "slug": "donk"
+    },
+    {
+     "active": true,
+     "age": null,
+     "birthday": null,
+     "first_name": "Dmitry",
+     "id": 21230,
+     "image_url": "https://cdn.pandascore.co/images/player/image/21230/sh1ro.png",
+     "last_name": "Sokolov",
+     "modified_at": "2026-11-02T11:20:07Z",
+     "name": "sh1ro",
+     "nationality": "RU",
+     "role": null,
+     "slug": "sh1ro"
+    },
+    {
+     "active": true,
+     "age": null,
+     "birthday": null,
+     "first_name": "Leonid",
+     "id": 19870,
+     "image_url": "https://cdn.pandascore.co/images/player/image/19870/chopper.png",
+     "last_name": "Vishnyakov",
+     "modified_at": "2026-11-02T11:20:07Z",
+     "name": "chopper",
+     "nationality": "RU",
+     "role": null,
+     "slug": "chopper"
+    },
+    {
+     "active": true,
+     "age": null,
+     "birthday": null,
+     "first_name": "Myroslav",
+     "id": 30977,
+     "image_url": "https://cdn.pandascore.co/images/player/image/30977/zont1x.png",
+     "last_name": "Plakhotia",
+     "modified_at": "2026-11-02T11:20:07Z",
+     "name": "zont1x",
+     "nationality": "UA",
+     "role": null,
+     "slug": "zont1x"
+    },
+    {
+     "active": true,
+     "age": null,
+     "birthday": null,
+     "first_name": "Ivan",
+     "id": 36244,
+     "image_url": "https://cdn.pandascore.co/images/player/image/36244/zweih.png",
+     "last_name": "Gogin",
+     "modified_at": "2026-11-02T11:20:07Z",
+     "name": "zweih",
+     "nationality": "RU",
+     "role": null,
+     "slug": "zweih"
+    }
+   ]
+  },
+  {
+   "acronym": "G2",
+   "dark_mode_image_url": null,
+   "id": 3210,
+   "image_url": "https://cdn.pandascore.co/images/team/image/3210/g2-cs-go.png",
+   "location": "DE",
+   "modified_at": "2026-11-10T09:14:51Z",
+   "name": "G2",
+   "slug": "g2-cs-go",
+   "players": [
+    {
+     "active": true,
+     "age": null,
+     "birthday": null,
+     "first_name": "Nemanja",
+     "id": 20711,
+     "image_url": "https://cdn.pandascore.co/images/player/image/20711/hunter-.png",
+     "last_name": "Kovac",
+     "modified_at": "2026-11-02T11:20:07Z",
+     "name": "huNter-",
+     "nationality": "BA",
+     "role": null,
+     "slug": "hunter-"
+    },
+    {
+     "active": true,
+     "age": null,
+     "birthday": null,
+     "first_name": "Janusz",
+     "id": 18811,
+     "image_url": "https://cdn.pandascore.co/images/player/image/18811/snax.png",
+     "last_name": "Pogorzelski",
+     "modified_at": "2026-11-02T11:20:07Z",
+     "name": "Snax",
+     "nationality": "PL",
+     "role": null,
+     "slug": "snax"
+    },
+    {
+     "active": true,
+     "age": null,
+     "birthday": null,
+     "first_name": "Mario",
+     "id": 33218,
+     "image_url": "https://cdn.pandascore.co/images/player/image/33218/malbsmd.png",
+     "last_name": "Samayoa",
+     "modified_at": "2026-11-02T11:20:07Z",
+     "name": "malbsMd",
+     "nationality": "GT",
+     "role": null,
+     "slug": "malbsmd"
+    },
+    {
+     "active": true,
+     "age": null,
+     "birthday": null,
+     "first_name": "Nikita",
+     "id": 33901,
+     "image_url": "https://cdn.pandascore.co/images/player/image/33901/heavygod.png",
+     "last_name": "Martynenko",
+     "modified_at": "2026-11-02T11:20:07Z",
+     "name": "HeavyGod",
+     "nationality": "IL",
+     "role": null,
+     "slug": "heavygod"
+    },
+    {
+     "active": true,
+     "age": null,
+     "birthday": null,
+     "first_name": "Matus",
+     "id": 35120,
+     "image_url": "https://cdn.pandascore.co/images/player/image/35120/matys.png",
+     "last_name": "Simko",
+     "modified_at": "2026-11-02T11:20:07Z",
+     "name": "MATYS",
+     "nationality": "SK",
+     "role": null,
+     "slug": "matys"
+    }
+   ]
+  }
+ ],
+ "type": "Team"
+}

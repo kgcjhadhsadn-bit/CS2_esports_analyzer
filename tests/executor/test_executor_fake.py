@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import itertools
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
@@ -21,11 +22,15 @@ from cs2bot.executor import (
 )
 from cs2bot.utils.time import utcnow
 
+_seq = itertools.count(7)
+
 
 def order(**overrides: object) -> BetOrder:
+    """A valid order; every call gets its own idempotency key (as every real bet does)."""
+    n = next(_seq)
     data: dict[str, object] = {
-        "bet_id": 7,
-        "idempotency_key": "k-7",
+        "bet_id": n,
+        "idempotency_key": f"k-{n}",
         "external_event_id": "3002201001",
         "market_raw_name": "Zwycięzca meczu",
         "selection_raw_name": "Natus Vincere",
@@ -134,3 +139,26 @@ def test_bookmaker_bet_record_requires_aware_datetimes() -> None:
         BookmakerBetRecord(external_bet_id="x", placed_at=datetime(2026, 1, 1))
     rec = BookmakerBetRecord(external_bet_id="x", placed_at=datetime(2026, 1, 1, 1, tzinfo=UTC))
     assert rec.placed_at is not None and rec.placed_at.tzinfo is not None
+
+
+def test_never_places_twice_for_one_idempotency_key() -> None:
+    """Same rule as the real executor: PLACED / UNCERTAIN keys are refused, rejections may be retried."""
+    fake = FakeExecutor([PlacementStatus.UNCERTAIN, PlacementStatus.INSUFFICIENT_BALANCE])
+    unsure = order()
+    assert fake.place(unsure).status is PlacementStatus.UNCERTAIN
+    again = fake.place(unsure)
+    assert again.status is PlacementStatus.UNCERTAIN and "refusing to place twice" in again.message
+    assert len(fake.script) == 1  # the refusal did not consume the script
+    rejected = order()
+    assert fake.place(rejected).status is PlacementStatus.INSUFFICIENT_BALANCE
+    placed = fake.place(rejected)  # a definite rejection may be retried
+    assert placed.status is PlacementStatus.PLACED and placed.external_bet_id == "FAKE-1"
+    assert fake.place(rejected).status is PlacementStatus.UNCERTAIN
+    assert len(fake.history) == 1 and fake.balance == Decimal("990.00")
+    # dry runs never click: they neither block a key nor are they blocked by an unrelated one
+    dry = order(dry_run=True)
+    assert fake.place(dry).status is PlacementStatus.DRY_RUN_OK
+    assert fake.place(dry).status is PlacementStatus.DRY_RUN_OK
+    loose = FakeExecutor(enforce_idempotency=False)
+    twice = order()
+    assert [loose.place(twice).status, loose.place(twice).status] == [PlacementStatus.PLACED] * 2

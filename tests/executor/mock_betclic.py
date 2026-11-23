@@ -201,6 +201,15 @@ class MockState:
     history_page_size: int = 5
     slip_add_delay_s: float = 0.15
     last_receipt: str | None = None  # shown in the slip until the user closes it (survives reloads)
+    # --- knobs for adversarial tests ---
+    show_potential_win: bool = True  # "Możliwa wygrana" line in the slip
+    win_factor: Decimal = Decimal("0.88")  # potential win = stake x odds x this (12% stake tax)
+    stake_multiplier: Decimal = Decimal("1")  # 100 = the site misreads "12,50" as 1250
+    hidden_slip_item: bool = False  # a stale selection kept in the DOM but hidden (display: none)
+    slip_market_override: str | None = None  # the slip shows this market name instead of the real one
+    extra_slip_notice: str | None = None  # an informational role=alert message in the slip
+    place_delay_s: float = 0.0  # the server takes this long to answer a place request
+    redirects: dict[str, str] = field(default_factory=dict)  # GET path -> 302 Location
 
     def find_selection(self, selection_id: str) -> tuple[MockEvent, MockMarket, MockSelection] | None:
         for event in self.events.values():
@@ -278,7 +287,7 @@ class MockBetclicServer:
                 {
                     "selection_id": selection.id,
                     "selection": selection.name,
-                    "market": market.name,
+                    "market": self.state.slip_market_override or market.name,
                     "event": event.name,
                     "odds": selection.odds,
                 }
@@ -330,6 +339,11 @@ class MockBetclicServer:
             "accept_mode": st.accept_mode,
             "history_page_size": st.history_page_size,
             "receipt": st.last_receipt,
+            "show_potential_win": st.show_potential_win,
+            "win_factor": float(st.win_factor),
+            "stake_multiplier": float(st.stake_multiplier),
+            "hidden_slip_item": st.hidden_slip_item,
+            "extra_slip_notice": st.extra_slip_notice,
             "slip": self.slip_items(),
             "page": self.page_data(path),
         }
@@ -395,7 +409,7 @@ class MockBetclicServer:
             return response
         if response["result"] != "ok":
             return response
-        stake = parse_pl(str(call["stake_text"] or "0"))
+        stake = parse_pl(str(call["stake_text"] or "0")) * st.stake_multiplier
         if stake > st.balance:
             return {
                 "result": "error",
@@ -423,7 +437,13 @@ class MockBetclicServer:
         st.balance -= stake
         st.slip = []
         st.last_receipt = bet_id
-        return {"result": "ok", "bet_id": bet_id, "balance_text": pl_money(st.balance), "slip": []}
+        return {
+            "result": "ok",
+            "bet_id": bet_id,
+            "balance_text": pl_money(st.balance),
+            "slip": [],
+            "note": response.get("note"),  # e.g. "oczekuje na akceptację" (pending trader approval)
+        }
 
 
 def _make_handler(server: MockBetclicServer) -> type[BaseHTTPRequestHandler]:
@@ -472,6 +492,13 @@ def _make_handler(server: MockBetclicServer) -> type[BaseHTTPRequestHandler]:
             if path == "/favicon.ico":
                 self._send(404, b"", "text/plain")
                 return
+            target = server.state.redirects.get(path)
+            if target is not None:
+                self.send_response(302)
+                self.send_header("Location", target)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+                return
             self._send(200, (SITE_DIR / "index.html").read_bytes(), "text/html; charset=utf-8")
 
         def do_POST(self) -> None:
@@ -484,6 +511,8 @@ def _make_handler(server: MockBetclicServer) -> type[BaseHTTPRequestHandler]:
             path = urlsplit(self.path).path
             if path == "/api/slip/add":
                 time.sleep(server.state.slip_add_delay_s)  # the real site updates the slip asynchronously
+            if path == "/api/place" and server.state.place_delay_s > 0:
+                time.sleep(server.state.place_delay_s)
             with server.lock:
                 payload = server.handle_post(path, body)
             self._json(payload)

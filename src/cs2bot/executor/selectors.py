@@ -284,6 +284,13 @@ class SelectorBehaviour(BaseModel):
     odds_change_accept_places_bet: bool = True
     dismiss_cookie_banner: bool = True
     dismiss_popups: bool = True
+    # True: a market name shown in the bet slip that does not fit the ordered market aborts the bet
+    # (SELECTOR_ERROR). False: only a warning is logged.
+    require_slip_market_match: bool = True
+    # True: bet-slip selections that are in the DOM but hidden count as stale selections and abort the
+    # bet (a hidden second selection would turn the single into a combination bet). Set to False only
+    # if the page is known to keep hidden duplicates of the visible slip.
+    count_hidden_slip_items: bool = True
 
 
 @dataclass(frozen=True)

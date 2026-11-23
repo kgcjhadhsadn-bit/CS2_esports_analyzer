@@ -214,6 +214,7 @@ def resolve_ps_player(
     seen_at: datetime | None,
     move_team: bool,
     same_match_candidates: list[Player] | None = None,
+    keep_team_player_ids: set[int] | frozenset[int] = frozenset(),
 ) -> Player | None:
     """Find or create the player of a PandaScore roster / stat line of ``team``.
 
@@ -224,7 +225,9 @@ def resolve_ps_player(
 
     ``Player.current_team_id`` only moves when ``move_team`` is set and this sighting (``seen_at``) is
     not older than the last one recorded by PandaScore or HLTV, so a backfill walking through old
-    matches never drags players back to former teams.
+    matches never drags players back to former teams. Players whose DB id is in
+    ``keep_team_player_ids`` (stand-ins according to another source's lineup of this match) are never
+    moved.
     """
     if ps_player.id is None or not ps_player.name:
         return None
@@ -259,7 +262,7 @@ def resolve_ps_player(
             player.real_name = real_name
         if country and not player.country:
             player.country = country
-    if move_team and seen_at is not None:
+    if move_team and seen_at is not None and player.id not in keep_team_player_ids:
         last = _last_team_sighting(player)
         if last is None or seen_at >= last:
             if player.current_team_id != team.id:

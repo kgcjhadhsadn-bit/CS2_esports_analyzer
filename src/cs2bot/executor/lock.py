@@ -177,9 +177,16 @@ class ProfileLock:
             return None
 
     def acquire(self) -> None:
-        """Take the lock or raise :class:`ProfileLockedError` (stale locks are broken first)."""
-        if self._held:
+        """Take the lock or raise :class:`ProfileLockedError` (stale locks are broken first).
+
+        A no-op while we hold the lock. If our lock was *lost* (the file was deleted, or another process
+        took it over after judging it stale - e.g. the PC slept longer than ``stale_after_s``), it is
+        taken again from scratch: that fails with :class:`ProfileLockedError` when someone else holds it.
+        """
+        if self._held and not self._lost:
             return
+        if self._held:  # lost: forget the old lock (release() never deletes a file that is not ours)
+            self.release()
         self.profile_dir.mkdir(parents=True, exist_ok=True)
         for _ in range(3):
             now = self._clock()
@@ -225,6 +232,11 @@ class ProfileLock:
                 log.debug("lock heartbeat failed: %s", exc)
                 with contextlib.suppress(OSError):
                     tmp.unlink()
+
+    def verify(self) -> bool:
+        """Re-read the lock file now: ``True`` only if we hold the lock and the file is still ours."""
+        self.refresh()
+        return self._held and not self._lost
 
     def release(self) -> None:
         """Stop the heartbeat and delete the lock file if it is still ours."""

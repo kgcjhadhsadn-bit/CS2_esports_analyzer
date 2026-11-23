@@ -12,6 +12,7 @@ from pydantic import SecretStr, ValidationError
 from cs2bot.config import Settings
 from cs2bot.domain.enums import ContextFlagType, TeamSlot
 from cs2bot.llm.context import (
+    ADVERSE_FLAG_TYPES,
     CONTEXT_EVIDENCE,
     ContextAnalyzer,
     LLMStatus,
@@ -199,7 +200,7 @@ def test_suggestions_are_clipped_and_clamped() -> None:
 
 
 def test_negative_shift_is_clipped_to_the_configured_bound() -> None:
-    client = FakeClient([fake_response(context_result(suggestion(logit_shift=-9.0)))])
+    client = FakeClient([fake_response(context_result(suggestion(team=TeamSlot.TEAM1, logit_shift=-9.0)))])
     analyzer = _analyzer(client, make_settings(max_flag_logit_shift=0.05))
     assert analyzer.analyze_match(make_ctx(), [make_news(1)], now=NOW)[0].logit_shift == pytest.approx(-0.05)
 
@@ -220,7 +221,18 @@ def test_flags_without_supplied_evidence_are_dropped(caplog: pytest.LogCaptureFi
 def test_evidence_resolution_variants() -> None:
     news = [make_news(1), make_news(2)]
     index = build_evidence_index(news)
-    raw = ["NEWS-2", "news:1", " #2 ", news[0].url.upper(), "context", "Match Context", "news-0", "3", "", "x"]
+    raw = [
+        "NEWS-2",
+        "news:1",
+        " #2 ",
+        news[0].url.upper(),
+        "context",
+        "Match Context",
+        "news-0",
+        "3",
+        "",
+        "x",
+    ]
     assert resolve_evidence(raw, index) == [news[1].url, news[0].url, CONTEXT_EVIDENCE]
     assert resolve_evidence(["news-1"], {}) == []
     assert len(resolve_evidence([f"news-{i}" for i in range(1, 3)] + ["context"], index, limit=2)) == 2
@@ -228,7 +240,12 @@ def test_evidence_resolution_variants() -> None:
 
 def test_context_only_evidence_is_accepted() -> None:
     lineup_unknown = suggestion(
-        flag_type=ContextFlagType.OTHER, team=None, veto=True, confidence=0.9, logit_shift=0.0, evidence=["context"]
+        flag_type=ContextFlagType.OTHER,
+        team=None,
+        veto=True,
+        confidence=0.9,
+        logit_shift=0.0,
+        evidence=["context"],
     )
     client = FakeClient([fake_response(context_result(lineup_unknown))])
     flag = _analyzer(client).analyze_match(make_ctx(team1_lineup=[]), [], now=NOW)[0]
@@ -271,7 +288,9 @@ def test_rationale_is_sanitised_and_bounded() -> None:
     assert flag is not None
     assert "<script>" not in flag.rationale and flag.rationale.startswith("alert(1) Stand-in confirmed")
     assert len(flag.rationale) <= LLMTuning().max_rationale_chars
-    empty = suggestion_to_flag(suggestion(rationale=" "), settings=make_settings().llm, evidence_index=index, now=NOW)
+    empty = suggestion_to_flag(
+        suggestion(rationale=" "), settings=make_settings().llm, evidence_index=index, now=NOW
+    )
     assert empty is not None and empty.rationale == "(no rationale given)"
 
 
@@ -366,7 +385,13 @@ def test_missing_parsed_output_is_a_failure() -> None:
 
 @pytest.mark.parametrize(
     "error",
-    [api_status_error(429), api_status_error(500), api_status_error(529), api_status_error(400), connection_error()],
+    [
+        api_status_error(429),
+        api_status_error(500),
+        api_status_error(529),
+        api_status_error(400),
+        connection_error(),
+    ],
 )
 def test_api_errors_degrade_to_empty(error: Exception) -> None:
     analyzer = _analyzer(FakeClient([error]))
@@ -403,7 +428,11 @@ def test_usage_is_accumulated() -> None:
     analyzer = _analyzer(client, tuning=LLMTuning(reanalysis_interval_s=0.0))
     analyzer.analyze_match(make_ctx(), [], now=NOW)
     analyzer.analyze_match(make_ctx(), [], now=NOW + timedelta(minutes=1))
-    assert (analyzer.usage.requests, analyzer.usage.input_tokens, analyzer.usage.output_tokens) == (2, 2400, 600)
+    assert (analyzer.usage.requests, analyzer.usage.input_tokens, analyzer.usage.output_tokens) == (
+        2,
+        2400,
+        600,
+    )
 
 
 # ---------------------------------------------------------------------------------------------
@@ -454,15 +483,36 @@ def test_interval_is_shorter_close_to_the_start() -> None:
     assert len(client.calls) == 2
 
 
-def test_failed_analysis_backs_off_then_retries() -> None:
-    client = FakeClient([refusal(), fake_response(context_result(suggestion()))])
+def test_transient_failure_backs_off_briefly_then_retries() -> None:
+    client = FakeClient([api_status_error(503), fake_response(context_result(suggestion()))])
     analyzer = _analyzer(client)
     ctx, news = make_ctx(), [make_news(1)]
-    assert analyzer.analyze_match_detailed(ctx, news, now=NOW).status is LLMStatus.REFUSED
+    assert analyzer.analyze_match_detailed(ctx, news, now=NOW).status is LLMStatus.FAILED
     backoff = analyzer.analyze_match_detailed(ctx, news, now=NOW + timedelta(minutes=5))
     assert backoff.status is LLMStatus.BACKOFF and backoff.flags == [] and len(client.calls) == 1
     retried = analyzer.analyze_match_detailed(ctx, news, now=NOW + timedelta(minutes=16))
     assert retried.ok and len(retried.flags) == 1 and len(client.calls) == 2
+
+
+@pytest.mark.parametrize("failure", [refusal(), fake_response(None, stop_reason="max_tokens")])
+def test_refused_or_truncated_inputs_are_not_resent_before_the_reanalysis_interval(failure: Any) -> None:
+    """Such answers are billed and would repeat for identical inputs: no retry every 15 minutes."""
+    client = FakeClient(
+        [failure, fake_response(context_result(suggestion())), fake_response(context_result())]
+    )
+    analyzer = _analyzer(client)
+    ctx, news = make_ctx(), [make_news(1)]
+    assert not analyzer.analyze_match_detailed(ctx, news, now=NOW).ok
+    for minutes in (16, 120, 359):
+        waiting = analyzer.analyze_match_detailed(ctx, news, now=NOW + timedelta(minutes=minutes))
+        assert waiting.status is LLMStatus.BACKOFF
+    assert len(client.calls) == 1
+    # New information is a new fingerprint and is analysed immediately ...
+    fresh = analyzer.analyze_match_detailed(ctx, [*news, make_news(2)], now=NOW + timedelta(minutes=20))
+    assert fresh.ok and len(client.calls) == 2
+    # ... and the old inputs are tried again once the interval has passed.
+    assert analyzer.analyze_match_detailed(ctx, news, now=NOW + timedelta(hours=6, minutes=1)).ok
+    assert len(client.calls) == 3
 
 
 def test_memo_can_be_bypassed() -> None:
@@ -624,7 +674,9 @@ def test_triage_batches_of_twenty_in_input_order() -> None:
     analyzer = _analyzer(client)
     items = [(i, make_news(i)) for i in range(1, 46)]
     outcome = analyzer.triage_detailed(items, KNOWN)
-    assert [len(__import__("re").findall(r"news_id=", c[1]["messages"][0]["content"])) for c in client.calls] == [
+    assert [
+        len(__import__("re").findall(r"news_id=", c[1]["messages"][0]["content"])) for c in client.calls
+    ] == [
         20,
         20,
         5,
@@ -636,7 +688,9 @@ def test_triage_batches_of_twenty_in_input_order() -> None:
 def test_triage_validates_ids_teams_and_relevance() -> None:
     news = make_news(1, title="BIG and Alpha Wolves swap players", body="big news for Bravo.", team_ids=[1])
     answer = triage_batch(
-        triage_item(5, relevance=3.0, team_ids=[1, 3, 2, 999], team_names=["Bravo Foxes", "bravo foxes", " "]),
+        triage_item(
+            5, relevance=3.0, team_ids=[1, 3, 2, 999], team_names=["Bravo Foxes", "bravo foxes", " "]
+        ),
         triage_item(5, label=TriageLabel.IRRELEVANT),  # duplicate id - ignored
         triage_item(77),  # id not in the batch - ignored
         triage_item(6, label=TriageLabel.IRRELEVANT, relevance=0.9),
@@ -760,7 +814,9 @@ def test_rationale_gets_a_disclaimer_when_the_model_forgot_it() -> None:
 
 
 def test_rationale_strips_html_and_images() -> None:
-    dirty = "Fine.<img src=x onerror=alert(1)> ![chart](https://evil.example/p.png) p < 0.75. Losses possible."
+    dirty = (
+        "Fine.<img src=x onerror=alert(1)> ![chart](https://evil.example/p.png) p < 0.75. Losses possible."
+    )
     client = FakeClient([fake_response(RationaleOutput(markdown=dirty))])
     text = _analyzer(client).write_rationale(make_prediction(), [], make_ctx())
     assert "<img" not in text and "evil.example" not in text and "p < 0.75" in text and "chart" in text
@@ -780,6 +836,237 @@ def test_rationale_falls_back_to_the_template(response: Any) -> None:
     analyzer = _analyzer(FakeClient([response]))
     prediction, decisions, ctx = make_prediction(), [make_decision(accepted=True)], make_ctx()
     outcome = analyzer.write_rationale_detailed(prediction, decisions, ctx)
-    disabled = _analyzer(FakeClient(), make_settings(enabled=False)).write_rationale(prediction, decisions, ctx)
+    disabled = _analyzer(FakeClient(), make_settings(enabled=False)).write_rationale(
+        prediction, decisions, ctx
+    )
     assert outcome.text == disabled and outcome.model is None and outcome.status is not LLMStatus.OK
     assert "Alpha Wolves 64.0%" in outcome.text
+
+
+# ---------------------------------------------------------------------------------------------
+# Direction check for adverse flags
+# ---------------------------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("team", "shift", "expected"),
+    [
+        (TeamSlot.TEAM1, -0.10, -0.10),  # team1 weakened -> favours team2: consistent
+        (TeamSlot.TEAM2, 0.10, 0.10),  # team2 weakened -> favours team1: consistent
+        (TeamSlot.TEAM1, 0.10, 0.0),  # sign slip: a team1 stand-in cannot help team1
+        (TeamSlot.TEAM2, -0.10, 0.0),
+        (None, -0.10, -0.10),  # match-wide flags carry no implied direction
+    ],
+)
+def test_adverse_flag_cannot_favour_the_affected_team(
+    team: TeamSlot | None, shift: float, expected: float, caplog: pytest.LogCaptureFixture
+) -> None:
+    client = FakeClient([fake_response(context_result(suggestion(team=team, logit_shift=shift)))])
+    with caplog.at_level(logging.WARNING):
+        flag = _analyzer(client).analyze_match(make_ctx(), [make_news(1)], now=NOW)[0]
+    assert flag.logit_shift == pytest.approx(expected)
+    contradicted = expected == 0.0
+    assert ("Adjustment not applied" in flag.rationale) is contradicted
+    assert ("not applied" in caplog.text) is contradicted
+
+
+def test_direction_check_only_covers_adverse_types_and_can_be_switched_off() -> None:
+    llm = make_settings().llm
+    index = build_evidence_index([make_news(1)])
+    upgrade = suggestion(flag_type=ContextFlagType.ROSTER_CHANGE, team=TeamSlot.TEAM1, logit_shift=0.1)
+    kept = suggestion_to_flag(upgrade, settings=llm, evidence_index=index, now=NOW)
+    assert kept is not None and kept.logit_shift == pytest.approx(0.1)
+
+    slip = suggestion(flag_type=ContextFlagType.ILLNESS, team=TeamSlot.TEAM1, logit_shift=0.1, veto=True)
+    strict = suggestion_to_flag(slip, settings=llm, evidence_index=index, now=NOW)
+    assert strict is not None and strict.logit_shift == 0.0
+    assert strict.veto is True  # the veto does not depend on the direction
+    lax = suggestion_to_flag(
+        slip, settings=llm, evidence_index=index, now=NOW, tuning=LLMTuning(enforce_adverse_direction=False)
+    )
+    assert lax is not None and lax.logit_shift == pytest.approx(0.1)
+    assert {
+        ContextFlagType.STAND_IN,
+        ContextFlagType.ILLNESS,
+        ContextFlagType.VISA_ISSUE,
+        ContextFlagType.TRAVEL_FATIGUE,
+        ContextFlagType.INTERNAL_CONFLICT,
+        ContextFlagType.FORM_SLUMP,
+    } == ADVERSE_FLAG_TYPES
+
+
+def test_context_prompt_tells_the_model_about_the_direction_rule() -> None:
+    client = FakeClient([fake_response(context_result())])
+    _analyzer(client).analyze_match(make_ctx(), [], now=NOW)
+    system = " ".join(client.system_text().split())
+    assert "can only count against that team" in system
+    for flag_type in ADVERSE_FLAG_TYPES:
+        assert flag_type.value in system
+
+
+# ---------------------------------------------------------------------------------------------
+# Incomplete JSON (what the real SDK raises for a truncated answer) and rejected requests
+# ---------------------------------------------------------------------------------------------
+
+
+def _incomplete_json_error() -> ValidationError:
+    """The error ``messages.parse()`` raises when the response text is cut-off JSON."""
+    try:
+        MatchContextResult.model_validate_json('{"flags": [{"flag_type": "stand_in", "te')
+    except ValidationError as exc:
+        return exc
+    raise AssertionError("expected a ValidationError")
+
+
+def test_incomplete_json_from_the_sdk_is_reported_as_truncation(caplog: pytest.LogCaptureFixture) -> None:
+    analyzer = _analyzer(FakeClient([_incomplete_json_error()]))
+    with caplog.at_level(logging.WARNING):
+        outcome = analyzer.analyze_match_detailed(make_ctx(), [make_news(1)], now=NOW)
+    assert outcome.status is LLMStatus.TRUNCATED and outcome.flags == []
+    assert outcome.detail == "incomplete_output"
+    assert "max_tokens=16000" in caplog.text
+
+
+def test_schema_mismatch_is_a_plain_failure_not_a_truncation() -> None:
+    try:
+        TriageItem.model_validate({"news_id": "x"})
+    except ValidationError as exc:
+        error = exc
+    outcome = _analyzer(FakeClient([error])).analyze_match_detailed(make_ctx(), [], now=NOW)
+    assert outcome.status is LLMStatus.FAILED and outcome.detail == "invalid_output"
+
+
+@pytest.mark.parametrize("status", [400, 404, 413, 422])
+def test_triage_rejected_request_stops_without_splitting_or_blaming_the_items(status: int) -> None:
+    """A 4xx (unknown model, exhausted credit, changed API) is not caused by an article."""
+    client = FakeClient([api_status_error(status)])
+    analyzer = _analyzer(client, tuning=LLMTuning(triage_batch_size=2))
+    outcome = analyzer.triage_detailed([(i, make_news(i)) for i in range(1, 6)], KNOWN)
+    assert len(client.calls) == 1  # no item-by-item retries, no further batches
+    assert outcome.items == [] and outcome.unanswered_ids == []
+    assert outcome.deferred_ids == [1, 2, 3, 4, 5] and outcome.status is LLMStatus.FAILED
+    assert analyzer.enabled  # unlike 401/403 this does not switch the layer off
+
+
+def test_triage_stops_after_consecutive_transient_failures() -> None:
+    client = FakeClient([connection_error(), api_status_error(503)])
+    analyzer = _analyzer(client, tuning=LLMTuning(triage_batch_size=1))
+    outcome = analyzer.triage_detailed([(i, make_news(i)) for i in range(1, 6)], KNOWN)
+    assert len(client.calls) == 2
+    assert outcome.items == [] and outcome.deferred_ids == [1, 2, 3, 4, 5]
+
+
+def test_triage_transient_failure_counter_resets_after_a_success() -> None:
+    answers = iter([api_status_error(503), None, api_status_error(503), None, None])
+
+    def script(endpoint: str, kwargs: dict[str, Any]) -> Any:
+        return next(answers) or _echo_triage(endpoint, kwargs)
+
+    client = FakeClient(script)
+    analyzer = _analyzer(client, tuning=LLMTuning(triage_batch_size=1))
+    outcome = analyzer.triage_detailed([(i, make_news(i)) for i in range(1, 6)], KNOWN)
+    assert [i.news_id for i in outcome.items] == [2, 4, 5] and outcome.deferred_ids == [1, 3]
+
+
+# ---------------------------------------------------------------------------------------------
+# Rationale cost guard
+# ---------------------------------------------------------------------------------------------
+
+_TEXT = "## Summary\nAlpha Wolves are favoured.\n\n## Risks\nLosses are possible."
+
+
+def _rationale_client() -> FakeClient:
+    return FakeClient(lambda *_: fake_response(RationaleOutput(markdown=_TEXT), model="claude-opus-5-5"))
+
+
+def test_rationale_is_reused_while_the_picture_is_unchanged() -> None:
+    client = _rationale_client()
+    analyzer = _analyzer(client)
+    ctx, bet = make_ctx(), make_decision(accepted=True)
+
+    first = analyzer.write_rationale_detailed(make_prediction(), [bet], ctx, now=NOW)
+    assert first.status is LLMStatus.OK and not first.from_cache and first.written_at == NOW
+
+    # Odds, EV and rejected outcomes drift; the win probability moves inside its band: same story.
+    drifted_bet = make_decision(accepted=True, odds="1.84", ev=0.07)
+    rejected = make_decision(accepted=False, selection="team2", reasons=["stale_odds: 700s"])
+    central = make_prediction().central.model_copy(update={"p_team1_win": 0.645})
+    again = analyzer.write_rationale_detailed(
+        make_prediction(central=central), [drifted_bet, rejected], ctx, now=NOW + timedelta(hours=5)
+    )
+    assert again.from_cache and again.text == first.text and again.model == "claude-opus-5-5"
+    assert again.written_at == NOW and len(client.calls) == 1
+
+    late = NOW + timedelta(hours=6, minutes=1)
+    expired = analyzer.write_rationale_detailed(make_prediction(), [bet], ctx, now=late)
+    assert not expired.from_cache and len(client.calls) == 2
+
+
+def test_rationale_is_rewritten_when_the_picture_changes() -> None:
+    client = _rationale_client()
+    analyzer = _analyzer(client)
+    ctx, bet = make_ctx(), make_decision(accepted=True)
+    base = make_prediction()
+    analyzer.write_rationale(base, [bet], ctx, now=NOW)
+
+    moved = base.central.model_copy(update={"p_team1_win": 0.70})
+    changes: list[tuple[Any, list[Any], Any]] = [
+        (base, [], ctx),  # the bet is gone
+        (base, [bet, make_decision(accepted=True, selection="team2")], ctx),  # another bet accepted
+        (make_prediction(central=moved), [bet], ctx),  # the model's view moved to another band
+        (make_prediction(context_flags=[]), [bet], ctx),  # a flag disappeared
+        (make_prediction(veto_known=True), [bet], ctx),  # the veto was published
+        (make_prediction(model_version="test-2"), [bet], ctx),  # retrained model
+        (base, [bet], make_ctx(team2_lineup=ctx.team2_lineup[:4])),  # lineup change
+    ]
+    for n, (prediction, decisions, context) in enumerate(changes, start=2):
+        at = NOW + timedelta(minutes=n)
+        outcome = analyzer.write_rationale_detailed(prediction, decisions, context, now=at)
+        assert not outcome.from_cache and len(client.calls) == n
+    # Going back to the first picture finds its text again (both versions are remembered).
+    assert analyzer.write_rationale_detailed(base, [bet], ctx, now=NOW + timedelta(minutes=30)).from_cache
+    assert len(client.calls) == len(changes) + 1
+
+
+def test_rationale_memo_can_be_bypassed_and_is_per_analyzer() -> None:
+    client = _rationale_client()
+    analyzer = _analyzer(client)
+    args = (make_prediction(), [make_decision(accepted=True)], make_ctx())
+    analyzer.write_rationale_detailed(*args, now=NOW)
+    assert not analyzer.write_rationale_detailed(*args, now=NOW, use_memo=False).from_cache
+    assert len(client.calls) == 2
+    assert not _analyzer(client).write_rationale_detailed(*args, now=NOW).from_cache
+    assert len(client.calls) == 3
+
+
+def test_failed_rationale_backs_off_with_the_template() -> None:
+    client = FakeClient([api_status_error(503), fake_response(RationaleOutput(markdown=_TEXT))])
+    analyzer = _analyzer(client)
+    args = (make_prediction(), [make_decision(accepted=True)], make_ctx())
+    failed = analyzer.write_rationale_detailed(*args, now=NOW)
+    assert failed.status is LLMStatus.FAILED and "Automatic summary" in failed.text
+    waiting = analyzer.write_rationale_detailed(*args, now=NOW + timedelta(minutes=10))
+    assert waiting.status is LLMStatus.BACKOFF and "Automatic summary" in waiting.text
+    assert waiting.model is None and len(client.calls) == 1
+    retried = analyzer.write_rationale_detailed(*args, now=NOW + timedelta(minutes=16))
+    assert retried.status is LLMStatus.OK and retried.text == _TEXT and len(client.calls) == 2
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        refusal(None),
+        fake_response(None, stop_reason="max_tokens"),
+        fake_response(RationaleOutput(markdown="  ")),
+    ],
+)
+def test_refused_or_unusable_rationale_is_not_requested_again_for_the_same_picture(response: Any) -> None:
+    client = FakeClient([response, fake_response(RationaleOutput(markdown=_TEXT))])
+    analyzer = _analyzer(client)
+    args = (make_prediction(), [make_decision(accepted=True)], make_ctx())
+    assert analyzer.write_rationale_detailed(*args, now=NOW).model is None
+    for minutes in (16, 300):
+        waiting = analyzer.write_rationale_detailed(*args, now=NOW + timedelta(minutes=minutes))
+        assert waiting.status is LLMStatus.BACKOFF and "Automatic summary" in waiting.text
+    assert len(client.calls) == 1
+    assert analyzer.write_rationale_detailed(*args, now=NOW + timedelta(hours=7)).text == _TEXT

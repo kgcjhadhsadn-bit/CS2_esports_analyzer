@@ -7,6 +7,7 @@ win probabilities used for betting; every suggestion is clipped in code.
 
 from cs2bot.llm.combine import active_flags, combine_flags, flag_contribution
 from cs2bot.llm.context import (
+    ADVERSE_FLAG_TYPES,
     ContextAnalyzer,
     LLMStatus,
     MatchAnalysisOutcome,
@@ -15,7 +16,7 @@ from cs2bot.llm.context import (
     UsageTotals,
     suggestion_to_flag,
 )
-from cs2bot.llm.memo import AnalysisMemo, MemoEntry, context_fingerprint
+from cs2bot.llm.memo import AnalysisMemo, MemoEntry, context_fingerprint, rationale_fingerprint
 from cs2bot.llm.pipeline import (
     ContextRefresh,
     TriageReport,
@@ -42,6 +43,7 @@ from cs2bot.llm.store import (
 from cs2bot.llm.tuning import VETO_MIN_CONFIDENCE, LLMTuning
 
 __all__ = [
+    "ADVERSE_FLAG_TYPES",
     "RISK_DISCLAIMER",
     "VETO_MIN_CONFIDENCE",
     "AnalysisMemo",
@@ -70,6 +72,7 @@ __all__ = [
     "load_known_teams",
     "news_row_to_input",
     "persist_flags",
+    "rationale_fingerprint",
     "refresh_match_context",
     "render_template_rationale",
     "select_news_for_match",

@@ -29,7 +29,7 @@ from collections import defaultdict
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, time, timedelta
 
-from sqlalchemy import ColumnElement, and_, delete, func, select
+from sqlalchemy import ColumnElement, and_, case, delete, func, select
 from sqlalchemy.orm import Session
 
 from cs2bot.db.models import (
@@ -107,7 +107,10 @@ def rebuild_position_aggregates(
             PlayerPositionSample.is_alive.is_(True),
         )
         .group_by(
-            PlayerPositionSample.player_id, MapPlayed.map_name, PlayerPositionSample.side, PlayerPositionSample.place
+            PlayerPositionSample.player_id,
+            MapPlayed.map_name,
+            PlayerPositionSample.side,
+            PlayerPositionSample.place,
         )
     )
     for player_id, map_name, side, place, count in samples:
@@ -115,47 +118,62 @@ def rebuild_position_aggregates(
         if place:
             stats[(player_id, map_name, side, place)].samples += count
 
+    # A kill by / of a player without a players row still counts for the other, linked, player.
     enemy_kill = and_(
-        Kill.attacker_player_id.is_not(None),
         Kill.attacker_side.is_not(None),
         Kill.victim_side.is_not(None),
         Kill.attacker_side != Kill.victim_side,
     )
     kills = session.execute(
-        select(Kill.attacker_player_id, MapPlayed.map_name, Kill.attacker_side, Kill.attacker_place, Kill.is_opening)
+        select(
+            Kill.attacker_player_id,
+            MapPlayed.map_name,
+            Kill.attacker_side,
+            Kill.attacker_place,
+            Kill.is_opening,
+        )
         .join(MapPlayed, MapPlayed.id == Kill.map_played_id)
         .join(Match, Match.id == MapPlayed.match_id)
-        .where(_in_window(lo, hi), enemy_kill, Kill.attacker_place.is_not(None))
+        .where(
+            _in_window(lo, hi),
+            enemy_kill,
+            Kill.attacker_player_id.is_not(None),
+            Kill.attacker_place.is_not(None),
+        )
     )
-    for player_id, map_name, side, place, is_opening in kills:
-        if not place:
+    for killer_id, kill_map, killer_side, killer_place, is_opening in kills:
+        if killer_id is None or killer_side is None or not killer_place:
             continue
-        entry = stats[(player_id, map_name, side, place)]
+        entry = stats[(killer_id, kill_map, killer_side, killer_place)]
         entry.kills += 1
         entry.opening_kills += int(bool(is_opening))
     deaths = session.execute(
-        select(Kill.victim_player_id, MapPlayed.map_name, Kill.victim_side, Kill.victim_place, Kill.is_opening)
+        select(
+            Kill.victim_player_id, MapPlayed.map_name, Kill.victim_side, Kill.victim_place, Kill.is_opening
+        )
         .join(MapPlayed, MapPlayed.id == Kill.map_played_id)
         .join(Match, Match.id == MapPlayed.match_id)
-        .where(_in_window(lo, hi), enemy_kill, Kill.victim_player_id.is_not(None), Kill.victim_place.is_not(None))
+        .where(
+            _in_window(lo, hi), enemy_kill, Kill.victim_player_id.is_not(None), Kill.victim_place.is_not(None)
+        )
     )
-    for player_id, map_name, side, place, is_opening in deaths:
-        if not place:
+    for victim_id, death_map, victim_side, victim_place, is_opening in deaths:
+        if victim_id is None or victim_side is None or not victim_place:
             continue
-        entry = stats[(player_id, map_name, side, place)]
+        entry = stats[(victim_id, death_map, victim_side, victim_place)]
         entry.deaths += 1
         entry.opening_deaths += int(bool(is_opening))
 
     session.execute(
         delete(PositionAggregate)
         .where(PositionAggregate.window_end == end)
-        .execution_options(synchronize_session=False)
+        .execution_options(synchronize_session="fetch")
     )
     if prune_before is not None:
         session.execute(
             delete(PositionAggregate)
             .where(PositionAggregate.window_end < prune_before)
-            .execution_options(synchronize_session=False)
+            .execution_options(synchronize_session="fetch")
         )
     for (player_id, map_name, side, place), entry in sorted(
         stats.items(), key=lambda item: (item[0][0], item[0][1], item[0][2].value, item[0][3])
@@ -205,7 +223,7 @@ def rebuild_duel_aggregates(
             Kill.victim_player_id,
             MapPlayed.map_name,
             func.count(),
-            func.sum(func.coalesce(Kill.is_opening, False).cast_to_int() if False else _as_int(Kill.is_opening)),
+            func.sum(case((Kill.is_opening.is_(True), 1), else_=0)),
         )
         .join(MapPlayed, MapPlayed.id == Kill.map_played_id)
         .join(Match, Match.id == MapPlayed.match_id)
@@ -231,13 +249,15 @@ def rebuild_duel_aggregates(
             backward.opening_deaths += opening
 
     session.execute(
-        delete(DuelAggregate).where(DuelAggregate.window_end == end).execution_options(synchronize_session=False)
+        delete(DuelAggregate)
+        .where(DuelAggregate.window_end == end)
+        .execution_options(synchronize_session="fetch")
     )
     if prune_before is not None:
         session.execute(
             delete(DuelAggregate)
             .where(DuelAggregate.window_end < prune_before)
-            .execution_options(synchronize_session=False)
+            .execution_options(synchronize_session="fetch")
         )
     for (player_id, opponent_id, map_name), entry in sorted(stats.items()):
         session.add(

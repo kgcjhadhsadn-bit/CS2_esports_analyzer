@@ -1,0 +1,186 @@
+{
+ "begin_at": "2026-11-23T18:00:00Z",
+ "detailed_stats": true,
+ "draw": false,
+ "end_at": null,
+ "forfeit": false,
+ "game_advantage": null,
+ "games": [
+  {
+   "begin_at": null,
+   "complete": false,
+   "detailed_stats": true,
+   "end_at": null,
+   "finished": false,
+   "forfeit": false,
+   "id": 2301250,
+   "length": null,
+   "match_id": 1287050,
+   "position": 1,
+   "status": "not_started",
+   "winner": {
+    "id": null,
+    "type": "Team"
+   },
+   "winner_type": "Team"
+  },
+  {
+   "begin_at": null,
+   "complete": false,
+   "detailed_stats": true,
+   "end_at": null,
+   "finished": false,
+   "forfeit": false,
+   "id": 2301251,
+   "length": null,
+   "match_id": 1287050,
+   "position": 2,
+   "status": "not_started",
+   "winner": {
+    "id": null,
+    "type": "Team"
+   },
+   "winner_type": "Team"
+  },
+  {
+   "begin_at": null,
+   "complete": false,
+   "detailed_stats": true,
+   "end_at": null,
+   "finished": false,
+   "forfeit": false,
+   "id": 2301252,
+   "length": null,
+   "match_id": 1287050,
+   "position": 3,
+   "status": "not_started",
+   "winner": {
+    "id": null,
+    "type": "Team"
+   },
+   "winner_type": "Team"
+  }
+ ],
+ "id": 1287050,
+ "league": {
+  "id": 4854,
+  "image_url": "https://cdn.pandascore.co/images/league/image/4854/cs-go-starladder-major.png",
+  "modified_at": "2026-01-12T08:00:00Z",
+  "name": "StarLadder Major",
+  "slug": "cs-go-starladder-major",
+  "url": null
+ },
+ "league_id": 4854,
+ "live": {
+  "opens_at": null,
+  "supported": false,
+  "url": null
+ },
+ "match_type": "best_of",
+ "modified_at": "2026-11-20T12:10:09Z",
+ "name": "Quarterfinal 2: G2 vs TS",
+ "number_of_games": 3,
+ "opponents": [
+  {
+   "opponent": {
+    "acronym": "TS",
+    "dark_mode_image_url": null,
+    "id": 124523,
+    "image_url": "https://cdn.pandascore.co/images/team/image/124523/team-spirit-cs-go.png",
+    "location": "RU",
+    "modified_at": "2026-11-10T09:14:51Z",
+    "name": "Team Spirit",
+    "slug": "team-spirit-cs-go"
+   },
+   "type": "Team"
+  },
+  {
+   "opponent": {
+    "acronym": "G2",
+    "dark_mode_image_url": null,
+    "id": 3210,
+    "image_url": "https://cdn.pandascore.co/images/team/image/3210/g2-cs-go.png",
+    "location": "DE",
+    "modified_at": "2026-11-10T09:14:51Z",
+    "name": "G2",
+    "slug": "g2-cs-go"
+   },
+   "type": "Team"
+  }
+ ],
+ "original_scheduled_at": "2026-11-23T18:00:00Z",
+ "rescheduled": false,
+ "results": [
+  {
+   "score": 0,
+   "team_id": 124523
+  },
+  {
+   "score": 0,
+   "team_id": 3210
+  }
+ ],
+ "scheduled_at": "2026-11-23T18:00:00Z",
+ "serie": {
+  "begin_at": "2026-11-19T10:00:00Z",
+  "end_at": "2026-12-13T20:00:00Z",
+  "full_name": "Budapest 2026",
+  "id": 9844,
+  "league_id": 4854,
+  "modified_at": "2026-11-01T10:00:00Z",
+  "name": "Budapest",
+  "season": null,
+  "slug": "cs-go-starladder-major-budapest-2026",
+  "winner_id": null,
+  "winner_type": "Team",
+  "year": 2026
+ },
+ "serie_id": 9844,
+ "slug": "g2-vs-team-spirit-2026-11-23",
+ "status": "not_started",
+ "streams_list": [
+  {
+   "embed_url": "https://player.twitch.tv/?channel=esl_csgo",
+   "language": "en",
+   "main": true,
+   "official": true,
+   "raw_url": "https://www.twitch.tv/esl_csgo"
+  }
+ ],
+ "tournament": {
+  "begin_at": "2026-11-23T14:00:00Z",
+  "country": "HU",
+  "detailed_stats": true,
+  "end_at": "2026-12-13T20:00:00Z",
+  "has_bracket": true,
+  "id": 17260,
+  "league_id": 4854,
+  "live_supported": true,
+  "modified_at": "2026-11-20T07:31:12Z",
+  "name": "Playoffs",
+  "prizepool": "1250000 United States Dollar",
+  "region": "EEU",
+  "serie_id": 9844,
+  "slug": "cs-go-starladder-major-budapest-2026-playoffs",
+  "tier": "s",
+  "type": "offline",
+  "winner_id": null,
+  "winner_type": "Team"
+ },
+ "tournament_id": 17260,
+ "videogame": {
+  "id": 3,
+  "name": "Counter-Strike",
+  "slug": "cs-go"
+ },
+ "videogame_title": {
+  "id": 13,
+  "name": "Counter-Strike 2",
+  "slug": "cs-2",
+  "videogame_id": 3
+ },
+ "videogame_version": null,
+ "winner": null,
+ "winner_id": null,
+ "winner_type": "Team"
+}

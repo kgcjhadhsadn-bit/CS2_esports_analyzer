@@ -43,13 +43,25 @@ class LLMTuning:
 
     # --- flag semantics ---
     veto_min_confidence: float = VETO_MIN_CONFIDENCE
+    # A stand-in / illness / visa / travel / conflict / slump flag about one team can only count
+    # against that team; a suggested shift pointing the other way (a sign slip) is not applied.
+    enforce_adverse_direction: bool = True
 
     # --- cost guard (see cs2bot.llm.memo) ---
     reanalysis_interval_s: float = 6 * 3600.0  # same inputs are not re-analysed more often than this
     near_start_window_s: float = 3 * 3600.0  # ... except close to the match start,
     near_start_interval_s: float = 3600.0  # where "lineup still unknown" becomes time-sensitive
-    failure_backoff_s: float = 900.0  # after a failed / refused analysis of the same inputs
+    # After a transient failure (network, 5xx, rate limit, rejected request) the same inputs are
+    # retried after this long. A refusal / truncated / invalid answer is tied to the inputs, was
+    # billed, and would most likely repeat: it is retried only after the re-analysis interval.
+    failure_backoff_s: float = 900.0
     memo_max_entries: int = 512
+    # Rationale: an unchanged picture (same bets, flags, veto state, lineups and a match-win
+    # probability within the same ``rationale_probability_step`` band) reuses the previous text.
+    rationale_reuse_interval_s: float = 6 * 3600.0
+    rationale_probability_step: float = 0.025
+    # Triage: stop sending further batches after this many consecutive transient failures.
+    triage_max_transient_failures: int = 2
 
     # --- news selection ---
     min_relevance: float = 0.3  # triaged items below this are not shown to the context model

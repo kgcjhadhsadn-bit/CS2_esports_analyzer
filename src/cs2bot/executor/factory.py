@@ -26,8 +26,13 @@ def create_betclic_executor(
     The browser starts lazily on the first call (on the wrapper's own worker thread), so creating it is
     cheap; call ``close()`` on shutdown to close Chromium and release the profile lock. The selector file
     is loaded (and validated) on that first call too.
+
+    Timeouts, pacing and the profile-lock ages come from ``settings.executor``
+    (:meth:`ExecutorTuning.from_settings`) unless an explicit ``tuning`` is given. Inconsistent values
+    raise ``ValueError`` here, at start-up, rather than at the first bet.
     """
     halt_check = db_halt_check(session_factory)
+    tuning = tuning if tuning is not None else ExecutorTuning.from_settings(settings)
 
     def _build() -> BetclicExecutor:
         return BetclicExecutor(
