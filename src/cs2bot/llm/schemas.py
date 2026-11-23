@@ -62,6 +62,10 @@ class TriageLabel(StrEnum):
     IRRELEVANT = "irrelevant"
 
 
+# NOTE: class docstrings below end up as "description" in the JSON schema sent to the model, so they
+# are written for the model; developer notes are kept in comments.
+
+
 class TriageItem(BaseModel):
     """Triage verdict for one news item."""
 
@@ -101,17 +105,16 @@ class TriageItem(BaseModel):
 
 
 class TriageBatch(BaseModel):
-    """Structured output of one triage request."""
+    """Triage verdicts for a batch of news items."""
 
     items: list[TriageItem] = Field(description="Exactly one entry per news item in the request.")
 
 
 class ContextFlagSuggestion(BaseModel):
-    """One flag as *suggested* by the model. Mirrors :class:`cs2bot.domain.context.ContextFlag`.
+    """One situational flag for the match, supported by cited evidence."""
 
-    It is never used directly: :func:`cs2bot.llm.context.suggestion_to_flag` validates the evidence,
-    clips the numbers and converts it into a ``ContextFlag``.
-    """
+    # Mirrors cs2bot.domain.context.ContextFlag, but is only a *suggestion*: it is never used directly.
+    # cs2bot.llm.context.suggestion_to_flag validates the evidence, clips the numbers and converts it.
 
     flag_type: ContextFlagType = Field(description="Category of the situation.")
     team: TeamSlot | None = Field(
@@ -133,12 +136,12 @@ class ContextFlagSuggestion(BaseModel):
         description='Ids of the supporting news items (e.g. "news-3"), or "context" for the match context.'
     )
     expires_at: str | None = Field(
-        description="ISO-8601 UTC time after which the flag no longer applies, or null (valid until the match)."
+        description="ISO-8601 UTC time after which the flag stops applying, or null (holds until the match)."
     )
 
 
 class MatchContextResult(BaseModel):
-    """Structured output of the match-context analysis."""
+    """Situational flags for one match plus a short overall note."""
 
     flags: list[ContextFlagSuggestion] = Field(
         description="Zero or more flags. An empty list is the normal result when nothing notable is reported."
@@ -152,6 +155,6 @@ class MatchContextResult(BaseModel):
 
 
 class RationaleOutput(BaseModel):
-    """Structured output of the rationale request."""
+    """The dashboard note for one match."""
 
     markdown: str = Field(description="The complete rationale as Markdown.")

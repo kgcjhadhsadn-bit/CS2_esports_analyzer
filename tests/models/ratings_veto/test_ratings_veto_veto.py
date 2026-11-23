@@ -15,6 +15,7 @@ from cs2bot.domain.predictions import MapSequenceProbability
 from cs2bot.domain.records import VetoRecord, VetoStep
 from cs2bot.models.ratings import MapRatingModel
 from cs2bot.models.veto import (
+    BO1_TEMPLATE_2_3_1,
     VETO_TEMPLATES,
     VetoCoefficients,
     VetoConfig,
@@ -743,6 +744,15 @@ def test_known_steps_that_deviate_from_the_template() -> None:
         s.maps[:2] == ["nuke", "train"] and len(s.maps) == 3 and s.pickers == [T1, T2, None] for s in seqs
     )
     assert {s.maps[2] for s in seqs} == set(POOL7) - {"nuke", "train"}
+    # ... and a deviating step without team information keeps the template's actor
+    anonymous = [VetoStep(step=1, action=PICK, team=None, map_name="nuke")]
+    seqs = model.predict_sequences(1, 2, MatchFormat.BO3, POOL7, known_steps=anonymous, top_k=100)
+    assert all(s.maps[0] == "nuke" and s.pickers == [T1, T2, None] for s in seqs)
+    seqs = model.predict_sequences(
+        1, 2, MatchFormat.BO3, POOL7, known_steps=anonymous, first_veto=None, top_k=100
+    )
+    assert sum(s.probability for s in seqs) == pytest.approx(1.0)
+    assert {tuple(s.pickers) for s in seqs} == {(T1, T2, None), (T2, T1, None)}
     # an explicit custom template (BO3 on a 7-map pool: pick, pick, then four bans)
     custom = [VetoTemplateStep(PICK, 0), VetoTemplateStep(PICK, 1)] + [
         VetoTemplateStep(BAN, i % 2) for i in range(4)
@@ -751,6 +761,14 @@ def test_known_steps_that_deviate_from_the_template() -> None:
     assert sum(s.probability for s in seqs) == pytest.approx(1.0)
     assert len(seqs) == 7 * 6 * 5
     assert all(s.pickers == [T1, T2, None] for s in seqs)
+    # the ready-made 2-3-1 BO1 template: team 1 bans twice, team 2 three times, team 1 once
+    assert [st.actor for st in BO1_TEMPLATE_2_3_1] == [0, 0, 1, 1, 1, 0, None]
+    step2 = model.next_step(1, 2, MatchFormat.BO1, POOL7, known_steps=known[:1], template=BO1_TEMPLATE_2_3_1)
+    assert (step2.step, step2.action, step2.team) == (2, BAN, T1)
+    step3 = model.next_step(1, 2, MatchFormat.BO1, POOL7, known_steps=known[:2], template=BO1_TEMPLATE_2_3_1)
+    assert (step3.step, step3.action, step3.team) == (3, BAN, T2)
+    seqs = model.predict_sequences(1, 2, MatchFormat.BO1, POOL7, template=BO1_TEMPLATE_2_3_1)
+    assert len(seqs) == 7 and sum(s.probability for s in seqs) == pytest.approx(1.0)
     # impossible combinations are reported instead of returning garbage
     leftover_first = veto_steps([("ban", 1, "nuke"), ("leftover", None, "train"), ("ban", 1, "mirage")])
     with pytest.raises(ValueError, match="leftover map must be the last"):

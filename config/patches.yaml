@@ -1,0 +1,199 @@
+# CS2 patch timeline used by cs2bot.features.meta (days_since_last_patch, patch_id, pool history).
+#
+# Scope: updates since the CS2 release (2023-09-27) that plausibly shifted the competitive meta -
+# Active Duty map pool changes, economy / weapon balance, core mechanics. Cosmetic, matchmaking-only
+# and pure bug-fix updates are left out on purpose.
+#
+# Fields
+#   id             stable identifier (never rename: it may be stored with trained models)
+#   date           UTC calendar day of the Valve release. Valve ships in the US afternoon, so some
+#                  sources quote the following day; +-1 day does not matter for the features.
+#   kind           release | map_pool | economy | weapons | mechanics | engine
+#   impact         major | moderate | minor (features use "moderate" and above by default)
+#   date_verified  true  = the day was confirmed by at least two independent sources during research
+#                  false = UNVERIFIED: taken from one secondary source or from memory - check against
+#                          the official release notes (https://www.counter-strike.net/news/updates)
+#                          before relying on the exact day
+#   map_pool       the Active Duty pool AFTER the patch (only on entries that change it)
+#   notes          what changed and why it matters for the model
+#
+# IMPORTANT: tournaments adopt a new map pool at their own pace (an event that started before the
+# patch normally finishes on the old pool). The pool the bot actually uses for a match comes from
+# detect_active_map_pool (recent results); this file is the calendar reference.
+#
+# Research date: 2026-11-23. Sources: Valve release notes as summarised by esports.net, hotspawn.com
+# (map pool history), tradeit.gg (update changelog), dust2.us, sportskeeda.com, dotesports.com.
+# Maintenance: add a new entry at the bottom whenever Valve changes the pool or the balance.
+
+version: 1
+
+patches:
+  - id: cs2-release
+    date: 2023-09-27
+    kind: release
+    impact: major
+    date_verified: true
+    title: "Counter-Strike 2 released"
+    map_pool: [ancient, anubis, inferno, mirage, nuke, overpass, vertigo]
+    notes: >
+      CS2 replaces CS:GO. MR12 (first to 13, overtime MR3 first to 4), sub-tick input, volumetric
+      smokes, reworked loss-bonus/economy pacing for the shorter halves. Start of all model data.
+
+  - id: 2024-02-06-call-to-arms
+    date: 2024-02-06
+    kind: mechanics
+    impact: minor
+    date_verified: false
+    title: "A Call to Arms update"
+    notes: >
+      UNVERIFIED day (from memory). Arms Race returns, Zeus changes, Kilowatt case. Little effect on
+      professional five-versus-five play; listed as a reference point only.
+
+  - id: 2024-04-25-dust2-in-overpass-out
+    date: 2024-04-25
+    kind: map_pool
+    impact: major
+    date_verified: true
+    title: "Dust II replaces Overpass in Active Duty"
+    map_pool: [ancient, anubis, dust2, inferno, mirage, nuke, vertigo]
+    notes: >
+      First CS2 Active Duty change (Overpass's run 2013-12-18 .. 2024-04-25 ends). Team map pools
+      and vetoes shift for the following months.
+
+  - id: 2024-05-23-ct-economy
+    date: 2024-05-23
+    kind: economy
+    impact: moderate
+    date_verified: true
+    title: "CT economy relief and Vertigo rework"
+    notes: >
+      M4A4 3100 -> 3000 USD, incendiary grenade 600 -> 500 USD, Terrorist team reward when the planted
+      bomb is defused 800 -> 600 USD; large Vertigo layout changes. Slightly stronger CT sides.
+
+  - id: 2024-11-13-train-returns
+    date: 2024-11-13
+    kind: map_pool
+    impact: minor
+    date_verified: false
+    title: "Train added to CS2 (not yet Active Duty)"
+    notes: >
+      UNVERIFIED day (from memory). Reworked Train becomes playable; teams start preparing it ahead
+      of the pool change in January 2025. The Active Duty pool itself is unchanged.
+
+  - id: 2025-01-29-train-in-vertigo-out
+    date: 2025-01-29
+    kind: map_pool
+    impact: major
+    date_verified: true
+    title: "Premier Season 2: Train replaces Vertigo in Active Duty"
+    map_pool: [ancient, anubis, dust2, inferno, mirage, nuke, train]
+    notes: >
+      Announced by Valve on 2025-01-06, shipped with Premier Season 2 on 2025-01-29; first used in
+      pro play at BLAST Bounty. The same update lowered the M4A4 price again (reported as a
+      "discount"; exact value UNVERIFIED, believed 3000 -> 2900 USD).
+
+  - id: 2025-07-16-overpass-in-anubis-out
+    date: 2025-07-16
+    kind: map_pool
+    impact: major
+    date_verified: false
+    title: "Premier Season 3: Overpass replaces Anubis in Active Duty"
+    map_pool: [ancient, dust2, inferno, mirage, nuke, overpass, train]
+    notes: >
+      Month confirmed by several sources, exact day from secondary sources only (UNVERIFIED). Also
+      reported for this update: MP9 nerf, incendiary fire spreads faster, CTs earn an extra 50 USD
+      per kill in Competitive.
+
+  - id: 2025-07-29-animgraph2-first-person
+    date: 2025-07-29
+    kind: engine
+    impact: minor
+    date_verified: false
+    title: "First-person animations moved to AnimGraph 2"
+    notes: >
+      UNVERIFIED day (single secondary source). Weapon handling feel changed; map changes on
+      Overpass, Train and Inferno in the same update.
+
+  - id: 2025-09-17-subtick-consistency
+    date: 2025-09-17
+    kind: engine
+    impact: minor
+    date_verified: false
+    title: "Sub-tick shooting and movement consistency"
+    notes: >
+      UNVERIFIED day (single secondary source). Shooting consistency improved (09-17) and movement
+      acceleration made timestep independent (09-18).
+
+  - id: 2025-10-15-defuse-and-penetration
+    date: 2025-10-15
+    kind: mechanics
+    impact: moderate
+    date_verified: false
+    title: "Defusing lowers the weapon; bullet penetration rewritten"
+    notes: >
+      UNVERIFIED day (single secondary source). Defusing now lowers the weapon, blocks scoping and
+      adds a short fire delay (weaker fake defuses / stick decisions in post-plants); wallbang
+      behaviour changed by the penetration rewrite.
+
+  - id: 2026-01-21-anubis-in-train-out
+    date: 2026-01-21
+    kind: map_pool
+    impact: major
+    date_verified: true
+    title: "Premier Season 4: Anubis replaces Train in Active Duty"
+    map_pool: [ancient, anubis, dust2, inferno, mirage, nuke, overpass]
+    notes: >
+      Reworked Anubis returns after six months, Train leaves after one year (sources quote 01-21 or
+      01-22). Same update: SMG buffs and a jump / landing overhaul (stamina penalties removed).
+
+  - id: 2026-03-19-reload-rework
+    date: 2026-03-19
+    kind: weapons
+    impact: moderate
+    date_verified: false
+    title: "Reload redesign and reserve ammo rebalance"
+    notes: >
+      Day from two secondary sources, not checked against Valve's notes (UNVERIFIED). Magazine-fed
+      weapons discard the bullets left in the magazine on reload; reserve ammo rebalanced. Changes
+      spam / wallbang habits and ammo management in long rounds.
+
+  - id: 2026-04-02-animgraph2-rollout
+    date: 2026-04-02
+    kind: engine
+    impact: minor
+    date_verified: false
+    title: "AnimGraph 2 rollout (movement, crouch-jumps)"
+    notes: >
+      UNVERIFIED day (single secondary source). Smoother movement; slope height changes can break
+      grenade line-ups on ramps.
+
+  - id: 2026-07-08-cache-in-overpass-out
+    date: 2026-07-08
+    kind: map_pool
+    impact: major
+    date_verified: true
+    title: "Premier Season 5: Cache replaces Overpass in Active Duty"
+    map_pool: [ancient, anubis, cache, dust2, inferno, mirage, nuke]
+    notes: >
+      Cache (added to other modes on 2026-04-29) enters Active Duty, Overpass leaves (sources quote
+      07-08 or 07-09). Same update: C4 explosion damage reworked.
+
+  - id: 2026-07-21-bomb-clears-utility
+    date: 2026-07-21
+    kind: mechanics
+    impact: minor
+    date_verified: false
+    title: "Bomb explosion clears smokes and fires"
+    notes: >
+      UNVERIFIED day (single secondary source). Follow-up to the C4 damage rework; affects late
+      post-plant save / exit-frag situations (kill props) more than round outcomes.
+
+  - id: 2026-09-23-silent-reload
+    date: 2026-09-23
+    kind: mechanics
+    impact: minor
+    date_verified: false
+    title: "Silent reloading introduced"
+    notes: >
+      UNVERIFIED day (single secondary source). Slower, quiet reload when holding the key; Premier
+      map selection changed (not relevant for pro vetoes).

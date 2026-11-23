@@ -13,7 +13,7 @@ from pydantic import ValidationError
 from scipy.stats import spearmanr
 
 from cs2bot.domain.enums import TeamSlot, Tier
-from cs2bot.domain.predictions import MapWinEstimate
+from cs2bot.domain.predictions import MapSequenceProbability, MapWinEstimate
 from cs2bot.domain.records import MapResultRecord
 from cs2bot.models.ratings import (
     MapRatingModel,
@@ -667,7 +667,7 @@ def test_config_validation() -> None:
     with pytest.raises(ValidationError):
         RatingConfig(mov_weight=1.5)
     with pytest.raises(ValidationError):
-        RatingConfig(not_a_field=1)  # type: ignore[call-arg]
+        RatingConfig.model_validate({"not_a_field": 1})
     cfg = RatingConfig(roster_reset_fractions=(0.0, 0.5))
     assert cfg.roster_fraction(0) == 0.0
     assert cfg.roster_fraction(1) == 0.5
@@ -769,3 +769,114 @@ def test_default_config_is_near_the_optimum_of_a_coarse_grid() -> None:
         row for row in report["results"] if row["params"] == {"map_offset_sd": 0.6, "initial_phi": 2.0}
     )
     assert default_row["log_loss"] - report["best_log_loss"] < 0.01
+
+
+# ----------------------------------------------------------------------- map pick advantage
+
+
+def test_pick_advantage_is_off_by_default_and_shifts_the_picker_when_enabled() -> None:
+    recs = _season(8)
+    as_of = _after(recs)
+    assert RatingConfig().pick_advantage == 0.0
+    plain = MapRatingModel().fit(recs)
+    base = plain.predict(1, 2, "mirage", as_of)
+    assert plain.predict(1, 2, "mirage", as_of, picked_by=TeamSlot.TEAM2).p_team1_win == base.p_team1_win
+    assert base.components["pick_shift"] == 0.0
+
+    model = MapRatingModel(RatingConfig(pick_advantage=0.3)).fit(recs)  # records carry no picker
+    assert model.to_dict()["teams"] == plain.to_dict()["teams"]
+    neutral = model.predict(1, 2, "mirage", as_of)
+    own = model.predict(1, 2, "mirage", as_of, picked_by=TeamSlot.TEAM1)
+    theirs = model.predict(1, 2, "mirage", as_of, picked_by=TeamSlot.TEAM2)
+    assert neutral.p_team1_win == pytest.approx(base.p_team1_win)
+    assert own.components["logit_mean"] == pytest.approx(neutral.components["logit_mean"] + 0.3)
+    assert theirs.components["logit_mean"] == pytest.approx(neutral.components["logit_mean"] - 0.3)
+    assert theirs.p_team1_win < neutral.p_team1_win < own.p_team1_win
+    assert own.picked_by is TeamSlot.TEAM1
+    # orientation: "team 1 on its own pick" is the mirror image of "team 2 on its opponent's pick"
+    mirrored = model.predict(2, 1, "mirage", as_of, picked_by=TeamSlot.TEAM2)
+    assert own.p_team1_win + mirrored.p_team1_win == pytest.approx(1.0)
+    # map_advantage (used by the veto model) never includes the pick shift
+    assert model.map_advantage(1, 2, "mirage", as_of) == pytest.approx(logit(neutral.p_team1_win))
+
+
+def test_pick_advantage_discounts_wins_on_the_own_pick() -> None:
+    def gain(picked_by: TeamSlot | None) -> float:
+        model = MapRatingModel(RatingConfig(pick_advantage=0.4))
+        model.update(map_result(1, 1, 2).model_copy(update={"picked_by": picked_by}))
+        return model.rating(1).mu
+
+    assert gain(TeamSlot.TEAM2) > gain(None) > gain(TeamSlot.TEAM1) > 0.0
+
+
+def test_pick_advantage_helps_on_the_synthetic_universe() -> None:
+    """Synthetic teams pick on their true relative map strength, so the picker beats its rating."""
+    recs = universe(seed=4).map_results()
+    best, report = tune(recs, {"pick_advantage": [0.0, 0.3]}, holdout_fraction=0.4)
+    assert best.pick_advantage == 0.3
+    by_value = {row["params"]["pick_advantage"]: row["log_loss"] for row in report["results"]}
+    assert by_value[0.3] < by_value[0.0] - 0.002
+
+
+def test_predict_for_sequences_gives_one_estimate_per_map() -> None:
+    recs = _season(8)
+    as_of = _after(recs)
+    t1, t2 = TeamSlot.TEAM1, TeamSlot.TEAM2
+    sequences = [
+        MapSequenceProbability(
+            maps=["mirage", "de_nuke", "inferno"], pickers=[t1, t2, None], probability=0.6
+        ),
+        MapSequenceProbability(maps=["mirage", "inferno", "nuke"], pickers=[t1, t2, None], probability=0.3),
+        MapSequenceProbability(maps=["train", "mirage", "nuke"], pickers=[t2, t1, None], probability=0.1),
+        MapSequenceProbability(maps=["dust2", "mirage", "nuke"], pickers=[t2, t1, None], probability=0.0),
+    ]
+    plain = MapRatingModel().fit(recs)
+    estimates = plain.predict_for_sequences(1, 2, sequences, as_of, is_lan=True)
+    assert set(estimates) == {"mirage", "nuke", "inferno", "train"}  # zero-probability paths ignored
+    for map_name, est in estimates.items():
+        assert est.map_name == map_name
+        assert est.p_team1_win == pytest.approx(plain.predict(1, 2, map_name, as_of, is_lan=True).p_team1_win)
+    assert estimates["mirage"].picked_by is t1  # the same picker in every sequence
+    assert estimates["train"].picked_by is t2
+    assert estimates["nuke"].picked_by is None  # team 2's pick in one sequence, decider in others
+    assert estimates["inferno"].picked_by is None
+
+    model = MapRatingModel(RatingConfig(pick_advantage=0.4)).fit(recs)
+    mixed = model.predict_for_sequences(1, 2, sequences, as_of)
+    as_pick = model.predict(1, 2, "nuke", as_of, picked_by=t2)
+    as_decider = model.predict(1, 2, "nuke", as_of)
+    want = 0.6 * as_pick.p_team1_win + 0.4 * as_decider.p_team1_win
+    assert mixed["nuke"].p_team1_win == pytest.approx(want)
+    assert as_pick.p_team1_win < mixed["nuke"].p_team1_win < as_decider.p_team1_win
+    assert mixed["nuke"].sigma == pytest.approx(0.6 * as_pick.sigma + 0.4 * as_decider.sigma)
+    assert mixed["nuke"].components["p_picked_by_team2"] == pytest.approx(0.6)
+    assert mixed["nuke"].components["pick_shift"] == pytest.approx(-0.4 * 0.6)
+    assert mixed["mirage"].p_team1_win == pytest.approx(
+        model.predict(1, 2, "mirage", as_of, picked_by=t1).p_team1_win
+    )
+    with pytest.raises(ValueError):
+        model.predict_for_sequences(1, 2, sequences, recs[-1].played_at)
+    assert model.predict_for_sequences(1, 2, [], as_of) == {}
+
+
+def test_sigma_matches_the_real_error_against_ground_truth() -> None:
+    """``sigma`` is an honest error bar: errors vs the true probability are about one sigma wide."""
+    uni = universe(seed=3)
+    recs = uni.map_results()
+    train, hold = chronological_split(recs, 0.4)
+    wf = evaluate_walk_forward(MapRatingModel().fit(train), hold)
+    z_scores: list[float] = []
+    errors: list[float] = []
+    truth: dict[tuple[int, int, str], float] = {}
+    for pred in wf.predictions[3::10][:45]:
+        key = (pred.team1_id, pred.team2_id, pred.map_name)
+        if key not in truth:
+            truth[key] = uni.true_map_win_prob(*key, n_sims=500, seed=1)
+        errors.append(truth[key] - pred.p_team1_win)
+        z_scores.append(errors[-1] / pred.sigma)
+    n = len(z_scores)
+    rms_z = math.sqrt(sum(z * z for z in z_scores) / n)
+    assert 0.5 < rms_z < 1.5  # neither wildly over- nor under-confident
+    assert sum(abs(z) < 2.0 for z in z_scores) / n > 0.85
+    assert math.sqrt(sum(e * e for e in errors) / n) < 0.2
+    assert abs(sum(errors) / n) < 0.06  # no systematic bias toward team1 / team2

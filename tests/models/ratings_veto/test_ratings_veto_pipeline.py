@@ -47,8 +47,8 @@ def test_veto_distribution_and_map_estimates_feed_the_match_engine(
     assert all(isinstance(s, MapSequenceProbability) for s in sequences)
     assert sum(s.probability for s in sequences) == pytest.approx(1.0)
     json.dumps([s.model_dump(mode="json") for s in sequences])
-    maps = sorted({m for s in sequences for m in s.maps})
-    estimates = {m: ratings.predict(team1, team2, m, as_of, is_lan=True) for m in maps}
+    estimates = ratings.predict_for_sequences(team1, team2, sequences, as_of, is_lan=True)
+    assert set(estimates) == {m for s in sequences for m in s.maps}
     assert all(isinstance(e, MapWinEstimate) for e in estimates.values())
     prediction = build_match_prediction(
         match_id=1,

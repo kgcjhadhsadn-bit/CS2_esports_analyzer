@@ -4,12 +4,15 @@ State (:func:`compute_state`), from the ledger and the ``bets`` table; dry-run b
 from all money and limits:
 
 * ``balance``: the latest ledger balance minus the stakes of open bets that have not been debited in
-  the ledger yet (normally zero: a stake is debited when the bet is placed), i.e. the cash that is
-  still free to stake. The ledger is initialised with a DEPOSIT of ``starting_bankroll`` if empty.
+  the ledger yet (``reserved_stakes``; normally zero: a stake is debited when the bet is placed),
+  i.e. the cash that is still free to stake. The ledger is initialised with a DEPOSIT of
+  ``starting_bankroll`` if empty.
 * open stakes: bets in PENDING / PLACING / PLACED; ``bankroll_reference = balance + open stakes``
   (cash plus money at risk) is the bankroll that stakes and limits are sized from.
 * realized P&L today / this week: ``pnl`` of bets settled since the local (Europe/Warsaw) midnight /
-  Monday 00:00 (``cs2bot.utils.time.local_day_start`` / ``local_week_start``, DST-aware).
+  Monday 00:00 (``cs2bot.utils.time.local_day_start`` / ``local_week_start``, DST-aware; the UTC
+  instants are returned as ``day_start`` / ``week_start``). A settled bet without ``settled_at``
+  (an integration bug) is dated by its ``updated_at`` rather than silently ignored.
 * ``day_start_bankroll = bankroll_reference - realized_pnl_today`` (same for the week). Deposits,
   withdrawals and balance corrections made during the period are deliberately treated as if they
   had happened at the start of the period: they are part of the capital the limit protects. This
@@ -23,16 +26,24 @@ Stake sizing (:func:`size_stake`), PLAN.md section 6:
 * ``max_stake_fraction x bankroll_reference``;
 * the match exposure cap ``max_match_exposure_fraction x bankroll_reference - open stakes on the
   match`` (markets on the same match are correlated);
-* the daily guard ``daily_loss_limit_fraction x day_start_bankroll - (realized loss today + open
-  stakes placed today)`` - even if every bet placed today loses, the day's loss stays within the
-  limit; realized profits never enlarge the allowance (loss = ``max(0, -pnl)``);
+* the daily guard ``daily_loss_limit_fraction x day_start_bankroll - (realized loss today + ALL
+  open stakes)`` - even if every open bet loses today, the day's loss stays within the limit.
+  Open stakes placed on earlier days count too (:func:`total_open_stakes`): bets are placed up to
+  ``max_hours_before_start`` ahead, so yesterday's open bets usually settle today, and counting only
+  "stakes placed today" would let the worst-case loss of one day reach a multiple of the limit
+  (place the full allowance before midnight and again after it). Realized profits never enlarge the
+  allowance (loss = ``max(0, -pnl)``);
 * the weekly guard (same with the week numbers);
 * ``max_bets_per_day`` and the free ``balance``;
 * the 10 % winnings tax: when the stake would push the winning above 2,280 PLN, the stake is held
   at the tax-free limit unless the larger, taxed stake has a higher expected log-growth;
 
-rounded DOWN to ``stake_step``; below Betclic's ``min_stake`` it becomes 0 with a reason. A halted
-bot (kill switch / pause) never gets a stake.
+rounded DOWN to ``stake_step`` (never above any cap); below Betclic's ``min_stake`` it becomes 0 with
+a reason. A halted bot (kill switch / pause) never gets a stake.
+
+The caps only hold if every bet is sized against a state that already contains the previous bets:
+either recompute the state after each bet row is created, or size a whole batch with
+:func:`size_decisions`, which reserves each stake in a running copy of the state.
 
 Loss limits (:func:`check_loss_limits`): when the realized loss of the day (week) reaches
 ``daily_loss_limit_fraction x day_start_bankroll`` (weekly likewise) the bot is paused with a clear
@@ -45,12 +56,13 @@ from __future__ import annotations
 
 import math
 from collections import defaultdict
+from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from decimal import Decimal
 from zoneinfo import ZoneInfo
 
-from sqlalchemy import or_, select
+from sqlalchemy import and_, or_, select
 from sqlalchemy.orm import Session
 
 from cs2bot.config import BankrollSettings, BetclicSettings, Settings
@@ -67,7 +79,7 @@ from cs2bot.engine.ev import (
     kelly_for_net_odds,
 )
 from cs2bot.utils.logging import get_logger
-from cs2bot.utils.money import D, quantize_money, round_down_to_step
+from cs2bot.utils.money import CENT, D, quantize_money, round_down_to_step
 from cs2bot.utils.time import WARSAW, local_day_start, local_week_start, utcnow
 
 logger = get_logger(__name__)
@@ -90,10 +102,11 @@ class LossLimitStatus:
     weekly_limit: Decimal
     realized_loss_today: Decimal  # max(0, -realized_pnl_today)
     realized_loss_week: Decimal
-    daily_allowance: Decimal  # daily_limit - (realized loss today + open stakes placed today)
-    weekly_allowance: Decimal
+    daily_allowance: Decimal  # daily_limit - (realized loss today + all open stakes)
+    weekly_allowance: Decimal  # weekly_limit - (realized loss this week + all open stakes)
     daily_hit: bool
     weekly_hit: bool
+    open_stakes: Decimal = _ZERO  # all stakes at risk right now (see total_open_stakes)
 
 
 # ----------------------------------------------------------------------------------------------
@@ -103,6 +116,30 @@ class LossLimitStatus:
 
 def _bet_time(bet: Bet) -> datetime | None:
     return bet.placed_at if bet.placed_at is not None else bet.created_at
+
+
+def _settled_time(bet: Bet) -> datetime | None:
+    """When a settled bet counts for the loss limits: ``settled_at``, else ``updated_at`` (see module
+    doc) and, as a last resort, when it was placed / created."""
+    if bet.settled_at is not None:
+        return bet.settled_at
+    return bet.updated_at if bet.updated_at is not None else _bet_time(bet)
+
+
+def total_open_stakes(state: BankrollState) -> Decimal:
+    """Every stake currently at risk, whenever it was placed (the worst-case loss still to come).
+
+    ``compute_state`` guarantees ``bankroll_reference = balance + open stakes``; the other fields are
+    included so that a hand-built or partially filled state is never read as *less* exposure.
+    """
+    by_match = sum(state.exposure_by_match.values(), _ZERO)
+    return max(
+        state.bankroll_reference - state.balance,
+        by_match,
+        state.open_stakes_week,
+        state.open_stakes_today,
+        _ZERO,
+    )
 
 
 def _settled_pnl(bet: Bet, settings: Settings) -> Decimal:
@@ -146,6 +183,11 @@ def compute_state(
                 or_(
                     Bet.status.in_(list(OPEN_STATUSES)),
                     Bet.settled_at >= week_start - slack,
+                    and_(
+                        Bet.status.in_(list(SETTLED_STATUSES)),
+                        Bet.settled_at.is_(None),
+                        Bet.updated_at >= week_start - slack,
+                    ),
                     Bet.placed_at >= day_start - slack,
                     Bet.created_at >= day_start - slack,
                 ),
@@ -170,14 +212,22 @@ def compute_state(
 
     pnl_today = _ZERO
     pnl_week = _ZERO
+    undated: list[int] = []
     for bet in bets:
-        if bet.status not in SETTLED_STATUSES or bet.settled_at is None:
+        if bet.status not in SETTLED_STATUSES:
             continue
-        if bet.settled_at >= week_start:
+        if bet.settled_at is None:
+            undated.append(bet.id)
+        settled = _settled_time(bet)
+        if settled is None or settled >= week_start:  # unknown time: assume it is recent (conservative)
             pnl = _settled_pnl(bet, settings)
             pnl_week += pnl
-            if bet.settled_at >= day_start:
+            if settled is None or settled >= day_start:
                 pnl_today += pnl
+    if undated:
+        logger.warning(
+            "settled bets without settled_at (dated by updated_at for the loss limits): %s", undated[:20]
+        )
 
     open_today = _ZERO
     open_week = _ZERO
@@ -210,6 +260,9 @@ def compute_state(
         open_stakes_today=quantize_money(open_today),
         open_stakes_week=quantize_money(open_week),
         exposure_by_match={k: quantize_money(v) for k, v in exposure.items()},
+        day_start=day_start,
+        week_start=week_start,
+        reserved_stakes=quantize_money(reserved),
         bets_placed_today=placed_today,
         kill_switch=kill,
         paused=paused,
@@ -228,15 +281,17 @@ def loss_limit_status(state: BankrollState, settings: BankrollSettings) -> LossL
     weekly_limit = quantize_money(D(settings.weekly_loss_limit_fraction) * state.week_start_bankroll)
     loss_today = max(_ZERO, -state.realized_pnl_today)
     loss_week = max(_ZERO, -state.realized_pnl_week)
+    at_risk = total_open_stakes(state)
     return LossLimitStatus(
         daily_limit=daily_limit,
         weekly_limit=weekly_limit,
         realized_loss_today=loss_today,
         realized_loss_week=loss_week,
-        daily_allowance=daily_limit - (loss_today + state.open_stakes_today),
-        weekly_allowance=weekly_limit - (loss_week + state.open_stakes_week),
+        daily_allowance=daily_limit - (loss_today + at_risk),
+        weekly_allowance=weekly_limit - (loss_week + at_risk),
         daily_hit=loss_today > 0 and loss_today >= daily_limit,
         weekly_hit=loss_week > 0 and loss_week >= weekly_limit,
+        open_stakes=at_risk,
     )
 
 
@@ -252,8 +307,10 @@ def check_loss_limits(
 
     Returns True if a daily or weekly limit is currently reached. The pause is written once per
     period (remembered in ``system_state["loss_limit_pauses"]``) so that the owner's manual resume
-    is respected; this function never resumes. ``now`` (default: utcnow) and the timezone of a full
-    :class:`Settings` (default Europe/Warsaw) identify the current day / week.
+    is respected; this function never resumes. The current day / week are ``state.day_start`` /
+    ``state.week_start`` (set by :func:`compute_state`); for a state without them they are derived
+    from ``now`` (default: utcnow) and the timezone of a full :class:`Settings` (default
+    Europe/Warsaw).
     """
     if isinstance(settings, Settings):
         bankroll = db_state.effective_bankroll_settings(session, settings)
@@ -261,13 +318,15 @@ def check_loss_limits(
     else:
         bankroll, tz = settings, WARSAW
     when = now or utcnow()
+    day_id = (state.day_start or local_day_start(when, tz)).isoformat()
+    week_id = (state.week_start or local_week_start(when, tz)).isoformat()
     status = loss_limit_status(state, bankroll)
     hits: list[tuple[str, str, str]] = []  # (period kind, period id, message)
     if status.daily_hit:
         hits.append(
             (
                 "daily",
-                local_day_start(when, tz).isoformat(),
+                day_id,
                 f"daily loss limit reached: realized loss today {status.realized_loss_today} PLN "
                 f">= {status.daily_limit} PLN ({bankroll.daily_loss_limit_fraction:.0%} of the "
                 f"day-start bankroll {state.day_start_bankroll} PLN)",
@@ -277,7 +336,7 @@ def check_loss_limits(
         hits.append(
             (
                 "weekly",
-                local_week_start(when, tz).isoformat(),
+                week_id,
                 f"weekly loss limit reached: realized loss this week {status.realized_loss_week} PLN "
                 f">= {status.weekly_limit} PLN ({bankroll.weekly_loss_limit_fraction:.0%} of the "
                 f"week-start bankroll {state.week_start_bankroll} PLN)",
@@ -313,9 +372,14 @@ def size_stake(
 ) -> tuple[Decimal, list[str]]:
     """Stake for an accepted decision and the reasons behind it (module doc for the rules).
 
-    Returns ``(stake, reasons)``. A zero stake comes with the reasons why nothing can be staked
+    Returns ``(stake, messages)``. A zero stake comes with the reasons why nothing can be staked
     (prefixed with a code like ``"halted: ..."``); a positive stake comes with informational notes
-    about the caps that bound it (``"capped: ..."``).
+    about the caps that bound it (``"capped: ..."``). :func:`apply_stake` files them under
+    ``BetDecision.reasons`` and ``BetDecision.notes`` respectively.
+
+    Pure function of its arguments: the caller must make sure ``state`` already contains every bet
+    created so far (see the module docstring and :func:`size_decisions`), and must still check
+    ``db.state.is_trading_halted`` immediately before placing the bet.
     """
     reasons: list[str] = []
     if not decision.accepted:
@@ -357,14 +421,13 @@ def size_stake(
             "daily_loss_guard",
             status.daily_allowance,
             f"daily loss guard: limit {_money(status.daily_limit)}, realized loss "
-            f"{_money(status.realized_loss_today)}, open stakes placed today "
-            f"{_money(state.open_stakes_today)}",
+            f"{_money(status.realized_loss_today)}, open stakes {_money(status.open_stakes)}",
         ),
         (
             "weekly_loss_guard",
             status.weekly_allowance,
             f"weekly loss guard: limit {_money(status.weekly_limit)}, realized loss "
-            f"{_money(status.realized_loss_week)}, open stakes this week {_money(state.open_stakes_week)}",
+            f"{_money(status.realized_loss_week)}, open stakes {_money(status.open_stakes)}",
         ),
         ("balance", state.balance, f"free balance {_money(state.balance)}"),
     ]
@@ -383,7 +446,10 @@ def size_stake(
     if tax_note:
         notes.append(tax_note)
 
+    ceiling = stake
     stake = round_down_to_step(stake, settings.stake_step)
+    while stake > ceiling:  # only possible with a step finer than a grosz: never round above a cap
+        stake -= CENT
     if stake < betclic.min_stake:
         detail = f"sized stake {_money(stake)} < Betclic minimum {_money(betclic.min_stake)}"
         if notes:
@@ -414,16 +480,20 @@ def _respect_winnings_tax(
         return stake, None
     outcome = decision.priced.outcome
     p_win, p_lose = outcome.p_win, outcome.p_lose
+    refunds = {
+        "p_refund": max(0.0, outcome.p_push) + max(0.0, outcome.p_void),
+        "refund_loss": float(model.refund_loss_rate),
+    }
     bankroll = float(bankroll_reference)
     o_eff = float(effective_odds(odds, tax_rate=model.stake_tax_rate))
     b_free = o_eff - 1.0
     b_taxed = o_eff * (1.0 - float(model.big_win_rate)) - 1.0
-    taxed_full_kelly = max(0.0, kelly_for_net_odds(p_win, p_lose, b_taxed))
+    taxed_full_kelly = max(0.0, kelly_for_net_odds(p_win, p_lose, b_taxed, **refunds))
     # same fractional Kelly and the same caps (``stake`` already includes every cap)
     taxed_stake = min(D(settings.kelly_fraction * taxed_full_kelly) * bankroll_reference, stake)
-    growth_limit = expected_log_growth(p_win, p_lose, b_free, float(limit) / bankroll)
+    growth_limit = expected_log_growth(p_win, p_lose, b_free, float(limit) / bankroll, **refunds)
     if taxed_stake > limit:
-        growth_taxed = expected_log_growth(p_win, p_lose, b_taxed, float(taxed_stake) / bankroll)
+        growth_taxed = expected_log_growth(p_win, p_lose, b_taxed, float(taxed_stake) / bankroll, **refunds)
         if growth_taxed > growth_limit:
             return taxed_stake, (
                 f"winnings tax: staking {_money(taxed_stake)} although the winning exceeds "
@@ -438,24 +508,82 @@ def _respect_winnings_tax(
 
 
 def apply_stake(decision: BetDecision, state: BankrollState, stake: Decimal, notes: list[str]) -> BetDecision:
-    """Copy of ``decision`` with the stake applied: rejected (with the reasons) if the stake is 0.
+    """Copy of ``decision`` with the result of :func:`size_stake` applied.
 
+    A positive stake keeps the decision accepted and files ``notes`` under ``BetDecision.notes``
+    (informational: which caps were binding). A zero stake rejects the decision and appends ``notes``
+    - then the reasons why nothing can be staked - to ``BetDecision.reasons``.
     ``kelly_fraction_used`` is the fraction of ``bankroll_reference`` actually staked.
     """
-    used = float(stake / state.bankroll_reference) if state.bankroll_reference > 0 and stake > 0 else 0.0
-    return decision.model_copy(
-        update={
-            "stake": stake,
-            "kelly_fraction_used": used,
-            "accepted": decision.accepted and stake > 0,
-            "reasons": [*decision.reasons, *notes],
-        }
-    )
+    staked = stake > 0
+    used = float(stake / state.bankroll_reference) if state.bankroll_reference > 0 and staked else 0.0
+    update: dict[str, object] = {
+        "stake": stake if staked else _ZERO,
+        "kelly_fraction_used": used,
+        "accepted": decision.accepted and staked,
+    }
+    if staked:
+        update["notes"] = [*decision.notes, *notes]
+    else:
+        update["reasons"] = [*decision.reasons, *notes]
+    return decision.model_copy(update=update)
 
 
 def size_decision(
     decision: BetDecision, state: BankrollState, settings: BankrollSettings, betclic: BetclicSettings
 ) -> BetDecision:
-    """:func:`size_stake` + :func:`apply_stake` in one call."""
+    """:func:`size_stake` + :func:`apply_stake` in one call.
+
+    A decision the decision rules already rejected is returned unchanged (stake 0, its own reasons).
+    """
+    if not decision.accepted:
+        return decision
     stake, notes = size_stake(decision, state, settings, betclic)
     return apply_stake(decision, state, stake, notes)
+
+
+def reserve_stake(state: BankrollState, match_id: int, stake: Decimal) -> BankrollState:
+    """The state after a new bet of ``stake`` on ``match_id`` has been created (not yet debited).
+
+    The stake leaves the free balance and joins the open stakes, the match exposure and today's bet
+    count; ``bankroll_reference`` is unchanged. This is exactly what :func:`compute_state` returns
+    once the PENDING ``bets`` row exists, so a batch can be sized without touching the database.
+    """
+    if stake <= 0:
+        return state
+    exposure = dict(state.exposure_by_match)
+    exposure[match_id] = exposure.get(match_id, _ZERO) + stake
+    return state.model_copy(
+        update={
+            "balance": state.balance - stake,
+            "open_stakes_today": state.open_stakes_today + stake,
+            "open_stakes_week": state.open_stakes_week + stake,
+            "exposure_by_match": exposure,
+            "reserved_stakes": state.reserved_stakes + stake,
+            "bets_placed_today": state.bets_placed_today + 1,
+        }
+    )
+
+
+def size_decisions(
+    decisions: Iterable[BetDecision],
+    state: BankrollState,
+    settings: BankrollSettings,
+    betclic: BetclicSettings,
+) -> tuple[list[BetDecision], BankrollState]:
+    """Size a batch of decisions one after another against a running copy of ``state``.
+
+    Each accepted decision is sized with :func:`size_decision` and its stake is reserved
+    (:func:`reserve_stake`) before the next one is sized, so the batch as a whole respects every
+    cap, guard and the bets-per-day limit - sizing all decisions against the same snapshot would
+    not. Decisions are processed in the given order (put the best ones first). Returns the sized
+    decisions (same order) and the projected state after all of them.
+    """
+    sized: list[BetDecision] = []
+    running = state
+    for decision in decisions:
+        result = size_decision(decision, running, settings, betclic)
+        if result.accepted and result.stake > 0:
+            running = reserve_stake(running, result.match_id, result.stake)
+        sized.append(result)
+    return sized, running

@@ -15,7 +15,14 @@ from cs2bot.config import BetclicSettings, DecisionSettings, MarketThresholds
 from cs2bot.db.models import ContextFlagRow, Veto
 from cs2bot.domain.betting import BetDecision
 from cs2bot.domain.context import ContextFlag
-from cs2bot.domain.enums import BetStatus, ContextFlagType, LinkStatus, TeamSlot, VetoAction
+from cs2bot.domain.enums import (
+    BetStatus,
+    ContextFlagType,
+    LinkStatus,
+    MatchStatus,
+    TeamSlot,
+    VetoAction,
+)
 from cs2bot.domain.markets import SELECTION_OVER, MarketSpec, MarketType
 from cs2bot.engine.decision import (
     MatchDecisionInfo,
@@ -27,9 +34,18 @@ from cs2bot.engine.decision import (
     load_already_bet_keys,
     load_match_decision_info,
     reason_code,
+    settled_sigma,
     thresholds_for,
 )
-from tests.engine.engine_factories import T0, add_bet, add_event, add_match, make_prediction, make_priced
+from tests.engine.engine_factories import (
+    T0,
+    add_bet,
+    add_event,
+    add_match,
+    make_outcome,
+    make_prediction,
+    make_priced,
+)
 
 NOW = T0 + timedelta(seconds=60)
 
@@ -409,3 +425,123 @@ def test_non_finite_numbers_never_pass() -> None:
     match_ok = match.model_copy(update={"data_completeness": 1.0, "link_confidence": 1.0})
     d3 = evaluate(nan_p, match=match_ok, settings=DecisionSettings(), betclic=BetclicSettings(), now=NOW)
     assert codes(d3) == [ReasonCode.INVALID_NUMBERS.value, ReasonCode.LOW_PROBABILITY.value]
+
+
+# ------------------------------------------------------------------ review round 1 additions
+
+
+def test_sigma_is_judged_on_the_scale_of_the_settled_probability() -> None:
+    """Map 3 of a BO3 is void half of the time: the sigma of the unconditional p_win is only half the
+    uncertainty of p(win | settled), the probability the confidence check uses."""
+    spec3 = MarketSpec(market_type=MarketType.MAP_WINNER, map_number=3)
+    kw: dict[str, Any] = {"spec": spec3, "p_win": 0.42, "p_void": 0.5, "odds": "1.80"}
+    fine = Case(priced_kw={**kw, "sigma": 0.02}, match_kw={"veto_known": True}).run()
+    assert fine.accepted  # 0.02 / 0.5 = 0.04 <= 0.05
+    risky = Case(priced_kw={**kw, "sigma": 0.03}, match_kw={"veto_known": True}).run()
+    assert codes(risky) == [ReasonCode.HIGH_SIGMA]  # 0.03 / 0.5 = 0.06 > 0.05
+    assert "sigma 0.0600 > 0.0500" in risky.reasons[0] and "0.0300" in risky.reasons[0]
+    assert settled_sigma(make_outcome(p_win=0.42, p_void=0.5, sigma=0.03)) == pytest.approx(0.06)
+    assert settled_sigma(make_outcome(p_win=0.8, sigma=0.03)) == pytest.approx(0.03)
+    assert settled_sigma(make_outcome(p_win=0.0, p_void=1.0, sigma=0.01)) == float("inf")
+
+
+@pytest.mark.parametrize(
+    "status", [MatchStatus.LIVE, MatchStatus.FINISHED, MatchStatus.CANCELED, MatchStatus.POSTPONED]
+)
+def test_only_scheduled_matches_are_bet(status: MatchStatus) -> None:
+    d = Case(match_kw={"match_status": status}).run()
+    assert codes(d) == [ReasonCode.MATCH_NOT_SCHEDULED] and status.value in d.reasons[0]
+
+
+@pytest.mark.parametrize("status", [None, MatchStatus.SCHEDULED, MatchStatus.UNKNOWN])
+def test_scheduled_or_unknown_match_status_is_fine(status: MatchStatus | None) -> None:
+    assert Case(match_kw={"match_status": status}).run().accepted
+
+
+def test_naive_timestamps_fail_the_rule_instead_of_crashing() -> None:
+    naive_quote = Case(priced_kw={"captured_at": T0.replace(tzinfo=None)}).run()
+    assert codes(naive_quote) == [ReasonCode.ODDS_STALE] and "timezone" in naive_quote.reasons[0]
+    naive_start = Case(match_kw={"scheduled_at": (T0 + timedelta(hours=3)).replace(tzinfo=None)}).run()
+    assert codes(naive_start) == [ReasonCode.OUTSIDE_TIME_WINDOW] and "timezone" in naive_start.reasons[0]
+
+
+@pytest.mark.parametrize(
+    "update",
+    [
+        {"p_win": 1.2},  # would sail through every threshold
+        {"p_win": 0.8, "p_void": 0.3},  # sums to 1.1
+        {"p_win": 0.8, "p_push": -0.1},
+        {"p_win": 0.8, "sigma": -0.01},
+    ],
+)
+def test_invalid_distributions_never_pass(update: dict[str, float]) -> None:
+    priced = make_priced()
+    broken = priced.model_copy(update={"outcome": priced.outcome.model_copy(update=update)})
+    d = evaluate(
+        broken,
+        match=MatchDecisionInfo(
+            match_id=1,
+            scheduled_at=T0 + timedelta(hours=3),
+            data_completeness=0.99,
+            link_confidence=0.97,
+            link_status=LinkStatus.AUTO,
+        ),
+        settings=DecisionSettings(),
+        betclic=BetclicSettings(),
+        now=NOW,
+    )
+    assert not d.accepted and ReasonCode.INVALID_NUMBERS in codes(d)
+
+
+def test_dry_run_bets_do_not_block_real_bets(session: Session) -> None:
+    m = add_match(session)
+    add_bet(session, match_id=m.id, status=BetStatus.DRY_RUN, dry_run=True, spec_key="map_winner|map=1")
+    add_bet(session, match_id=m.id, status=BetStatus.DRY_RUN, dry_run=False, spec_key="map_winner|map=2")
+    add_bet(session, match_id=m.id, status=BetStatus.PLACING, spec_key="match_winner")  # unconfirmed
+    real = {bet_key(m.id, "match_winner", "team1")}
+    dry = {bet_key(m.id, "map_winner|map=1", "team1"), bet_key(m.id, "map_winner|map=2", "team1")}
+    assert load_already_bet_keys(session, m.id) == real | dry  # default: a dry run is not repeated
+    assert load_already_bet_keys(session, m.id, include_dry_run=False) == real
+    info = load_match_decision_info(session, match_id=m.id, include_dry_run_bets=False)
+    assert info.already_bet_keys == real
+
+
+def test_decision_info_uses_the_earlier_start_time_and_the_match_status(session: Session) -> None:
+    m = add_match(session, scheduled_at=T0 + timedelta(hours=5))
+    ev = add_event(session, m.id)
+    ev.starts_at = T0 + timedelta(hours=4)  # Betclic closes the market an hour before our start time
+    other = add_event(session, None)
+    other.starts_at = T0 + timedelta(hours=1)  # not linked to this match: ignored
+    session.flush()
+    info = load_match_decision_info(session, match_id=m.id, bookmaker_event_id=ev.id, now=NOW)
+    assert info.scheduled_at == T0 + timedelta(hours=4) and info.match_status is MatchStatus.SCHEDULED
+    assert load_match_decision_info(
+        session, match_id=m.id, bookmaker_event_id=other.id, now=NOW
+    ).scheduled_at == T0 + timedelta(hours=5)
+    ev.starts_at = T0 + timedelta(hours=6)
+    m.status = MatchStatus.LIVE
+    session.flush()
+    info = load_match_decision_info(session, match_id=m.id, bookmaker_event_id=ev.id, now=NOW)
+    assert info.scheduled_at == T0 + timedelta(hours=5) and info.match_status is MatchStatus.LIVE
+    d = evaluate(make_priced(), match=info, settings=DecisionSettings(), betclic=BetclicSettings(), now=NOW)
+    assert ReasonCode.MATCH_NOT_SCHEDULED in codes(d)
+    with pytest.raises(ValueError, match="prediction is for match"):
+        load_match_decision_info(session, match_id=m.id, prediction=make_prediction(match_id=m.id + 1))
+
+
+def test_naive_expiry_on_a_prediction_flag_is_read_as_utc(session: Session) -> None:
+    m = add_match(session)
+    expired = ContextFlag(
+        flag_type=ContextFlagType.ILLNESS,
+        severity=0.9,
+        confidence=0.9,
+        veto=True,
+        rationale="was ill last week",
+        expires_at=(NOW - timedelta(hours=1)).replace(tzinfo=None),
+    )
+    active = expired.model_copy(
+        update={"rationale": "ill today", "expires_at": (NOW + timedelta(hours=1)).replace(tzinfo=None)}
+    )
+    pred = make_prediction(match_id=m.id).model_copy(update={"context_flags": [expired, active]})
+    info = load_match_decision_info(session, match_id=m.id, prediction=pred, now=NOW)
+    assert info.context_veto and info.context_veto_reason == "illness: ill today"

@@ -22,8 +22,11 @@ from cs2bot.engine.bankroll import (
     check_loss_limits,
     compute_state,
     loss_limit_status,
+    reserve_stake,
     size_decision,
+    size_decisions,
     size_stake,
+    total_open_stakes,
 )
 from cs2bot.engine.ev import TaxModel, kelly_fraction
 from tests.engine.engine_factories import add_bet, add_match, make_decision, make_outcome
@@ -191,6 +194,41 @@ def test_settled_bet_without_pnl_is_derived(session: Session, settings: Settings
     assert st.bets_placed_today == 4
 
 
+def test_state_carries_period_starts_and_reserved_stakes(session: Session, settings: Settings) -> None:
+    now = utc(2026, 1, 15, 10)  # Thursday 11:00 Warsaw
+    ledger.ensure_initialized(session, settings, at=utc(2026, 1, 1))
+    place(session, "20", now - timedelta(hours=1))
+    add_bet(session, stake="10", status=BetStatus.PENDING, created_at=now - timedelta(minutes=1))
+    add_bet(session, stake="5", status=BetStatus.PLACING, created_at=now - timedelta(minutes=1))
+    st = compute_state(session, settings, now=now)
+    assert st.day_start == utc(2026, 1, 14, 23) and st.week_start == utc(2026, 1, 11, 23)
+    assert st.reserved_stakes == Decimal("15.00")  # pending + uncertain placement: not debited yet
+    assert st.balance == Decimal("965.00") and st.bankroll_reference == Decimal("1000.00")
+    assert total_open_stakes(st) == Decimal("35.00") == st.bankroll_reference - st.balance
+
+
+def test_settled_bet_without_settled_at_still_counts_for_the_limits(
+    session: Session, settings: Settings
+) -> None:
+    """An integration bug (status set, settled_at forgotten) must not hide a loss from the limits."""
+    now = utc(2026, 1, 15, 10)
+    ledger.ensure_initialized(session, settings, at=utc(2026, 1, 1))
+    bet = place(session, "60", now - timedelta(days=2))
+    bet.status, bet.pnl = BetStatus.LOST, Decimal("-60.00")
+    bet.updated_at = now - timedelta(hours=1)
+    session.flush()
+    assert bet.settled_at is None
+    st = compute_state(session, settings, now=now)
+    assert st.realized_pnl_today == Decimal("-60.00") == st.realized_pnl_week
+    assert check_loss_limits(session, st, settings) is True
+    # ... while a loss whose row was last touched before this week is left alone
+    old = place(session, "30", now - timedelta(days=20))
+    old.status, old.pnl = BetStatus.LOST, Decimal("-30.00")
+    old.updated_at = now - timedelta(days=19)
+    session.flush()
+    assert compute_state(session, settings, now=now).realized_pnl_week == Decimal("-60.00")
+
+
 # ------------------------------------------------------------------ loss limits
 
 
@@ -232,6 +270,19 @@ def test_daily_loss_limit_pauses_once_and_respects_manual_resume(
     stake, reasons = size_stake(make_decision(kelly_full=0.3), st, BANKROLL, BETCLIC)
     assert stake == 0 and reasons[0].startswith("daily_loss_guard")
     assert db_state.get_state(session, LOSS_LIMIT_STATE_KEY)["daily"] == "2026-01-14T23:00:00+00:00"
+
+
+def test_loss_limit_period_comes_from_the_state_not_the_wall_clock(
+    session: Session, settings: Settings
+) -> None:
+    now = utc(2026, 1, 15, 10)
+    ledger.ensure_initialized(session, settings, at=utc(2026, 1, 1))
+    bet = place(session, "50", now - timedelta(hours=3))
+    settle(session, bet, BetStatus.LOST, now - timedelta(hours=1), settings)
+    st = compute_state(session, settings, now=now)
+    assert check_loss_limits(session, st, settings) is True  # no ``now``: the real clock is irrelevant
+    assert db_state.get_state(session, LOSS_LIMIT_STATE_KEY)["daily"] == "2026-01-14T23:00:00+00:00"
+    assert db_state.get_pause(session)[0] is True
 
 
 def test_weekly_loss_limit(session: Session, settings: Settings) -> None:
@@ -292,6 +343,8 @@ def base_state(**kw: Any) -> BankrollState:
     return BankrollState(**values)
 
 
+NO_GUARDS: dict[str, Any] = {"daily_loss_limit_fraction": 2.0, "weekly_loss_limit_fraction": 2.0}
+
 STAKE_CASES: list[tuple[str, dict[str, Any], dict[str, Any], dict[str, Any], str, str | None]] = [
     # name, state kw, decision kw, bankroll settings kw, expected stake, expected first reason/note prefix
     ("quarter-kelly", {}, {"kelly_full": 0.04}, {}, "10.00", None),
@@ -321,9 +374,20 @@ STAKE_CASES: list[tuple[str, dict[str, Any], dict[str, Any], dict[str, Any], str
     ("bets-per-day", {"bets_placed_today": 10}, {"kelly_full": 0.3}, {}, "0", "bets_per_day"),
     ("bets-per-day-custom", {"bets_placed_today": 3}, {"kelly_full": 0.3}, {"max_bets_per_day": 3}, "0",
      "bets_per_day"),
-    ("balance", {"balance": Decimal("3.55")}, {"kelly_full": 0.3}, {}, "3.50", "capped: max_stake"),
+    # a free balance of 3.55 with a 1000 bankroll means 996.45 is at risk: the loss guards stop that
+    # long before the balance cap does, so the balance cap is isolated with the guards switched off
+    ("balance", {"balance": Decimal("3.55")}, {"kelly_full": 0.3}, NO_GUARDS, "3.50", "capped: max_stake"),
+    ("balance-implies-open-stakes", {"balance": Decimal("3.55")}, {"kelly_full": 0.3}, {}, "0",
+     "daily_loss_guard: nothing left"),
+    ("carried-over-open-stakes", {"balance": Decimal("965"), "exposure_by_match": {7: Decimal("35")}},
+     {"kelly_full": 0.3}, {}, "15.00", "capped: max_stake"),  # nothing placed today, 35 still open
+    ("carried-over-open-stakes-full", {"balance": Decimal("950")}, {"kelly_full": 0.3}, {}, "0",
+     "daily_loss_guard: nothing left"),
     ("min-stake", {}, {"kelly_full": 0.005}, {}, "0", "below_min_stake"),  # 1.25 < 2.00
-    ("min-stake-after-cap", {"balance": Decimal("1.99")}, {"kelly_full": 0.3}, {}, "0", "below_min_stake"),
+    ("min-stake-after-cap", {"balance": Decimal("1.99")}, {"kelly_full": 0.3}, NO_GUARDS, "0",
+     "below_min_stake"),
+    ("never-rounds-above-a-cap", {"exposure_by_match": {1: Decimal("37.994")}}, {"kelly_full": 0.3},
+     {"stake_step": Decimal("0.001")}, "2.00", "capped: max_stake"),  # cap 2.006: 2.00, never 2.01
     ("kill-switch", {"kill_switch": True}, {"kelly_full": 0.3}, {}, "0", "halted: kill switch"),
     ("paused", {"paused": True, "pause_reason": "daily loss limit reached"}, {"kelly_full": 0.3}, {}, "0",
      "halted: paused (daily loss limit reached)"),
@@ -367,7 +431,7 @@ def test_halted_lists_every_reason() -> None:
 
 def test_binding_caps_are_reported_as_notes() -> None:
     st = base_state(exposure_by_match={1: Decimal("35")}, balance=Decimal("4.20"))
-    stake, notes = size_stake(make_decision(kelly_full=0.3), st, BANKROLL, BETCLIC)
+    stake, notes = size_stake(make_decision(kelly_full=0.3), st, BankrollSettings(**NO_GUARDS), BETCLIC)
     assert stake == Decimal("4.20")
     assert [n.split(" ->")[0] for n in notes] == [
         "capped: max_stake",
@@ -397,14 +461,85 @@ def test_many_small_bets_hit_the_daily_guard(session: Session, settings: Setting
     assert last_reasons[0].startswith("daily_loss_guard: nothing left")
     st = compute_state(session, settings, now=now + timedelta(minutes=20))
     assert st.open_stakes_today == Decimal("50.00") and st.bets_placed_today == 10
-    # the next local day the open stakes no longer count for the daily guard, only the weekly one
+    # The next local day the bets are still open: they can all lose "today", so they keep counting
+    # against the daily guard although none of them was placed today.
     tomorrow = now + timedelta(days=1)
     st2 = compute_state(session, settings, now=tomorrow)
     assert st2.open_stakes_today == 0 and st2.open_stakes_week == Decimal("50.00")
-    stake2, _ = size_stake(
+    assert total_open_stakes(st2) == Decimal("50.00") and st2.bets_placed_today == 0
+    stake2, reasons2 = size_stake(
         make_decision(match_id=add_match(session).id, kelly_full=0.02), st2, bankroll, BETCLIC
     )
-    assert stake2 == Decimal("5.00")
+    assert stake2 == 0 and reasons2[0].startswith("daily_loss_guard: nothing left")
+    # once four of them have won, their stakes are no longer at risk and the guard has room again
+    open_bets = list(session.scalars(select(Bet).where(Bet.status == BetStatus.PLACED).order_by(Bet.id)))
+    for bet in open_bets[:4]:
+        settle(session, bet, BetStatus.WON, tomorrow, settings)
+    st3 = compute_state(session, settings, now=tomorrow + timedelta(minutes=1))
+    assert total_open_stakes(st3) == Decimal("30.00") and st3.realized_pnl_today > 0
+    stake3, _ = size_stake(
+        make_decision(match_id=add_match(session).id, kelly_full=0.02), st3, bankroll, BETCLIC
+    )
+    assert stake3 == Decimal("5.00")
+
+
+def test_worst_case_daily_loss_stays_within_the_limit_across_midnight(
+    session: Session, settings: Settings
+) -> None:
+    """Bets placed just before and just after local midnight, all losing on the same day."""
+    bankroll = BankrollSettings(max_bets_per_day=50)
+    ledger.ensure_initialized(session, settings, at=utc(2026, 1, 1))
+    evening = utc(2026, 1, 14, 22, 30)  # 23:30 Warsaw on the 14th
+    after_midnight = utc(2026, 1, 14, 23, 10)  # 00:10 Warsaw on the 15th
+    placed: list[Bet] = []
+    for when in (evening, after_midnight):
+        for i in range(20):
+            now = when + timedelta(seconds=i)
+            st = compute_state(session, settings, now=now)
+            match = add_match(session)
+            stake, _ = size_stake(make_decision(match_id=match.id, kelly_full=0.3), st, bankroll, BETCLIC)
+            if stake == 0:
+                break
+            placed.append(place(session, str(stake), now, match_id=match.id))
+    # 20 + 20 + 10 in the evening exhaust the 5% guard; nothing more fits after midnight
+    assert [b.stake for b in placed] == [Decimal("20.00"), Decimal("20.00"), Decimal("10.00")]
+    for bet in placed:
+        settle(session, bet, BetStatus.LOST, utc(2026, 1, 15, 18), settings)
+    st = compute_state(session, settings, now=utc(2026, 1, 15, 19))
+    status = loss_limit_status(st, bankroll)
+    assert status.realized_loss_today == Decimal("50.00") <= status.daily_limit == Decimal("50.00")
+
+
+def test_multi_day_worst_case_never_exceeds_the_daily_or_weekly_limit(
+    session: Session, settings: Settings
+) -> None:
+    """Stake as much as allowed every day; every bet loses the day after it was placed."""
+    bankroll = BankrollSettings(max_bets_per_day=50)
+    ledger.ensure_initialized(session, settings, at=utc(2025, 12, 1))
+    open_bets: list[Bet] = []
+    week_loss = Decimal("0")
+    week_start_bankroll: Decimal | None = None
+    for day in range(12, 19):  # Mon 2026-01-12 .. Sun 2026-01-18
+        morning = utc(2026, 1, day, 9)
+        day_loss = Decimal("0")
+        for bet in open_bets:  # yesterday's bets all lose this morning
+            settle(session, bet, BetStatus.LOST, morning, settings)
+            day_loss += bet.stake
+        open_bets = []
+        st = compute_state(session, settings, now=morning + timedelta(minutes=1))
+        week_start_bankroll = week_start_bankroll or st.week_start_bankroll
+        assert day_loss <= loss_limit_status(st, bankroll).daily_limit
+        week_loss += day_loss
+        for i in range(30):
+            now = morning + timedelta(hours=1, minutes=i)
+            st = compute_state(session, settings, now=now)
+            match = add_match(session)
+            stake, _ = size_stake(make_decision(match_id=match.id, kelly_full=0.3), st, bankroll, BETCLIC)
+            if stake == 0:
+                break
+            open_bets.append(place(session, str(stake), now, match_id=match.id))
+    assert week_start_bankroll is not None
+    assert Decimal("0") < week_loss <= Decimal("0.10") * week_start_bankroll
 
 
 def test_match_exposure_cap_with_real_bets(session: Session, settings: Settings) -> None:
@@ -470,11 +605,61 @@ def test_apply_stake_and_size_decision() -> None:
     assert sized.accepted and sized.stake == Decimal("10.00")
     assert sized.kelly_fraction_used == pytest.approx(0.01)
     assert d.stake == 0  # the original is untouched
+    assert sized.notes == [] and sized.reasons == []
     rejected = size_decision(d, base_state(kill_switch=True), BANKROLL, BETCLIC)
     assert not rejected.accepted and rejected.stake == 0 and rejected.kelly_fraction_used == 0
-    assert rejected.reasons == ["halted: kill switch is on"]
+    assert rejected.reasons == ["halted: kill switch is on"] and rejected.notes == []
     zero = apply_stake(d, base_state(bankroll_reference=Decimal("0")), Decimal("0"), ["x: y"])
     assert not zero.accepted and zero.reasons == ["x: y"]
+
+
+def test_sizing_notes_and_rejection_reasons_are_kept_apart() -> None:
+    capped = size_decision(make_decision(kelly_full=0.3), base_state(), BANKROLL, BETCLIC)
+    assert capped.accepted and capped.stake == Decimal("20.00")
+    assert capped.reasons == [] and capped.notes and capped.notes[0].startswith("capped: max_stake")
+    zero = size_decision(make_decision(kelly_full=0.005), base_state(), BANKROLL, BETCLIC)
+    assert not zero.accepted and zero.stake == 0 and zero.notes == []
+    assert zero.reasons and zero.reasons[0].startswith("below_min_stake")
+    rejected = make_decision(kelly_full=0.3, accepted=False)
+    assert size_decision(rejected, base_state(), BANKROLL, BETCLIC) is rejected  # left untouched
+
+
+def test_reserve_stake_matches_what_compute_state_sees(session: Session, settings: Settings) -> None:
+    now = utc(2026, 1, 15, 10)
+    ledger.ensure_initialized(session, settings, at=utc(2026, 1, 1))
+    match = add_match(session)
+    before = compute_state(session, settings, now=now)
+    projected = reserve_stake(before, match.id, Decimal("12.50"))
+    add_bet(session, stake="12.50", status=BetStatus.PENDING, match_id=match.id, created_at=now)
+    assert compute_state(session, settings, now=now) == projected
+    assert reserve_stake(before, match.id, Decimal("0")) is before
+
+
+def test_size_decisions_reserves_each_stake_before_sizing_the_next() -> None:
+    state = base_state()
+    decisions = [make_decision(match_id=m, kelly_full=0.3) for m in (1, 1, 1, 2, 3, 4)]
+    decisions.insert(2, make_decision(match_id=9, kelly_full=0.3, accepted=False))
+    # against one snapshot every bet would get the 2% cap: 120 PLN at risk with a 50 PLN daily limit
+    assert sum(size_stake(d, state, BANKROLL, BETCLIC)[0] for d in decisions) == Decimal("120.00")
+    sized, after = size_decisions(decisions, state, BANKROLL, BETCLIC)
+    assert [d.stake for d in sized] == [Decimal(x) for x in ("20", "20", "0", "0", "10", "0", "0")]
+    assert [d.accepted for d in sized] == [True, True, False, False, True, False, False]
+    assert sized[3].reasons[0].startswith("match_exposure: nothing left")  # 4% on match 1 is used up
+    assert sized[4].notes[-1].startswith("capped: daily_loss_guard")
+    assert sized[5].reasons[0].startswith("daily_loss_guard: nothing left")
+    assert after.exposure_by_match == {1: Decimal("40.00"), 2: Decimal("10.00")}
+    assert after.balance == Decimal("950.00") and after.bankroll_reference == Decimal("1000.00")
+    assert after.bets_placed_today == 3 and after.reserved_stakes == Decimal("50.00")
+    assert total_open_stakes(after) == Decimal("50.00")
+    assert state.balance == Decimal("1000.00")  # the input state is not mutated
+
+
+def test_size_decisions_respects_bets_per_day() -> None:
+    settings = BankrollSettings(max_bets_per_day=2, **NO_GUARDS)
+    decisions = [make_decision(match_id=m, kelly_full=0.04) for m in (1, 2, 3)]
+    sized, after = size_decisions(decisions, base_state(), settings, BETCLIC)
+    assert [d.stake for d in sized] == [Decimal("10.00"), Decimal("10.00"), Decimal("0")]
+    assert sized[2].reasons[0].startswith("bets_per_day") and after.bets_placed_today == 2
 
 
 def test_non_finite_kelly_is_no_edge() -> None:

@@ -538,7 +538,7 @@ class ContextAnalyzer:
     # -- triage (Haiku) -------------------------------------------------------------------
 
     def triage(self, items: list[tuple[int, NewsItemIn]], known_teams: dict[int, str]) -> list[TriageItem]:
-        """Classify news items. ``items`` are ``(news_items.id, NewsItemIn)``; returns verdicts in input order.
+        """Classify news items given as ``(news_items.id, NewsItemIn)``; verdicts come back in input order.
 
         Returns ``[]`` in disabled mode. Items the model could not classify are simply missing from the
         result (see :meth:`triage_detailed` for the reasons).
@@ -712,7 +712,9 @@ class ContextAnalyzer:
                 model=self._llm.context_model,
                 effort=self._llm.context_effort,
                 max_tokens=self._tuning.context_max_tokens,
-                system=prompts.context_system_prompt(self._llm.max_flag_logit_shift),
+                system=prompts.context_system_prompt(
+                    self._llm.max_flag_logit_shift, self._tuning.veto_min_confidence
+                ),
                 user=prompts.build_context_message(
                     ctx,
                     selected,

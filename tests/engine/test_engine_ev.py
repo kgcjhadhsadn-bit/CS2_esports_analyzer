@@ -24,6 +24,7 @@ from cs2bot.engine.ev import (
     payout_breakdown,
     price,
     price_all,
+    refund_amount,
     stake_tax,
     winnings_tax,
 )
@@ -32,6 +33,9 @@ from tests.engine.engine_factories import make_outcome, make_quote
 TAXED = TaxModel(Decimal("0.12"), Decimal("2280"), Decimal("0.10"))
 PROMO = TaxModel(Decimal("0"), Decimal("2280"), Decimal("0.10"))
 NO_PIT = TaxModel(Decimal("0.12"), Decimal("2280"), Decimal("0"))
+#: Bookmaker keeps the 12 % stake tax when a bet is voided / pushed (void_refunds_stake_tax = False).
+NET_REFUND = TaxModel(Decimal("0.12"), Decimal("2280"), Decimal("0.10"), refund_stake_tax=False)
+GROSZ = TaxModel(Decimal("0.12"), Decimal("2280"), Decimal("0.10"), win_tax_rounding="grosz")
 
 
 def outcome(p_win: float, p_void: float = 0.0, p_push: float = 0.0) -> OutcomeProbability:
@@ -55,6 +59,91 @@ def test_tax_model_from_settings() -> None:
         TaxModel(Decimal("1.2"), Decimal("2280"), Decimal("0.1"))
     with pytest.raises(ValueError, match="big_win_threshold"):
         TaxModel(Decimal("0.12"), Decimal("-1"), Decimal("0.1"))
+
+
+def test_tax_model_adopts_the_betclic_settlement_rules() -> None:
+    default = TaxModel.from_settings(BetclicSettings())
+    assert default.refund_stake_tax is True and default.win_tax_rounding == "zloty"
+    assert default.refund_loss_rate == 0
+    custom = BetclicSettings(void_refunds_stake_tax=False, winnings_tax_rounding="grosz")
+    model = TaxModel.from_settings(custom)
+    assert model.refund_stake_tax is False and model.win_tax_rounding == "grosz"
+    assert model.refund_loss_rate == Decimal("0.12")
+    assert TaxModel.from_settings(Settings(betclic=custom)) == model
+    # during a tax-free promo nothing is deducted, so a net refund loses nothing either
+    promo = TaxModel.from_settings(BetclicSettings(void_refunds_stake_tax=False, tax_free_promo=True))
+    assert promo.refund_loss_rate == 0
+    with pytest.raises(ValueError, match="win_tax_rounding"):
+        TaxModel(Decimal("0.12"), Decimal("2280"), Decimal("0.1"), win_tax_rounding="cent")  # type: ignore[arg-type]
+
+
+def test_refund_amount() -> None:
+    assert refund_amount(Decimal("10"), TAXED) == Decimal("10.00")
+    assert refund_amount(Decimal("10"), NET_REFUND) == Decimal("8.80")
+    assert refund_amount(Decimal("7.30"), NET_REFUND) == Decimal("6.42")  # tax 0.876 -> 0.88
+    # the tax actually charged on the bet (e.g. placed during a promo) overrides the settings
+    assert refund_amount(Decimal("10"), NET_REFUND, tax=Decimal("0")) == Decimal("10.00")
+    assert refund_amount(Decimal("10"), TAXED, tax=Decimal("1.20")) == Decimal("10.00")
+    with pytest.raises(ValueError):
+        refund_amount(Decimal("-1"), TAXED)
+    with pytest.raises(ValueError, match="stake tax"):
+        refund_amount(Decimal("10"), NET_REFUND, tax=Decimal("11"))
+
+
+def test_winnings_tax_to_the_grosz() -> None:
+    assert winnings_tax(Decimal("2280.00"), GROSZ) == Decimal("0.00")
+    assert winnings_tax(Decimal("2280.01"), GROSZ) == Decimal("228.00")  # 228.001
+    assert winnings_tax(Decimal("2345.67"), GROSZ) == Decimal("234.57")  # 234.567 (zloty rule: 235)
+    assert winnings_tax(Decimal("2345.67"), TAXED) == Decimal("235.00")
+    assert net_payout(Decimal("1000"), Decimal("2.666"), GROSZ) == Decimal("2111.47")  # 2346.08 - 234.61
+    assert net_payout(Decimal("1000"), Decimal("2.666"), TAXED) == Decimal("2111.08")  # 2346.08 - 235
+
+
+def test_expected_value_when_refunds_keep_the_stake_tax() -> None:
+    o = outcome(0.6, p_void=0.15, p_push=0.10)
+    # full refunds: 0.6 * 0.408 - 0.15 = 0.0948; net refunds lose 12% of the stake a quarter of the time
+    assert expected_value(o, Decimal("1.60"), TAXED) == pytest.approx(0.0948)
+    assert expected_value(o, Decimal("1.60"), NET_REFUND) == pytest.approx(0.0948 - 0.25 * 0.12)
+    assert expected_value(o, Decimal("1.60"), NET_REFUND, stake=Decimal("100")) == pytest.approx(0.0648)
+    # nothing but refunds: a certain loss of the stake tax
+    assert expected_value(outcome(0.0, p_void=1.0), Decimal("2.00"), NET_REFUND) == pytest.approx(-0.12)
+    assert kelly_fraction(outcome(0.0, p_void=1.0), Decimal("2.00"), NET_REFUND) < 0
+    priced = price(o, make_quote(odds="1.60"), NET_REFUND)
+    assert priced.ev == pytest.approx(0.0648)
+    assert 0 < priced.kelly_full < price(o, make_quote(odds="1.60"), TAXED).kelly_full
+
+
+@pytest.mark.parametrize(
+    ("p_win", "p_refund", "odds"),
+    [(0.6, 0.25, "1.60"), (0.45, 0.4, "2.50"), (0.8, 0.1, "1.45"), (0.3, 0.6, "4.00"), (0.7, 0.3, "1.50")],
+)
+def test_kelly_with_a_refund_cost_maximises_log_growth(p_win: float, p_refund: float, odds: str) -> None:
+    """G(f) = p_w ln(1 + b f) + p_l ln(1 - f) + p_r ln(1 - c f), c = stake tax kept on refunds."""
+    o = outcome(p_win, p_void=p_refund)
+    b = float(effective_odds(Decimal(odds), tax_rate=Decimal("0.12"))) - 1.0
+    c = 0.12
+
+    def growth(f: float) -> float:
+        return o.p_win * math.log1p(b * f) + o.p_lose * math.log1p(-f) + p_refund * math.log1p(-c * f)
+
+    res = minimize_scalar(
+        lambda f: -growth(f), bounds=(0.0, 0.999999), method="bounded", options={"xatol": 1e-11}
+    )
+    f_star = kelly_fraction(o, Decimal(odds), NET_REFUND)
+    ev = expected_value(o, Decimal(odds), NET_REFUND)
+    if ev > 0 and o.p_lose < 1e-9:
+        assert f_star == 1.0  # the whole stake can never be lost: staking everything maximises growth
+    elif ev > 0:
+        assert f_star == pytest.approx(res.x, abs=2e-6)
+        full = kelly_fraction(o, Decimal(odds), TAXED)
+        assert f_star <= full + 1e-9  # a refund cost never raises the stake ...
+        if o.p_lose > 1e-9:
+            assert f_star < full  # ... and lowers it whenever the bet can lose
+        assert expected_log_growth(o.p_win, o.p_lose, b, f_star, p_refund=p_refund, refund_loss=c) == (
+            pytest.approx(growth(f_star))
+        )
+    else:
+        assert f_star <= 0 and res.x == pytest.approx(0.0, abs=1e-5)
 
 
 def test_effective_odds() -> None:
@@ -241,6 +330,7 @@ probabilities = st.tuples(
 )
 odds_values = st.decimals(min_value=Decimal("1.01"), max_value=Decimal("25"), places=3)
 models = st.sampled_from([TAXED, PROMO])
+all_models = st.sampled_from([TAXED, PROMO, NET_REFUND])
 
 
 def _outcome_from(pw_frac: tuple[float, float]) -> OutcomeProbability:
@@ -250,7 +340,7 @@ def _outcome_from(pw_frac: tuple[float, float]) -> OutcomeProbability:
 
 
 @settings(max_examples=300, deadline=None)
-@given(probabilities, odds_values, models)
+@given(probabilities, odds_values, all_models)
 def test_property_kelly_non_positive_iff_ev_non_positive(
     pw: tuple[float, float], odds: Decimal, model: TaxModel
 ) -> None:
@@ -278,7 +368,7 @@ def test_property_refund_invariance(
 
 
 @settings(max_examples=300, deadline=None)
-@given(probabilities, odds_values, odds_values, models)
+@given(probabilities, odds_values, odds_values, all_models)
 def test_property_monotone_in_odds(pw: tuple[float, float], a: Decimal, b: Decimal, model: TaxModel) -> None:
     o = _outcome_from(pw)
     lo, hi = min(a, b), max(a, b)
@@ -314,3 +404,17 @@ def test_property_winnings_tax_never_helps(pw: tuple[float, float], odds: Decima
     payout = net_payout(stake, odds, TAXED)
     gross = payout_breakdown(stake, odds, TAXED).gross_win
     assert payout == gross or (gross > Decimal("2280") and payout < gross)
+
+
+@settings(max_examples=200, deadline=None)
+@given(probabilities, odds_values)
+def test_property_refund_cost_never_helps(pw: tuple[float, float], odds: Decimal) -> None:
+    """Keeping the stake tax on refunds can only lower the EV and the Kelly stake."""
+    o = _outcome_from(pw)
+    assert expected_value(o, odds, NET_REFUND) <= expected_value(o, odds, TAXED) + 1e-12
+    f_net, f_full = kelly_fraction(o, odds, NET_REFUND), kelly_fraction(o, odds, TAXED)
+    assert -1.0 <= f_net <= 1.0
+    if f_full > 0:
+        assert f_net <= f_full + 1e-9
+    if o.p_push + o.p_void == 0:
+        assert f_net == pytest.approx(f_full, abs=1e-12)

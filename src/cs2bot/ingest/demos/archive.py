@@ -99,7 +99,7 @@ def detect_archive_kind(path: Path) -> ArchiveKind:
 
 def _is_bsdtar(executable: str) -> bool:
     try:
-        out = subprocess.run(  # noqa: S603 - fixed arguments, executable found on this machine
+        out = subprocess.run(
             [executable, "--version"], capture_output=True, text=True, timeout=10, check=False
         )
     except (OSError, subprocess.SubprocessError):
@@ -116,7 +116,7 @@ def _windows_tool_candidates() -> list[tuple[str, str]]:
             candidate = Path(root) / relative
             if candidate.is_file():
                 found.append((attr, str(candidate)))
-    system_root = os.environ.get("SystemRoot")
+    system_root = os.environ.get("SYSTEMROOT")
     tar_candidates = [shutil.which("tar")]
     if system_root:
         tar_candidates.append(str(Path(system_root) / "System32" / "tar.exe"))

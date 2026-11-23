@@ -289,9 +289,8 @@ def render_template_rationale(
         )
     if not flags:
         lines.append("- No context flags.")
-    lines.append(
-        f"- Total adjustment applied to {team1}'s map log-odds: {digest['context']['logit_shift_applied_team1']:+.3f}"
-    )
+    applied = digest["context"]["logit_shift_applied_team1"]
+    lines.append(f"- Total adjustment applied to {team1}'s map log-odds: {applied:+.3f}")
 
     dec = digest["decisions"]
     lines += ["", "### Bets"]

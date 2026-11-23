@@ -250,7 +250,7 @@ def store_triage(
     suggested = {int(t) for t in item.team_ids}
     if suggested:
         known = set(session.scalars(select(Team.id).where(Team.id.in_(suggested))))
-        merged = sorted({int(t) for t in (row.team_ids or []) if isinstance(t, int)} | known)
+        merged = sorted(_int_set(row.team_ids) | known)
         if merged != list(row.team_ids or []):
             row.team_ids = merged
     row.extra = merge_llm_extra(
@@ -279,8 +279,8 @@ def news_row_to_input(row: NewsItem) -> NewsItemIn:
         title=row.title,
         body=body,
         published_at=row.published_at,
-        team_ids=[int(t) for t in (row.team_ids or []) if isinstance(t, int)],
-        player_ids=[int(p) for p in (row.player_ids or []) if isinstance(p, int)],
+        team_ids=sorted(_int_set(row.team_ids)),
+        player_ids=sorted(_int_set(row.player_ids)),
     )
 
 

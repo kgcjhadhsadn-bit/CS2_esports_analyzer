@@ -48,7 +48,16 @@ by penalised maximum likelihood (L-BFGS, ridge toward ``a = 1, b = c = 0``) on h
 whose features are computed **walk-forward** (each veto's features use only earlier vetoes, and the
 advantage callable is queried at the veto's own time). Two coefficient sets are kept: one with the
 advantage term (if an advantage callable was given to :meth:`VetoModel.fit`) and one without, used
-when :meth:`VetoModel.predict_sequences` is called without ``map_advantage``.
+when :meth:`VetoModel.predict_sequences` is called without ``map_advantage``. A model fitted
+*without* an advantage callable has no weight for the term and therefore ignores ``map_advantage``
+at prediction time. Advantage values are sanitised (NaN / inf -> 0, clipped to +-10 logits); a
+lookup that raises during :meth:`VetoModel.fit` counts as "no information" for that step
+(:attr:`VetoModel.advantage_failures`), at prediction time the exception propagates.
+
+Assumptions (documented, not verifiable from this machine): maps are played in pick order followed
+by the leftover map; the first-veto team ("team A") is not known before the veto is published, so
+callers pass ``first_veto=None`` unless they know it; organisers with a different order (for
+example BO1 with 2-3-1 bans, or a BO5 on a 7-map pool starting with picks) pass ``template=``.
 
 Sequence distribution
 ---------------------
@@ -88,6 +97,7 @@ from cs2bot.utils.time import ensure_utc, utcnow
 log = get_logger(__name__)
 
 __all__ = [
+    "BO1_TEMPLATE_2_3_1",
     "VETO_TEMPLATES",
     "MapAdvantageFn",
     "StepForecast",
@@ -162,6 +172,19 @@ def veto_template(fmt: MatchFormat, n_maps: int = 7) -> tuple[VetoTemplateStep, 
 VETO_TEMPLATES: Final[dict[MatchFormat, tuple[VetoTemplateStep, ...]]] = {
     fmt: veto_template(fmt, 7) for fmt in MatchFormat
 }
+
+#: Alternative BO1 order used at Valve-sponsored events (assumption from the published Major rules:
+#: team A removes 2 maps, team B removes 3, team A removes 1, the remaining map is played). Pass it
+#: as ``template=`` for those tournaments; the default BO1 template alternates single bans.
+BO1_TEMPLATE_2_3_1: Final[tuple[VetoTemplateStep, ...]] = (
+    VetoTemplateStep(VetoAction.BAN, 0),
+    VetoTemplateStep(VetoAction.BAN, 0),
+    VetoTemplateStep(VetoAction.BAN, 1),
+    VetoTemplateStep(VetoAction.BAN, 1),
+    VetoTemplateStep(VetoAction.BAN, 1),
+    VetoTemplateStep(VetoAction.BAN, 0),
+    VetoTemplateStep(VetoAction.LEFTOVER, None),
+)
 
 
 # ------------------------------------------------------------------------------------------- config
@@ -708,11 +731,13 @@ class VetoModel:
         prefix_len = max(known) + 1
         prefix: list[tuple[VetoAction, TeamSlot | None]] = []
         for i in range(prefix_len):
-            if i in known:
+            if i < len(plan):
+                # Template step, already merged with the known step by _plan (a known step without
+                # team information keeps the template's actor).
+                prefix.append(plan[i])
+            elif i in known:
                 action, team, _ = known[i]
                 prefix.append((action, None if action is VetoAction.LEFTOVER else team))
-            elif i < len(plan):
-                prefix.append(plan[i])
             else:
                 raise ValueError("known veto steps have gaps beyond the veto template")
         if any(a is VetoAction.LEFTOVER for a, _ in prefix):

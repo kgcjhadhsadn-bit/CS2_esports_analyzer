@@ -34,7 +34,8 @@ Online update of one map (both teams simultaneously, each against the other's pr
    deviation becomes ``phi_t = min(phi_0, sqrt(phi^2 + c sigma^2))`` and offsets drift with
    ``psi_t^2 = min(psi_0^2, psi^2 + c_m * map_offset_drift^2)``.
 2. **Roster continuity.** If the record's lineup replaced ``k`` players of the team's previous
-   lineup, a reset fraction ``rho = roster_reset_fractions[k]`` (default 0, .12, .35, .7, .9, 1: one
+   lineup (``k = min(|new - old|, |old - new|)``, so an incomplete lineup listing is never counted
+   as a change), a reset fraction ``rho = roster_reset_fractions[k]`` (default 0, .12, .35, .7, .9, 1: one
    change is mild, three or more is close to a reset) moves ``phi^2`` toward ``phi_0^2`` by ``rho``
    and regresses ``mu`` toward ``initial_mu`` by ``rho * roster_mu_regression``; map/LAN offsets get
    the same treatment scaled by ``roster_offset_scale``.
@@ -58,6 +59,14 @@ Online update of one map (both teams simultaneously, each against the other's pr
 Actual score (margin of victory): ``s = (1 - mov_weight) 1[win] + mov_weight F_MR12(round share)``
 where ``F_MR12`` is the exact MR12/MR3 map-win probability for i.i.d. rounds - the implied map-win
 probability of the observed round share. A win always gives ``s > 0.5``.
+
+Map pick (optional, ``pick_advantage``, default 0): when the picker of a map is known, the picking
+team's strength is shifted by ``pick_advantage`` logits in the expected score of the update and in
+the prediction. Teams pick maps on private information the ratings only learn slowly, so the picker
+tends to beat its rating. On the synthetic universes (where picks follow the *true* relative map
+strength) values of 0.45-0.6 lower the walk-forward log-loss by about 0.01, but that size is an
+artefact of the generator; the default stays 0 until it is tuned on real results
+(``tune(records, {"pick_advantage": [0.0, 0.05, 0.1, 0.2]})``).
 
 Prediction: ``theta_1 - theta_2 ~ N(kappa (theta_1 - theta_2), kappa^2 (Phi_1^2 + Phi_2^2))`` at
 ``as_of`` (deviations inflated to ``as_of``); ``p_team1_win`` is the mean of the logistic over this
@@ -91,7 +100,7 @@ from typing import Any, Final
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from cs2bot.domain.enums import TeamSlot, Tier
-from cs2bot.domain.predictions import MapWinEstimate
+from cs2bot.domain.predictions import MapSequenceProbability, MapWinEstimate
 from cs2bot.domain.records import MapResultRecord
 from cs2bot.models.ratings_glicko import (
     g,
@@ -154,6 +163,9 @@ class RatingConfig(BaseModel):
     lan_scale: float = Field(default=0.0, gt=-1.0)
     lan_offset_sd: float = Field(default=0.0, ge=0.0)
     lan_offset_drift: float = Field(default=0.0, ge=0.0)
+    # Map-pick advantage (logit units) added to the picking team's strength when the picker is
+    # known (records' ``picked_by`` / ``predict(picked_by=...)``). 0 disables it; see module docstring.
+    pick_advantage: float = Field(default=0.0, ge=-2.0, le=2.0)
     # Optional information weight per tournament tier value ("s", "a", "b", ...); default 1.
     tier_weights: dict[str, float] = Field(default_factory=dict)
     # Roster continuity: reset fraction by number of replaced players (index = changes).
@@ -465,8 +477,9 @@ class MapRatingModel:
         s1 = mov_score(rec.team1_rounds, rec.team2_rounds, cfg.mov_weight)
         weight = cfg.tier_weight(rec.tier)
         kappa = cfg.lan_kappa(rec.is_lan)
-        new1 = self._update_team(team1, view1, view2, s1, weight, kappa, t, map_name)
-        new2 = self._update_team(team2, view2, view1, 1.0 - s1, weight, kappa, t, map_name)
+        shift = self._pick_shift(rec.picked_by)
+        new1 = self._update_team(team1, view1, view2, s1, weight, kappa, t, map_name, shift)
+        new2 = self._update_team(team2, view2, view1, 1.0 - s1, weight, kappa, t, map_name, -shift)
         self._teams[rec.team1_id] = new1
         self._teams[rec.team2_id] = new2
         if self._history is not None:
@@ -474,6 +487,12 @@ class MapRatingModel:
                 times, states = self._history.setdefault(tid, ([], []))
                 times.append(t)
                 states.append(st)
+
+    def _pick_shift(self, picked_by: TeamSlot | None) -> float:
+        """Strength shift (team1 minus team2, logit units) from the known map picker."""
+        if picked_by is None or self._config.pick_advantage == 0.0:
+            return 0.0
+        return self._config.pick_advantage if picked_by is TeamSlot.TEAM1 else -self._config.pick_advantage
 
     def _new_team(self) -> _Team:
         cfg = self._config
@@ -603,10 +622,11 @@ class MapRatingModel:
         kappa: float,
         t: datetime,
         map_name: str,
+        shift: float = 0.0,
     ) -> _Team:
         cfg = self._config
         g_opp = kappa * g(math.sqrt(opp.var_now))
-        e = sigmoid(g_opp * (own.theta - opp.theta))
+        e = sigmoid(g_opp * (own.theta - opp.theta + shift))
         e = min(max(e, _E_CLIP), 1.0 - _E_CLIP)
         info = weight * g_opp * g_opp * e * (1.0 - e)  # 1 / v
         score = weight * g_opp * (s - e)  # info * Delta
@@ -698,11 +718,12 @@ class MapRatingModel:
         v1, _ = self._prediction_view(teams, team1_id, team1_lineup, map_name, t, is_lan)
         v2, _ = self._prediction_view(teams, team2_id, team2_lineup, map_name, t, is_lan)
         kappa = cfg.lan_kappa(is_lan)
-        mean = kappa * (v1.theta - v2.theta)
+        shift = self._pick_shift(picked_by)
+        mean = kappa * (v1.theta - v2.theta + shift)
         var = kappa * kappa * (v1.var_now + v2.var_now)
         p, sd = logistic_normal_moments(mean, var)
         p_overall, _ = logistic_normal_moments(
-            kappa * (v1.overall.mu - v2.overall.mu), kappa * kappa * (v1.phi2_now + v2.phi2_now)
+            kappa * (v1.overall.mu - v2.overall.mu + shift), kappa * kappa * (v1.phi2_now + v2.phi2_now)
         )
         components: dict[str, float] = {
             "overall": p_overall,
@@ -718,6 +739,7 @@ class MapRatingModel:
             "team1_roster_changes": float(v1.roster_changes),
             "team2_roster_changes": float(v2.roster_changes),
             "lan": 1.0 if is_lan else 0.0,
+            "pick_shift": shift,
         }
         return MapWinEstimate(
             map_name=map_name, p_team1_win=p, sigma=sd, picked_by=picked_by, components=components
@@ -746,7 +768,9 @@ class MapRatingModel:
         ``team1_lineup``/``team2_lineup`` (player ids), when given and different from the team's
         last known lineup, apply the roster-continuity adjustment hypothetically (no state change).
         Unknown teams get the prior (``p`` near 0.5 when both are unknown, large ``sigma``).
-        Raises ``ValueError`` if ``as_of`` is not after the last processed game.
+        ``picked_by`` is copied to the estimate and, with ``config.pick_advantage != 0``, shifts the
+        picking team's strength. Raises ``ValueError`` if ``as_of`` is not after the last processed
+        game.
         """
         t = self._check_as_of(as_of)
         return self._estimate(
@@ -760,6 +784,62 @@ class MapRatingModel:
             team2_lineup,
             picked_by,
         )
+
+    def predict_for_sequences(
+        self,
+        team1_id: int,
+        team2_id: int,
+        sequences: Sequence[MapSequenceProbability],
+        as_of: datetime,
+        *,
+        is_lan: bool = False,
+        team1_lineup: Sequence[int] = (),
+        team2_lineup: Sequence[int] = (),
+    ) -> dict[str, MapWinEstimate]:
+        """One estimate per map of a veto distribution: the ``map_estimates`` of the match engine.
+
+        ``sequences`` is the output of :meth:`cs2bot.models.veto.VetoModel.predict_sequences`. The
+        match engine takes a single estimate per map, but the same map can be picked by either team
+        (or be the decider) in different sequences. ``picked_by`` of the returned estimate is the
+        picker when it is the same in every sequence containing the map, else ``None``; with
+        ``config.pick_advantage != 0`` the probability and sigma are the averages over the picker
+        scenarios weighted by their sequence probability (the marginal over the veto uncertainty).
+        """
+        t = self._check_as_of(as_of)
+        weights: dict[str, dict[TeamSlot | None, float]] = {}
+        for seq in sequences:
+            if seq.probability <= 0.0:
+                continue
+            for raw, picker in zip(seq.maps, seq.pickers, strict=False):
+                per_map = weights.setdefault(normalize_map_name(raw), {})
+                per_map[picker] = per_map.get(picker, 0.0) + seq.probability
+        out: dict[str, MapWinEstimate] = {}
+        for map_name, by_picker in weights.items():
+            total = sum(by_picker.values())
+            ests = {
+                picker: self._estimate(
+                    self._teams, team1_id, team2_id, map_name, t, is_lan, team1_lineup, team2_lineup, picker
+                )
+                for picker in by_picker
+            }
+            if len(ests) == 1:
+                out[map_name] = next(iter(ests.values()))
+                continue
+            modal = max(by_picker, key=lambda k: by_picker[k])
+            p = sum(by_picker[k] * ests[k].p_team1_win for k in ests) / total
+            sd = sum(by_picker[k] * ests[k].sigma for k in ests) / total
+            components = dict(ests[modal].components)
+            components["map"] = p
+            components["overall"] = sum(by_picker[k] * ests[k].components["overall"] for k in ests) / total
+            components["pick_shift"] = (
+                sum(by_picker[k] * ests[k].components["pick_shift"] for k in ests) / total
+            )
+            components["p_picked_by_team1"] = by_picker.get(TeamSlot.TEAM1, 0.0) / total
+            components["p_picked_by_team2"] = by_picker.get(TeamSlot.TEAM2, 0.0) / total
+            out[map_name] = MapWinEstimate(
+                map_name=map_name, p_team1_win=p, sigma=sd, picked_by=None, components=components
+            )
+        return out
 
     def map_advantage(
         self, team_id: int, opponent_id: int, map_name: str, as_of: datetime, *, is_lan: bool = False
@@ -1154,6 +1234,7 @@ def evaluate_walk_forward(model: MapRatingModel, records: Iterable[MapResultReco
                 is_lan=r.is_lan,
                 team1_lineup=r.team1_lineup,
                 team2_lineup=r.team2_lineup,
+                picked_by=r.picked_by,
             )
             preds.append(
                 WalkForwardPrediction(

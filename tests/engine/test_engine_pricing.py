@@ -13,6 +13,7 @@ import logging
 
 import pytest
 
+from cs2bot.config import BetclicSettings, reset_settings_cache
 from cs2bot.domain.enums import MatchFormat
 from cs2bot.domain.markets import (
     SELECTION_DRAW,
@@ -29,11 +30,13 @@ from cs2bot.domain.markets import (
     player_selection,
 )
 from cs2bot.domain.predictions import MatchPrediction, OutcomeProbability
+from cs2bot.engine import pricing as pricing_module
 from cs2bot.engine.pricing import (
     UnpriceableMarket,
     fallback_sigma,
     final_map_scores,
     is_final_round_score,
+    market_rules,
     price_core,
     price_outcome,
     price_quotes,
@@ -337,6 +340,109 @@ def test_race_to_beyond_regulation_needs_the_score_pmf() -> None:
     assert price(spec(MT.RACE_TO_ROUNDS, map_number=1, line=5), SELECTION_TEAM1, custom).p_win == 0.58
     with pytest.raises(UnpriceableMarket, match="neither team"):
         price(spec(MT.RACE_TO_ROUNDS, map_number=1, line=16), SELECTION_TEAM1, custom)
+
+
+def _with_slot1(pred: MatchPrediction, **update: object) -> MatchPrediction:
+    slot = pred.central.slots[0].model_copy(update=update)
+    return pred.model_copy(
+        update={"central": pred.central.model_copy(update={"slots": [slot, *pred.central.slots[1:]]})}
+    )
+
+
+def test_race_to_prefers_the_published_neither_probability() -> None:
+    pred = make_prediction(shift=None)
+    s16 = spec(MT.RACE_TO_ROUNDS, map_number=1, line=16)
+    # the simulator's own P(nobody reaches 16) wins over the value derived from the score pmf (0.8) ...
+    explicit = _with_slot1(pred, p_neither_race_to={"16": 0.7}, p_team1_race_to={"16": 0.18})
+    a, b = price(s16, SELECTION_TEAM1, explicit), price(s16, SELECTION_TEAM2, explicit)
+    assert (a.p_win, a.p_void) == (pytest.approx(0.18), pytest.approx(0.7))
+    assert (b.p_win, b.p_void) == (pytest.approx(0.12), pytest.approx(0.7))
+    # ... and makes the market priceable without a score pmf
+    no_pmf = _with_slot1(pred, score_pmf={}, p_neither_race_to={"16": 0.8})
+    assert price(s16, SELECTION_TEAM2, no_pmf).p_win == pytest.approx(0.08)
+    # inconsistent inputs are refused, not clipped
+    broken = _with_slot1(pred, p_neither_race_to={"16": 0.95})
+    with pytest.raises(UnpriceableMarket, match="inconsistent"):
+        price(s16, SELECTION_TEAM2, broken)
+    with pytest.raises(UnpriceableMarket, match="not a probability"):
+        price(s16, SELECTION_TEAM1, _with_slot1(pred, p_neither_race_to={"16": 1.3}))
+
+
+def test_round_handicap_on_regulation_time(bo3: MatchPrediction) -> None:
+    # map 1 (q = 0.6): P(16-14) = 0.12 and P(14-16) = 0.08 count as 12-12 on regulation time
+    s = spec(MT.ROUND_HANDICAP, map_number=1, line=-1.5)
+    assert price(s, SELECTION_TEAM1, bo3).p_win == pytest.approx(0.60)
+    reg1 = price(s, SELECTION_TEAM1, bo3, include_overtime_in_totals=False)
+    reg2 = price(s, SELECTION_TEAM2, bo3, include_overtime_in_totals=False)
+    assert reg1.p_win == pytest.approx(0.48) and reg2.p_win == pytest.approx(0.52)
+    level = spec(MT.ROUND_HANDICAP, map_number=1, line=0.0)
+    t1 = price(level, SELECTION_TEAM1, bo3, include_overtime_in_totals=False)
+    assert (t1.p_win, t1.p_push) == (pytest.approx(0.48), pytest.approx(0.20))
+    assert price(level, SELECTION_TEAM1, bo3).p_push == pytest.approx(0.0)
+
+
+def test_settlement_rules_default_to_the_betclic_settings(
+    bo3: MatchPrediction, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    assert market_rules() == (True, "push")  # the BetclicSettings defaults
+    strict = BetclicSettings(h2h_tie_rule="lose", totals_include_overtime=False)
+    assert market_rules(betclic=strict) == (False, "lose")
+    assert market_rules(True, None, strict) == (True, "lose")  # explicit arguments win
+    assert market_rules(None, "push", strict) == (False, "push")
+    with pytest.raises(ValueError, match="h2h_tie"):
+        market_rules(h2h_tie="draw")
+
+    s24 = spec(MT.TOTAL_ROUNDS, map_number=1, line=24.0)
+    assert price(s24, SELECTION_OVER, bo3).p_push == pytest.approx(0.26)
+    assert price(s24, SELECTION_OVER, bo3, betclic=strict).p_push == pytest.approx(0.46)
+    assert price(s24, SELECTION_OVER, bo3, betclic=strict, include_overtime_in_totals=True).p_push == (
+        pytest.approx(0.26)
+    )
+    h2h = spec(MT.PLAYER_KILLS_H2H, map_number=1, player_id=101, opponent_player_id=201)
+    assert price(h2h, player_selection(101), bo3).p_push > 0
+    assert price(h2h, player_selection(101), bo3, betclic=strict).p_push == 0
+    assert price_core(h2h, player_selection(101), bo3.central, fmt=bo3.format, betclic=strict).p_push == 0
+    quote = make_quote(s24, SELECTION_OVER)
+    [(priced, _)] = price_quotes(bo3, [quote], sigma_floor=FLOOR, betclic=strict)
+    assert priced.p_push == pytest.approx(0.46)
+
+    # without any argument the process settings (environment / .env) decide
+    monkeypatch.setenv("CS2BOT_BETCLIC__TOTALS_INCLUDE_OVERTIME", "false")
+    monkeypatch.setenv("CS2BOT_BETCLIC__H2H_TIE_RULE", "lose")
+    reset_settings_cache()
+    try:
+        assert market_rules() == (False, "lose")
+        assert price(s24, SELECTION_OVER, bo3).p_push == pytest.approx(0.46)
+        assert price(h2h, player_selection(101), bo3).p_push == 0
+    finally:
+        # not monkeypatch.undo(): the autouse isolation fixture shares this monkeypatch instance
+        monkeypatch.delenv("CS2BOT_BETCLIC__TOTALS_INCLUDE_OVERTIME")
+        monkeypatch.delenv("CS2BOT_BETCLIC__H2H_TIE_RULE")
+        reset_settings_cache()
+    assert market_rules() == (True, "push")
+
+
+def test_one_broken_quote_never_aborts_the_batch(
+    bo3: MatchPrediction, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    def boom(*_: object) -> pricing_module.OutcomeSplit:
+        raise KeyError("unexpected")
+
+    monkeypatch.setitem(pricing_module._HANDLERS, MT.MAP_OVERTIME, boom)
+    quotes = [
+        make_quote(spec(MT.MAP_OVERTIME, map_number=1), SELECTION_YES),
+        make_quote(spec(MT.MATCH_WINNER), SELECTION_TEAM1),
+    ]
+    with caplog.at_level(logging.WARNING, logger="cs2bot.engine.pricing"):
+        report = price_quotes_report(bo3, quotes, sigma_floor=FLOOR)
+    assert [q.spec.market_type for _, q in report.priced] == [MT.MATCH_WINNER]
+    assert len(report.skipped) == 1 and "pricing error" in report.skipped[0][1]
+    assert any("error while pricing" in r.message for r in caplog.records)
+    # bad arguments are still the caller's problem
+    with pytest.raises(ValueError, match="sigma_floor"):
+        price_quotes_report(bo3, quotes, sigma_floor=-1.0)
+    with pytest.raises(ValueError, match="h2h_tie"):
+        price_quotes_report(bo3, quotes, sigma_floor=FLOOR, h2h_tie="maybe")
 
 
 def test_half_winner(bo3: MatchPrediction) -> None:

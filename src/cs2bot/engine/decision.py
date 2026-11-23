@@ -14,9 +14,16 @@ thresholds can be overridden per market type through ``market_overrides[<MarketT
 * odds older than ``betclic.odds_max_age_s`` (or time-stamped in the future, a clock problem);
 * outside the time window: less than ``min_minutes_before_start`` or more than
   ``max_hours_before_start`` before the scheduled start (unknown start time also fails);
+* the match is no longer a plain scheduled match (live, finished, cancelled, postponed): this bot
+  is pre-match only (``MatchDecisionInfo.match_status``, when known);
 * ``p_win_given_settled < min_probability`` (the confidence check ignores refunded outcomes);
 * ``EV < min_ev`` (per-unit EV after the stake tax, see :mod:`cs2bot.engine.ev`);
-* ``sigma > max_sigma``;
+* ``sigma > max_sigma``, where the pricing sigma (an uncertainty of the *unconditional* ``p_win``)
+  is first put on the scale of the probability the confidence check uses:
+  ``sigma / (1 - p_void - p_push)``. Without this, a market that is void half of the time (map 3
+  of a BO3) would pass with twice the model uncertainty of a market that always settles;
+* probabilities that are not a valid distribution (outside [0, 1], summing above 1, negative
+  sigma, non-finite numbers) never pass;
 * data completeness below ``min_data_completeness``;
 * event link confidence below ``min_event_link_confidence`` or link status not AUTO / CONFIRMED;
 * a context veto (Claude flag or manual) on the match;
@@ -41,10 +48,10 @@ from sqlalchemy.orm import Session
 from cs2bot.config import BetclicSettings, DecisionSettings
 from cs2bot.db.models import Bet, BookmakerEvent, ContextFlagRow, Match
 from cs2bot.domain.betting import BetDecision, PricedOutcome
-from cs2bot.domain.enums import BetStatus, LinkStatus
+from cs2bot.domain.enums import BetStatus, LinkStatus, MatchStatus
 from cs2bot.domain.markets import MarketSpec, MarketType
-from cs2bot.domain.predictions import MatchPrediction
-from cs2bot.utils.time import utcnow
+from cs2bot.domain.predictions import MatchPrediction, OutcomeProbability
+from cs2bot.utils.time import ensure_utc, utcnow
 
 #: Link statuses that allow automatic betting.
 BETTABLE_LINK_STATUSES: frozenset[LinkStatus] = frozenset({LinkStatus.AUTO, LinkStatus.CONFIRMED})
@@ -52,6 +59,9 @@ BETTABLE_LINK_STATUSES: frozenset[LinkStatus] = frozenset({LinkStatus.AUTO, Link
 MAX_FUTURE_ODDS_SKEW_S = 300
 #: Bet statuses that do NOT block betting the same outcome again (no money was ever at risk).
 NON_BLOCKING_BET_STATUSES: frozenset[BetStatus] = frozenset({BetStatus.FAILED, BetStatus.CANCELLED})
+#: Match statuses a pre-match bet may be placed in (UNKNOWN = the source did not say).
+BETTABLE_MATCH_STATUSES: frozenset[MatchStatus] = frozenset({MatchStatus.SCHEDULED, MatchStatus.UNKNOWN})
+_PROB_EPS = 1e-9
 
 
 class ReasonCode(StrEnum):
@@ -70,6 +80,7 @@ class ReasonCode(StrEnum):
     DUPLICATE = "duplicate"
     PRICING_MISMATCH = "pricing_mismatch"
     INVALID_NUMBERS = "invalid_numbers"
+    MATCH_NOT_SCHEDULED = "match_not_scheduled"
 
 
 def make_reason(code: ReasonCode, detail: str) -> str:
@@ -86,6 +97,7 @@ class MatchDecisionInfo(BaseModel):
 
     match_id: int
     scheduled_at: datetime | None
+    match_status: MatchStatus | None = None  # None = not known to the caller (no status check)
     data_completeness: float | None = None  # 0..1; None = unknown (fails the check)
     link_confidence: float | None = None  # bookmaker event <-> match link confidence, 0..1
     link_status: LinkStatus = LinkStatus.UNLINKED
@@ -125,6 +137,20 @@ def bet_key(match_id: int, spec_key: str, selection_key: str) -> str:
 def is_slot_specific(spec: MarketSpec) -> bool:
     """Markets that depend on which map a slot turns out to be (they wait for the veto)."""
     return spec.is_map_scoped or spec.map_number is not None or spec.maps_scope is not None
+
+
+def settled_sigma(outcome: OutcomeProbability) -> float:
+    """The pricing sigma on the scale of ``p_win_given_settled``: ``sigma / (1 - p_void - p_push)``.
+
+    ``OutcomeProbability.sigma`` is the uncertainty of the unconditional ``p_win``; the confidence
+    check uses the probability given the bet settles, whose uncertainty is larger by the factor
+    ``1 / P(settled)`` (first order, treating the refund probability as known). Infinite when the bet
+    (almost) never settles; NaN stays NaN so the comparison fails.
+    """
+    settle_mass = 1.0 - outcome.p_void - outcome.p_push
+    if not settle_mass > 1e-12:
+        return math.inf
+    return outcome.sigma / min(1.0, settle_mass)
 
 
 def _fmt_odds(value: Decimal) -> str:
@@ -175,7 +201,11 @@ def evaluate(
                 f"{_fmt_odds(settings.max_odds)}]",
             )
         )
-    age_s = (now - quote.captured_at).total_seconds()
+    if quote.captured_at.tzinfo is None:
+        reasons.append(make_reason(ReasonCode.ODDS_STALE, "odds timestamp has no timezone"))
+        age_s = 0.0
+    else:
+        age_s = (now - quote.captured_at).total_seconds()
     if age_s > betclic.odds_max_age_s:
         reasons.append(
             make_reason(ReasonCode.ODDS_STALE, f"odds are {age_s:.0f}s old (max {betclic.odds_max_age_s}s)")
@@ -188,8 +218,17 @@ def evaluate(
         )
 
     # timing
+    if match.match_status is not None and match.match_status not in BETTABLE_MATCH_STATUSES:
+        reasons.append(
+            make_reason(
+                ReasonCode.MATCH_NOT_SCHEDULED,
+                f"match status is '{match.match_status.value}' (pre-match bets only)",
+            )
+        )
     if match.scheduled_at is None:
         reasons.append(make_reason(ReasonCode.OUTSIDE_TIME_WINDOW, "match start time is unknown"))
+    elif match.scheduled_at.tzinfo is None:
+        reasons.append(make_reason(ReasonCode.OUTSIDE_TIME_WINDOW, "match start time has no timezone"))
     else:
         to_start = match.scheduled_at - now
         min_gap = timedelta(minutes=settings.min_minutes_before_start)
@@ -222,6 +261,20 @@ def evaluate(
     broken = [name for name, value in numbers.items() if not math.isfinite(value)]
     if broken:
         reasons.append(make_reason(ReasonCode.INVALID_NUMBERS, f"non-finite {', '.join(broken)}"))
+    else:
+        probs = (outcome.p_win, outcome.p_push, outcome.p_void)
+        if (
+            any(p < -_PROB_EPS or p > 1.0 + _PROB_EPS for p in probs)
+            or sum(probs) > 1.0 + 1e-6
+            or outcome.sigma < 0
+        ):
+            reasons.append(
+                make_reason(
+                    ReasonCode.INVALID_NUMBERS,
+                    f"p_win {outcome.p_win:.4f} / p_push {outcome.p_push:.4f} / p_void "
+                    f"{outcome.p_void:.4f} / sigma {outcome.sigma:.4f} are not a valid distribution",
+                )
+            )
     th = thresholds_for(spec.market_type, settings)
     p_settled = outcome.p_win_given_settled
     if not p_settled >= th.min_probability:
@@ -233,8 +286,12 @@ def evaluate(
         )
     if not priced.ev >= th.min_ev:
         reasons.append(make_reason(ReasonCode.LOW_EV, f"EV {priced.ev:+.4f} < {th.min_ev:.4f}"))
-    if not outcome.sigma <= th.max_sigma:
-        reasons.append(make_reason(ReasonCode.HIGH_SIGMA, f"sigma {outcome.sigma:.4f} > {th.max_sigma:.4f}"))
+    sigma_settled = settled_sigma(outcome)
+    if not sigma_settled <= th.max_sigma:
+        detail = f"sigma {sigma_settled:.4f} > {th.max_sigma:.4f}"
+        if sigma_settled != outcome.sigma and math.isfinite(sigma_settled):
+            detail += f" (sigma {outcome.sigma:.4f} of the unconditional p_win, scaled to p(win | settled))"
+        reasons.append(make_reason(ReasonCode.HIGH_SIGMA, detail))
 
     # match-level data
     completeness = match.data_completeness
@@ -300,19 +357,22 @@ def evaluate_all(
 # ----------------------------------------------------------------------------------------------
 
 
-def load_already_bet_keys(session: Session, match_id: int) -> set[str]:
+def load_already_bet_keys(session: Session, match_id: int, *, include_dry_run: bool = True) -> set[str]:
     """:func:`bet_key` of every bet on the match that put (or may have put) money at risk.
 
-    Dry-run bets count too, so a dry run is not repeated every cycle; FAILED / CANCELLED bets
-    do not (nothing was placed, the outcome may be retried).
+    FAILED / CANCELLED bets do not count (nothing was placed, the outcome may be retried). Dry-run
+    bets count by default, so a dry run is not repeated every cycle; pass ``include_dry_run=False``
+    when betting for real (``executor.dry_run`` off), otherwise the simulated bets of an earlier
+    smoke test would block the real bets on the same outcomes.
     """
     rows = session.execute(
-        select(Bet.spec_key, Bet.selection_key, Bet.status).where(Bet.match_id == match_id)
+        select(Bet.spec_key, Bet.selection_key, Bet.status, Bet.dry_run).where(Bet.match_id == match_id)
     ).all()
     return {
         bet_key(match_id, spec_key, selection_key)
-        for spec_key, selection_key, status in rows
+        for spec_key, selection_key, status, dry_run in rows
         if status not in NON_BLOCKING_BET_STATUSES
+        and (include_dry_run or not (dry_run or status is BetStatus.DRY_RUN))
     }
 
 
@@ -323,25 +383,35 @@ def load_match_decision_info(
     bookmaker_event_id: int | None = None,
     prediction: MatchPrediction | None = None,
     now: datetime | None = None,
+    include_dry_run_bets: bool = True,
 ) -> MatchDecisionInfo:
     """Collect the match-level decision facts from the DB (and the prediction, when given).
 
+    * start time: the earlier of ``matches.scheduled_at`` and the linked bookmaker event's
+      ``starts_at`` (the bookmaker closes its pre-match market at its own kick-off time);
+    * match status from ``matches.status``;
     * data completeness: ``prediction.data_completeness`` if a prediction is given, else
       ``matches.data_completeness``;
     * link confidence / status from the bookmaker event (it must be linked to this match);
     * veto known: ``prediction.veto_known``, else "the match has veto rows";
-    * context veto: active, unexpired veto flags in ``context_flags`` or in the prediction.
+    * context veto: active, unexpired veto flags in ``context_flags`` or in the prediction;
+    * duplicates: :func:`load_already_bet_keys` (``include_dry_run_bets`` as described there).
     """
     now = now or utcnow()
     match = session.get(Match, match_id)
     if match is None:
         raise ValueError(f"match {match_id} does not exist")
+    if prediction is not None and prediction.match_id != match_id:
+        raise ValueError(f"the prediction is for match {prediction.match_id}, not match {match_id}")
     link_conf: float | None = None
     link_status = LinkStatus.UNLINKED
+    scheduled_at = match.scheduled_at
     if bookmaker_event_id is not None:
         event = session.get(BookmakerEvent, bookmaker_event_id)
         if event is not None and event.match_id == match_id:
             link_conf, link_status = event.link_confidence, event.link_status
+            if event.starts_at is not None and (scheduled_at is None or event.starts_at < scheduled_at):
+                scheduled_at = event.starts_at
     veto_reasons: list[str] = []
     flag_rows = session.scalars(
         select(ContextFlagRow).where(
@@ -355,18 +425,24 @@ def load_match_decision_info(
             veto_reasons.append(f"{row.flag_type.value}: {row.rationale}")
     if prediction is not None:
         for flag in prediction.context_flags:
-            if flag.veto and (flag.expires_at is None or flag.expires_at > now):
+            if flag.veto and (flag.expires_at is None or _aware(flag.expires_at) > now):
                 veto_reasons.append(f"{flag.flag_type.value}: {flag.rationale}")
     completeness = prediction.data_completeness if prediction is not None else match.data_completeness
     veto_known = prediction.veto_known if prediction is not None else bool(match.vetoes)
     return MatchDecisionInfo(
         match_id=match_id,
-        scheduled_at=match.scheduled_at,
+        scheduled_at=scheduled_at,
+        match_status=match.status,
         data_completeness=completeness,
         link_confidence=link_conf,
         link_status=link_status,
         veto_known=veto_known,
         context_veto=bool(veto_reasons),
         context_veto_reason="; ".join(dict.fromkeys(veto_reasons)) or None,
-        already_bet_keys=load_already_bet_keys(session, match_id),
+        already_bet_keys=load_already_bet_keys(session, match_id, include_dry_run=include_dry_run_bets),
     )
+
+
+def _aware(value: datetime) -> datetime:
+    """Treat a naive timestamp from an LLM-produced flag as UTC instead of failing the comparison."""
+    return ensure_utc(value)

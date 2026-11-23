@@ -132,7 +132,7 @@ missing, playing with the coach as fifth).
 - confidence (0 to 1): how sure the evidence makes you that the situation is real and applies to this \
 match. 0.9 or more for an official statement or a confirmed lineup; 0.6 to 0.8 for credible reporting \
 by an established outlet; below 0.5 for rumours, speculation or unclear timing. The code multiplies \
-your adjustment by this number, and it ignores a veto whose confidence is below 0.6.
+your adjustment by this number, and it ignores a veto whose confidence is below {veto_conf}.
 - logit_shift: your suggested adjustment to TEAM1's log-odds of winning each map. Positive values favour \
 team1, negative values favour team2 - so a problem for team1 is negative and a problem for team2 is \
 positive, whichever team the flag is about. It must stay within -{max_shift} and +{max_shift}; larger \
@@ -194,9 +194,12 @@ Keep the whole note under about 350 words. No preamble, no closing remarks, no H
 """
 
 
-def context_system_prompt(max_flag_logit_shift: float) -> str:
+def context_system_prompt(max_flag_logit_shift: float, veto_min_confidence: float = 0.6) -> str:
     """System prompt of the match-context analysis (stable for a given configuration)."""
-    return _CONTEXT_SYSTEM_TEMPLATE.format(max_shift=f"{abs(max_flag_logit_shift):.2f}")
+    return _CONTEXT_SYSTEM_TEMPLATE.format(
+        max_shift=f"{abs(max_flag_logit_shift):.2f}",
+        veto_conf=f"{veto_min_confidence:.2f}".rstrip("0").rstrip("."),
+    )
 
 
 def rationale_system_prompt(language: str = "English") -> str:
