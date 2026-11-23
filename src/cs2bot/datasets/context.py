@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import logging
+import math
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Any
@@ -155,6 +156,10 @@ def _active_flags(session: Session, match: Match, now: datetime) -> list[Context
     )
     flags: list[ContextFlag] = []
     for row in session.scalars(stmt):
+        if not all(math.isfinite(v) for v in (row.severity, row.confidence, row.logit_shift or 0.0)):
+            # a NaN / inf shift would poison every probability it is added to
+            log.debug("load_match_context: skipped context flag %s with a non-finite value", row.id)
+            continue
         try:
             flags.append(
                 ContextFlag(

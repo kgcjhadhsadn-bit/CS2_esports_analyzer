@@ -962,3 +962,30 @@ def test_default_pool_comes_from_the_active_duty_list() -> None:
         "nuke",
         "dust2",
     }
+
+
+def test_bo1_known_steps_from_a_2_3_1_veto_switch_the_order() -> None:
+    """Review round 1: a BO1 whose first two bans come from one team is a 2-3-1 veto (Valve Major
+    rules), so the remaining actors follow that order instead of the alternating default."""
+    model = VetoModel()
+    two_by_team1 = veto_steps([("ban", 1, "nuke"), ("ban", 1, "train")])
+    nxt = model.next_step(1, 2, MatchFormat.BO1, POOL7, first_veto=None, known_steps=two_by_team1)
+    assert (nxt.step, nxt.team) == (3, T2)
+    four = veto_steps([("ban", 1, "nuke"), ("ban", 1, "train"), ("ban", 2, "mirage"), ("ban", 2, "dust2")])
+    nxt = model.next_step(1, 2, MatchFormat.BO1, POOL7, first_veto=None, known_steps=four)
+    assert (nxt.step, nxt.team) == (5, T2)  # alternating would say team1
+    five = [*four, VetoStep(step=5, action=BAN, team=T2, map_name="ancient")]
+    nxt = model.next_step(1, 2, MatchFormat.BO1, POOL7, known_steps=five)
+    assert (nxt.step, nxt.team) == (6, T1)
+    seqs = model.predict_sequences(1, 2, MatchFormat.BO1, POOL7, first_veto=None, known_steps=five)
+    assert {s.maps[0] for s in seqs} == {"anubis", "inferno"}
+    assert sum(s.probability for s in seqs) == pytest.approx(1.0)
+    # steps that fit the alternating default keep it
+    alternating = veto_steps([("ban", 2, "nuke"), ("ban", 1, "train")])
+    nxt = model.next_step(1, 2, MatchFormat.BO1, POOL7, first_veto=None, known_steps=alternating)
+    assert (nxt.step, nxt.team) == (3, T2)
+    # an explicit template always wins over the detection
+    explicit = model.next_step(
+        1, 2, MatchFormat.BO1, POOL7, known_steps=two_by_team1, template=VETO_TEMPLATES[MatchFormat.BO1]
+    )
+    assert (explicit.step, explicit.team) == (3, T1)

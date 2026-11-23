@@ -90,7 +90,7 @@ from cs2bot.ingest.pandascore.mapping import (
     stage_label,
 )
 from cs2bot.ingest.pandascore.models import PSGame, PSMatch, PSPlayer
-from cs2bot.ingest.scope import refresh_match_scope
+from cs2bot.ingest.scope import refresh_match_scope, team_rank_as_of
 from cs2bot.utils.time import ensure_utc, utcnow
 
 logger = logging.getLogger(__name__)
@@ -239,7 +239,11 @@ def sync_upcoming(
             (
                 "running matches",
                 client.iter_matches(
-                    "running", {"sort": "begin_at"}, videogame_title=title, on_invalid=_invalid(run)
+                    "running",
+                    {"sort": "begin_at"},
+                    videogame_title=title,
+                    max_pages=run.options.max_pages,
+                    on_invalid=_invalid(run),
                 ),
             )
         )
@@ -437,7 +441,8 @@ def _invalid(run: _Run) -> Any:
     def handler(raw: dict[str, Any], exc: Exception) -> None:
         run.report.failed += 1
         count = exc.error_count() if isinstance(exc, ValidationError) else 1
-        run.report.add_error(f"match {raw.get('id')!r}: malformed payload ({count} validation errors)")
+        ident = str(raw.get("id"))[:40]  # untrusted: keep the message short
+        run.report.add_error(f"match {ident}: malformed payload ({count} validation errors)")
 
     return handler
 
@@ -458,6 +463,11 @@ def _consume(session: Session, run: _Run, what: str, matches: Iterable[PSMatch])
         except PandaScoreError as exc:
             run.report.failed += 1
             run.api_failure(what, exc)
+            return False
+        except Exception as exc:  # an unexpected payload problem must not escape the sync
+            logger.exception("reading PandaScore %s failed", what)
+            run.report.failed += 1
+            run.report.add_error(f"{what}: {type(exc).__name__}: {str(exc)[:200]}")
             return False
         _process_match(session, run, ps_match)
         every = run.options.commit_every
@@ -578,7 +588,10 @@ def _payload_in_scope(session: Session, run: _Run, ps: PSMatch) -> bool:
     if tier.value in {t.lower() for t in scope.pandascore_tiers}:
         return True
     ids = [team.id for team in ps.team_opponents() if team.id is not None]
-    ranks = session.scalars(select(Team.hltv_rank).where(Team.pandascore_id.in_(ids)))
+    teams = session.scalars(select(Team).where(Team.pandascore_id.in_(ids)))
+    # the rank as of the match (same rule as refresh_match_scope): today's rank must not decide
+    # whether a 2024 match of a team that only became good in 2026 is stored
+    ranks = [team_rank_as_of(session, team, ps.kickoff, now=run.now) for team in teams]
     return any(rank is not None and 0 < rank <= scope.hltv_top_n for rank in ranks)
 
 
@@ -661,14 +674,33 @@ def _replace_teams(
 
 
 def _merge_status(
-    current: MatchStatus | None, new: MatchStatus, *, created: bool, hltv_linked: bool
+    current: MatchStatus | None,
+    new: MatchStatus,
+    *,
+    created: bool,
+    hltv_linked: bool,
+    hltv_status: str | None = None,
 ) -> MatchStatus:
-    """PandaScore's status wins, except that it never re-opens a match HLTV already saw finished."""
+    """PandaScore's status wins, except that it never re-opens a match HLTV already closed.
+
+    * HLTV saw it finished: stays FINISHED.
+    * HLTV deleted it (``extra['hltv']['status'] == "deleted"``: cancelled or walkover) and the row is
+      CANCELED: stays CANCELED unless PandaScore reports it FINISHED. The HLTV sync never moves a
+      CANCELED match back to scheduled / live either, so without this rule the two sources would flip
+      the row between CANCELED and SCHEDULED on every run.
+    """
     if created or current is None:
         return new
     if new is MatchStatus.UNKNOWN:
         return current
     if hltv_linked and current is MatchStatus.FINISHED and new is not MatchStatus.FINISHED:
+        return current
+    if (
+        hltv_linked
+        and hltv_status == "deleted"
+        and current is MatchStatus.CANCELED
+        and new is not MatchStatus.FINISHED
+    ):
         return current
     return new
 
@@ -690,7 +722,13 @@ def _apply_match_fields(run: _Run, core: _Core, ps: PSMatch, tournament: Tournam
     tracker.set(
         match,
         "status",
-        _merge_status(match.status, ps_status, created=core.created, hltv_linked=hltv_linked),
+        _merge_status(
+            match.status,
+            ps_status,
+            created=core.created,
+            hltv_linked=hltv_linked,
+            hltv_status=extra_section(match, _HLTV_KEY).get("status"),
+        ),
     )
     extra: dict[str, Any] = {}
     kickoff = ps.kickoff

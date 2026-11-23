@@ -191,6 +191,13 @@ BO1_TEMPLATE_2_3_1: Final[tuple[VetoTemplateStep, ...]] = (
     VetoTemplateStep(VetoAction.LEFTOVER, None),
 )
 
+#: Other orders that are used in practice, tried (when no ``template=`` is given) if the published
+#: known steps contradict the default template but fit one of these - e.g. a BO1 whose first two
+#: bans were both made by the same team is a 2-3-1 veto, so its remaining actors follow that order.
+_ALTERNATIVE_TEMPLATES: Final[dict[tuple[MatchFormat, int], tuple[tuple[VetoTemplateStep, ...], ...]]] = {
+    (MatchFormat.BO1, 7): (BO1_TEMPLATE_2_3_1,),
+}
+
 
 # ------------------------------------------------------------------------------------------- config
 
@@ -769,6 +776,43 @@ class VetoModel:
             rest.append((VetoAction.LEFTOVER, None))
         return prefix + rest
 
+    @staticmethod
+    def _fits_template(
+        base: Sequence[VetoTemplateStep], known: Mapping[int, tuple[VetoAction, TeamSlot | None, str]]
+    ) -> bool:
+        """Whether the known steps' actions and named teams agree with ``base`` for one veto order."""
+        first: TeamSlot | None = None
+        for i in sorted(known):
+            action, team, _ = known[i]
+            if i >= len(base) or base[i].action is not action:
+                return False
+            if team is None or action is VetoAction.LEFTOVER or base[i].actor is None:
+                continue
+            implied = team if base[i].actor == 0 else team.other
+            if first is not None and implied is not first:
+                return False
+            first = implied
+        return True
+
+    @classmethod
+    def _effective_template(
+        cls,
+        fmt: MatchFormat,
+        n_pool: int,
+        known: Mapping[int, tuple[VetoAction, TeamSlot | None, str]],
+        template: Sequence[VetoTemplateStep] | None,
+    ) -> list[VetoTemplateStep]:
+        """``template`` if given; else the default order, or a known alternative the steps fit better."""
+        if template is not None:
+            return list(template)
+        default = list(veto_template(fmt, n_pool))
+        if not known or cls._fits_template(default, known):
+            return default
+        for alternative in _ALTERNATIVE_TEMPLATES.get((fmt, n_pool), ()):
+            if cls._fits_template(alternative, known):
+                return list(alternative)
+        return default
+
     def _infer_first(
         self,
         fmt: MatchFormat,
@@ -860,6 +904,7 @@ class VetoModel:
         dict[int, tuple[VetoAction, TeamSlot | None, str]],
         list[tuple[float, TeamSlot]],
         datetime | None,
+        list[VetoTemplateStep],
     ]:
         if team1_id == team2_id:
             raise ValueError("team1 and team2 must differ")
@@ -872,10 +917,11 @@ class VetoModel:
                 pool.append(m)
         if len(pool) < fmt.n_maps:
             raise ValueError(f"a {fmt.value} needs at least {fmt.n_maps} maps in the pool, got {len(pool)}")
-        inferred = self._infer_first(fmt, len(pool), known, template)
+        base = self._effective_template(fmt, len(pool), known, template)
+        inferred = self._infer_first(fmt, len(pool), known, base)
         first = inferred or first_veto
         orders = [(1.0, first)] if first is not None else [(0.5, TeamSlot.TEAM1), (0.5, TeamSlot.TEAM2)]
-        return pool, known, orders, t_pref
+        return pool, known, orders, t_pref, base
 
     def predict_sequences(
         self,
@@ -907,8 +953,10 @@ class VetoModel:
         * ``preserve_marginals`` (default): the truncation keeps the per-slot map marginals
           ``P(slot k is map m)`` of the full distribution exact - the most likely sequences are
           kept and the probability of the truncated tail is re-assigned to the few sequences that
-          reproduce its marginals (:mod:`cs2bot.models.veto_truncation`). This needs ``top_k`` >=
-          19 (BO3) / 31 (BO5) on a 7-map pool; below that, or with ``preserve_marginals=False``,
+          reproduce its marginals (:mod:`cs2bot.models.veto_truncation`); the per-map and per-slot
+          picker marginals are kept exact as well when ``top_k`` allows it (>= 26 / 38 with an
+          unknown first veto). This needs ``top_k`` >= 19 (BO3) / 31 (BO5) on a 7-map pool; below
+          that, or with ``preserve_marginals=False``,
           the ``top_k`` most likely sequences are simply rescaled (which can move a map's
           probability of being played by 0.2-0.5 when the list is much shorter than the
           distribution).
@@ -916,11 +964,13 @@ class VetoModel:
           ``None`` = as of the last fitted veto.
         * ``map_advantage``: optional ``(team, opponent, map, as_of) -> logit`` callable (e.g.
           ``MapRatingModel.map_advantage``); called with ``as_of`` (or now when ``as_of`` is None).
-        * ``template``: custom veto order for unusual tournament formats.
+        * ``template``: custom veto order for unusual tournament formats. Without it the default
+          order is used unless the known steps contradict it but fit a known alternative (a BO1
+          whose first two bans come from the same team follows :data:`BO1_TEMPLATE_2_3_1`).
         """
         if top_k is not None and top_k < 1:
             raise ValueError("top_k must be at least 1")
-        pool, known, orders, t_pref = self._prepare(
+        pool, known, orders, t_pref, base = self._prepare(
             team1_id, team2_id, fmt, map_pool, first_veto, known_steps, as_of, template
         )
         done = self._complete_sequence(fmt, pool, known)
@@ -930,7 +980,7 @@ class VetoModel:
         expu = self._exp_utilities(team1_id, team2_id, pool, t_pref, map_advantage, t_adv)
         totals: dict[_PlayedKey, float] = defaultdict(float)
         for weight, first in orders:
-            plan = self._plan(fmt, len(pool), first, known, template)
+            plan = self._plan(fmt, len(pool), first, known, base)
             for (_, played), p in self._run(plan, pool, expu, known, fmt).items():
                 totals[played] += weight * p
         mass = sum(totals.values())
@@ -960,7 +1010,7 @@ class VetoModel:
         Maps that ``known_steps`` assign to a later step are excluded. Raises ``ValueError`` when
         the veto is already complete.
         """
-        pool, known, orders, t_pref = self._prepare(
+        pool, known, orders, t_pref, base = self._prepare(
             team1_id, team2_id, fmt, map_pool, first_veto, known_steps, as_of, template
         )
         t_adv = ensure_utc(as_of) if as_of is not None else utcnow()
@@ -970,7 +1020,7 @@ class VetoModel:
         action_seen: VetoAction | None = None
         step_idx: int | None = None
         for weight, first in orders:
-            plan = self._plan(fmt, len(pool), first, known, template)
+            plan = self._plan(fmt, len(pool), first, known, base)
             idx = next((i for i in range(len(plan)) if i not in known), None)
             if idx is None:
                 continue

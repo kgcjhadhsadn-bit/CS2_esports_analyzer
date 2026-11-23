@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import importlib
 import logging
 from datetime import date
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from cs2bot.config import Settings
 from cs2bot.db.models import Team
 from cs2bot.db.repo import resolve_team
 from cs2bot.ingest.hltv.models import SyncReport
@@ -33,12 +35,15 @@ def sync_rankings(
     ranking_date: date | None = None,
     *,
     options: HLTVSyncOptions | None = None,
+    settings: Settings | None = None,
 ) -> SyncReport:
     """Upsert one weekly HLTV ranking (the latest when ``ranking_date`` is None).
 
     ``Team.hltv_rank`` / ``hltv_rank_updated_at`` only move forward in time. After syncing the *latest*
     full ranking, teams that dropped out of it lose their ``hltv_rank`` (otherwise a team that fell
-    out of the top N would stay in scope forever).
+    out of the top N would stay in scope forever). When ``settings`` is given, the scope of every
+    not-yet-finished match is re-evaluated afterwards (``cs2bot.ingest.scope.refresh_upcoming_scope``),
+    so a team entering the top N pulls its upcoming matches into scope.
     """
     opts = options or HLTVSyncOptions()
     report = SyncReport(job="hltv.sync_rankings")
@@ -84,4 +89,24 @@ def sync_rankings(
         report.add_error(f"ranking: persisting failed: {type(exc).__name__}: {exc}")
         return report
     report.details.update({"ranked_on": ranked_on.isoformat(), "teams": len(rows)})
+    if settings is not None and ranking_date is None:
+        _refresh_upcoming_scope(session, settings, report)
     return report
+
+
+def _refresh_upcoming_scope(session: Session, settings: Settings, report: SyncReport) -> None:
+    try:
+        module = importlib.import_module("cs2bot.ingest.scope")
+    except ImportError:
+        return
+    refresh = getattr(module, "refresh_upcoming_scope", None)
+    if not callable(refresh):
+        return
+    try:
+        with session.begin_nested():
+            changed = refresh(session, settings)
+    except Exception as exc:  # scope refresh is a convenience; the ranking itself is stored
+        logger.exception("refreshing match scope after the HLTV ranking failed")
+        report.add_warning(f"scope refresh failed: {type(exc).__name__}: {exc}")
+        return
+    report.details["scope_changed"] = int(changed) if isinstance(changed, int) else 0

@@ -210,7 +210,7 @@ def test_schema_enums_match_the_domain() -> None:
 def test_triage_item_cleans_its_values() -> None:
     item = TriageItem(
         news_id=1,
-        label="bootcamp",  # type: ignore[arg-type]
+        label="bootcamp",
         relevance=float("nan"),
         team_names=["  FaZe  Clan ", "faze clan", ""],
         team_ids=[3, 1, 3],

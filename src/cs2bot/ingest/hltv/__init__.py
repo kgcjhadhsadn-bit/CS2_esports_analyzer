@@ -23,7 +23,9 @@ from cs2bot.ingest.hltv.fetcher import (
     HttpPageLoader,
     LoadedPage,
     detect_challenge,
+    hltv_url,
 )
+from cs2bot.ingest.hltv.manual_check import ManualCheckResult, open_browser_for_manual_check
 from cs2bot.ingest.hltv.models import (
     DemoLink,
     EventRef,
@@ -97,6 +99,7 @@ __all__ = [
     "HttpPageLoader",
     "LineupPlayerRow",
     "LoadedPage",
+    "ManualCheckResult",
     "MapResult",
     "MapState",
     "MapStatsPage",
@@ -116,10 +119,12 @@ __all__ = [
     "VetoEntry",
     "detect_challenge",
     "hltv_round_records",
+    "hltv_url",
     "mapstats_path",
     "match_path",
     "matches_path",
     "news_archive_path",
+    "open_browser_for_manual_check",
     "parse_mapstats_page",
     "parse_match_page",
     "parse_matches_page",

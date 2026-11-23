@@ -135,7 +135,8 @@ def load_map_results(
     """Finished maps with a decided score, chronological.
 
     * ``picked_by``: ``maps_played.picked_by_team_id`` mapped to TEAM1/TEAM2; ``None`` for the decider
-      and when the pick is unknown (the record type cannot tell these apart).
+      (``is_decider`` wins over a contradicting picker) and when the pick is unknown (the record type
+      cannot tell these apart).
     * Lineups: ``match_lineups`` of the match (sorted player ids). When a match has no lineup rows for
       a team, the players with a stat line on that map are used instead; otherwise the tuple is empty.
     * ``is_lan`` / ``tier``: the match's value, falling back to the tournament's.
@@ -158,6 +159,7 @@ def load_map_results(
             MapPlayed.team2_t_rounds,
             MapPlayed.overtime_rounds,
             MapPlayed.picked_by_team_id,
+            MapPlayed.is_decider,
             ts.label("played_at"),
             Match.team1_id,
             Match.team2_id,
@@ -202,7 +204,7 @@ def load_map_results(
         total = r.team1_rounds + r.team2_rounds
         overtime = r.overtime_rounds or max(0, total - REGULATION_ROUNDS)
         picked: TeamSlot | None = None
-        if r.picked_by_team_id is not None:
+        if r.picked_by_team_id is not None and not r.is_decider:  # a decider has no picker
             if r.picked_by_team_id == r.team1_id:
                 picked = TeamSlot.TEAM1
             elif r.picked_by_team_id == r.team2_id:

@@ -2,7 +2,7 @@
 
 > Written by the engineer who implemented the package. Reviewers update it when the public API changes.
 
-**Tests:** `.venv/bin/python -m pytest tests/models/sim -q` - 70 passed, 0 failed (lint/type clean: True)
+**Tests:** `.venv/bin/python -m pytest tests/models/sim -q` - 104 passed, 0 failed, about 25 s with `-n 2` (lint/type clean: True; updated in review round 1)
 
 ## Summary
 
@@ -60,9 +60,10 @@ build_match_prediction(*, match_id: int, fmt: MatchFormat, team1_id: int, team2_
     as_of: datetime | None = None,             # data cut-off for player props (default created_at, default now)
     scenario_n_sims: int | None = None,        # sims for low/high (default max(2000, n_sims // 2))
     policy: BuyPolicy | None = None, flow: RoundFlowParams | None = None,
-    race_targets: tuple[int, ...] = (3, 5, 7, 10, 13), tol: float = 0.003,
-    top_fragger_samples: int | None = None,    # joint series sims (default n_sims)
-    simulator: MapSimulator | None = None,     # default: shared cached DEFAULT_SIMULATOR (not thread-safe)
+    race_targets: tuple[int, ...] = DEFAULT_RACE_TARGETS,  # 1..16 (review round 1)
+    tol: float = 0.003,
+    top_fragger_samples: int | None = None,    # joint series sims (default n_sims; >= 100)
+    simulator: MapSimulator | None = None,     # default: shared cached DEFAULT_SIMULATOR (thread-safe)
 ) -> MatchPrediction
 ```
 
@@ -73,7 +74,7 @@ What it expects:
 - `start_sides`: missing or `None` means a 50/50 mixture of starting sides.
 - `created_at` / `as_of` must be timezone-aware.
 
-It raises `ValueError` on a missing map estimate, a sequence shorter than the format needs, a repeated map in a sequence, no positive probability, naive datetimes, `n_sims < 200`, or duplicate players.
+It raises `ValueError` on a missing map estimate, a map estimate with a non-finite p or sigma (or p outside [0, 1], sigma < 0), a non-finite `logit_shift`, `top_fragger_samples < 100`, a sequence shorter than the format needs, a repeated map in a sequence, no positive probability, naive datetimes, `n_sims < 200`, or duplicate players.
 
 Output conventions (all `PredictionCore`s: central, low, high):
 - `sigma_team1_win = |high.p_team1_win - low.p_team1_win| / 2`.
@@ -84,13 +85,20 @@ Output conventions (all `PredictionCore`s: central, low, high):
   - `score_pmf` includes overtime scores, so handicaps, totals, odd/even and team totals can all be derived from it.
   - `p_team1_pistol` keys are `"1"` and `"13"`.
   - `p_team1_half` / `p_half_draw`: half `"1"` = rounds 1-12; half `"2"` = rounds 13-24 actually played (overtime excluded).
-  - `p_team1_race_to` contains only N ≤ 13, which is always decided, so P(team2) = 1 − p. For N > 13 use `MapSimOutput.p_neither_race_to`.
+  - `p_team1_race_to` / `p_neither_race_to` contain every simulated N (1..16 by default). N ≤ 13 is always decided (`p_neither = 0`); for N > 13 the market is void with `p_neither_race_to[N]` and P(team2 first) = 1 − p_team1 − p_neither. (Review round 1: N > 13 is now published.)
 - `player_kills_by_scope` keys:
   - `"map:k"`: conditional on slot k being played (same objects as `slots[k].players`, keyed by `str(player_id)`).
-  - `"maps:1,2"` for BO2/BO3/BO5, and `"maps:1,2,3"` for BO5: maps always played.
+  - `"maps:1,2"`, `"maps:1,2,3"`, ... every prefix of the series up to all its maps (BO3: `1,2` and `1,2,3`; BO5: `1,2` .. `1,2,3,4,5`). Each is conditional on its LAST listed map being played (e.g. BO3 `"maps:1,2,3"` = kills on maps 1-3 given 1-1 after two maps; the earlier maps enter with winner-conditional pmfs). Prefixes up to the format's minimum are always played. A prefix whose last map can (practically) never be played is omitted. (Review round 1: prefixes beyond the minimum were added.)
   - `"match"`: sum over the maps actually played.
 - `top_fragger` uses the same scope keys plus team-restricted versions `"<scope>|team1"` and `"<scope>|team2"`. Every dict sums to 1 (ties split evenly).
 - `components` holds: `seed`, `n_sims`, `scenario_map_p`, `map_strength_d` (per scenario and map), `sigma_logit`, `start_sides`, `veto`, `cache`, `timing_s`, `round_model` (fingerprint), `map_diagnostics`, `player_props`, `warnings`. Everything is JSON-serialisable.
+
+Integration helpers (review round 1, adopt the foundation additions):
+- `engine_options(model_settings: ModelSettings, *, match_id: int | None = None) -> dict[str, Any]`: `n_sims`, `scenario_n_sims`, `top_fragger_samples`, `economy` (with `ot_start_money`) and `seed` (`stable_seed(random_seed, match_id)`, or None when `random_seed` is None) for `build_match_prediction(**...)`.
+- `economy_from_settings(model_settings: ModelSettings, base: EconomyParams | None = None) -> EconomyParams`.
+- `players_from_context(context: MatchContext) -> list[PlayerInput]`: lineups with team slot, nickname and `LineupPlayer.role`; a player listed twice is kept once (first lineup wins).
+- `context_kwargs(context: MatchContext) -> dict[str, Any]`: `match_id`, `fmt`, `team1_id`, `team2_id`, `start_sides` (`MatchContext.start_sides`), `players`, `context_flags`.
+- Typical call: `build_match_prediction(**context_kwargs(ctx), **engine_options(settings.models, match_id=ctx.match_id), veto_distribution=..., map_estimates=..., round_model=..., kill_model=..., model_version=..., data_completeness=..., veto_known=..., logit_shift=...)`. Fit the models with `RoundModel.fit(..., half_life_days=settings.models.round_model_half_life_days)` and `PlayerKillModel.fit(..., half_life_days=settings.models.kill_model_half_life_days)`.
 
 `scenario_probabilities(estimate: MapWinEstimate, logit_shift: float = 0.0, max_sigma_logit: float = 2.5) -> tuple[central, low, high, sigma_logit]`, with `sigma_logit = sigma / (p (1 - p))` taken at the estimate's own p and capped at 2.5.
 
@@ -113,13 +121,14 @@ Output conventions (all `PredictionCore`s: central, low, high):
 
 ## `cs2bot.models.map_sim`
 
-- `MapSimInput(map_name: str, strength_diff: float = 0.0, team1_start_side: Side | None = None, economy: EconomyParams = DEFAULT_ECONOMY, round_model: RoundModel = RoundModel.default(), policy: BuyPolicy = DEFAULT_BUY_POLICY, flow: RoundFlowParams = DEFAULT_ROUND_FLOW, race_targets: tuple[int, ...] = (3, 5, 7, 10, 13))`
+- `MapSimInput(map_name: str, strength_diff: float = 0.0, team1_start_side: Side | None = None, economy: EconomyParams = DEFAULT_ECONOMY, round_model: RoundModel = RoundModel.default(), policy: BuyPolicy = DEFAULT_BUY_POLICY, flow: RoundFlowParams = DEFAULT_ROUND_FLOW, race_targets: tuple[int, ...] = DEFAULT_RACE_TARGETS)` with `DEFAULT_RACE_TARGETS = tuple(range(1, 17))`
   - Frozen; `.with_strength(d) -> MapSimInput`.
 - `MapSimulator(*, cache_size: int = 64, calibration_cache_size: int = 4096)`:
   - `.simulate(inp, n_sims: int = 20000, rng: np.random.Generator | int | None = None, *, record_rounds: bool = False) -> MapSimOutput`. An int seed makes the call cacheable.
   - `.calibrate_strength(target_p: float, inp, *, n_sims: int = 20000, rng_seed: int = 0, tol: float = 0.003, max_iter: int = 40) -> float`. Pure, memoised; targets clipped to [0.001, 0.999]; d bounded to [-8, 8].
   - `.calibrate_and_simulate(...same...) -> tuple[float, MapSimOutput]`.
-  - `.stats: dict`, `.clear_caches()`.
+  - `.stats: dict`, `.stats_snapshot() -> dict` (consistent copy), `.clear_caches()`.
+  - Thread-safe (review round 1): cache/statistics updates are locked; simulations run outside the lock. Picklable (the lock is recreated).
 - Module-level: `calibrate_strength(target_p, inp, *, n_sims=20000, rng_seed=0, tol=0.003) -> float`, `simulate_map(inp, n_sims=20000, rng=None)`, `DEFAULT_SIMULATOR`, `iid_map_win_prob(p_round, economy=DEFAULT_ECONOMY) -> float`, `iid_round_prob_for_map(target_p, economy=DEFAULT_ECONOMY) -> float`.
 - `MapSimOutput` (frozen):
   - Identity: `map_name`, `strength_diff`, `team1_start_side`, `n_sims`, `rounds_per_half`, `race_targets`.
@@ -137,7 +146,10 @@ Output conventions (all `PredictionCore`s: central, low, high):
   - `.lineup_rates(players: Sequence[PlayerInput], *, map_name, team1_id, team2_id, as_of, normalise: bool | None = None) -> dict[int, PlayerRate]`.
   - `.team_scales(players, *, team1_id, team2_id, as_of) -> tuple[float, float]`.
   - `.top_fragger_probs(players, map_name, team1_id, team2_id, team1_rounds, team2_rounds, *, as_of, rng=None, weights=None, n_samples=None, normalise=None) -> dict[str, float]`.
-  - `.summary(as_of) -> dict`, `.n_records`, `.knows_player(id)`.
+  - `.score_params(as_of: datetime) -> tuple[float, float]` **(review round 1)**: `(score_skew gamma, hist_margin_var)` estimated from records carrying `team_rounds_won` / `opponent_rounds_won` (strictly before `as_of`), shrunk toward `config.score_skew`; config defaults without such records. `project`, `top_fragger_probs` and the match engine use it.
+  - `.summary(as_of) -> dict` (now also `score_skew`, `hist_margin_var`, `n_skew_records`), `.n_records`, `.knows_player(id)`, `.fit_stats -> {"n_records", "n_skipped"}`.
+  - `fit` skips malformed stat lines (rounds ≤ 0, negative kills/deaths, > 5 kills per round, more deaths than rounds) instead of failing; inconsistent scorelines (negative, or summing to fewer than `rounds_played`) only make the scoreline unknown.
+  - Thread-safe as-of cache; picklable.
   - Persistence: `.save(path) -> Path` (`.npz`, no pickle), `PlayerKillModel.load(path)`.
 - Functions:
   - `top_fragger_probs(kills: ArrayLike[n_samples, n_players], player_ids: Sequence[int], *, row_mask=None, row_weights=None) -> dict[str, float]` (ties split evenly).
@@ -146,7 +158,7 @@ Output conventions (all `PredictionCore`s: central, low, high):
   - `sample_kills(rate, own_rounds, opp_rounds, rng, *, margin_center=0.0, score_skew=0.0, hist_margin_var=0.12)`.
   - `effective_size(size, cv2, score_skew=0.0, hist_margin_var=0.0)`.
 - Data classes:
-  - `KillModelConfig` (frozen): `score_skew=0.3`, `normalise_teams=True`, `unknown_player_cv_mult=1.5`, `default_kpr=0.68`, shrinkage pseudo-counts, and more.
+  - `KillModelConfig` (frozen): `score_skew=0.3` (prior/default), `hist_margin_var=0.12` (default), `estimate_score_skew=True`, `score_skew_prior_sd=0.15`, `score_skew_bounds=(0.0, 1.0)`, `min_records_for_skew=200`, `normalise_teams=True`, `unknown_player_cv_mult=1.5`, `default_kpr=0.68`, shrinkage pseudo-counts, and more.
   - `PlayerRate` (frozen): `kpr`, `base_kpr`, `cv2`, `size`, `dpr`, `known`, `role`, `map_factor`, `opp_factor`, `team_scale`; `.scaled(f)`.
 
 ## `cs2bot.models.economy`
@@ -160,6 +172,7 @@ Output conventions (all `PredictionCore`s: central, low, high):
 
 - `series_outcome(fmt: MatchFormat, p_maps: Sequence[float]) -> SeriesResult`, with `p_played: tuple[float, ...]`, `final: dict[(team1 maps, team2 maps), p]`, `.p_team1_win`, `.p_draw`, `.score_pmf()`.
 - `series_sum_pmf(fmt, p_maps, pmf_if_team1_wins, pmf_if_team2_wins) -> NDArray`.
+- `series_prefix_sum_pmf(fmt, p_maps, pmf_if_team1_wins, pmf_if_team2_wins, upto: int) -> tuple[float, NDArray]` **(review round 1)**: P(map `upto` is played) and the pmf of X_1 + ... + X_upto given that it is played.
 - `played_mask(fmt, team1_won[n_maps, n]) -> NDArray[bool]`.
 
 `cs2bot.models.sim_stats` holds internal numerical helpers (NB pmf matrix, pmf utilities, `stable_seed`).
@@ -170,23 +183,49 @@ Output conventions (all `PredictionCore`s: central, low, high):
 - The economy is team-level: money is the average per player, with no individual drops or AWP economy, and the $16k cap is applied to the average. Survivors' equipment is approximated.
 - With default settings and equal teams the simulator gives about 22.3 rounds per map and about 14% overtime. That is somewhat more decisive than the synthetic generator (about 23.4 rounds, 18% overtime), because of the CS2 economy's momentum. Map-win probabilities still match the synthetic ground truth closely. Real-data calibration of the behaviour settings is recommended.
 - When the starting side is unknown, the engine uses an exact 50/50 mixture. It does not infer who chooses the side (the non-picking team, or 'Team B' on the decider under Valve rules); pass start_sides once they are known. This matters most for pistol and half markets.
-- The kills-score skew (gamma = 0.3) and the historical margin variance (0.12) are fixed, documented defaults. PlayerMapRecord carries no team rounds won, so they cannot be estimated in fit().
+- The kills-score skew and the historical margin variance are estimated from `team_rounds_won` / `opponent_rounds_won` when at least 200 records carry them (review round 1); otherwise the documented defaults (0.3 / 0.12) are used.
 - Multi-map player-kill scopes assume maps are independent given the scenario, and treat the player's rate uncertainty as independent per map. This slightly understates the variance of multi-map totals for unknown players.
-- Race-to-N for N > 13 (reachable only in overtime) is computed in MapSimOutput (with p_neither_race_to) but is not published in MapSlotPrediction, because the domain model has no 'neither' field.
 - Map-level draws (Premier's single-overtime limit) are not supported: professional rules (unlimited overtime) are assumed. Overtime beyond 3 periods (about 0.4% of maps) is simulated as full buy against full buy.
 - Low/high scenarios use max(2000, n_sims // 2) simulations by default (configurable via scenario_n_sims). They share common random numbers with each other but not with the central run.
-- DEFAULT_SIMULATOR is a process-global cache (about 0.5 MB per cached 20k-sim output, 64 outputs by default) and is not thread-safe. Pass simulator=MapSimulator() per thread.
+- DEFAULT_SIMULATOR is a process-global cache (about 0.8 MB per cached 20k-sim output with 16 race targets, 64 outputs by default, i.e. up to ~50 MB). It is thread-safe since review round 1.
 - Team normalisation needs at least 4 known lineup players per side. Unknown players' death rate defaults to the global mean.
 - Overtime start money defaults to $10,000 (the Premier/Major setting). Events that use $12,500 need EconomyParams(ot_start_money=12500).
 
 ## Foundation change requests
 
-- domain.predictions.MapSlotPrediction: add `p_neither_race_to: dict[str, float] = {}` (or `p_team2_race_to`) so race-to-N markets with N > 13 can be priced. The engine currently publishes only N ≤ 13, which is always decided.
-- domain.match.LineupPlayer: add `role: PlayerRole | None = None`, so integration (P12) can build the engine's PlayerInput list (player_id, team slot, nickname, role) straight from MatchContext lineups. Alternatively, move PlayerInput into the domain.
-- domain.match.MatchContext: add `start_sides: dict[str, Side | None]` (team1's starting side per map once the veto or side choice is announced), so services can pass start_sides to build_match_prediction. This matters for pistol and half markets.
-- config.ModelSettings: add optional knobs currently passed as function arguments with documented defaults: `scenario_n_simulations` (default n//2), `ot_start_money` (10000; organiser-specific 12500), `round_model_half_life_days` (365), `kill_model_half_life_days` (120), `top_fragger_samples`.
-- domain.records.PlayerMapRecord: add `team_rounds_won` and `opponent_rounds_won` (or have datasets supply the joined MapResultRecord). PlayerKillModel could then estimate the kills-score skew and remove score-explained dispersion from data instead of using fixed defaults.
+- All requests of the first build wave were applied by the foundation and adopted in review round 1 (`MapSlotPrediction.p_neither_race_to`, `LineupPlayer.role`, `MatchContext.start_sides`, the `ModelSettings` knobs, `PlayerMapRecord.team_rounds_won` / `opponent_rounds_won`).
+- config.ModelSettings: the comment on `scenario_n_simulations` says "None = n_map_simulations // 2"; the engine's None default is `max(2000, n_sims // 2)` (identical for n_sims >= 4000). Worth aligning the comment.
 
 ## New dependency requests
 
 - (none)
+
+## Review round 1
+
+Reviewer: independent review of the sim package against docs/dev/briefs/sim.md (including the Addendum).
+
+**What I verified (re-derived, not trusted):**
+- CS2 rules in economy.py: MR12 (first to 13, swap after 12), MR3 overtime (4-x wins a period, 3-3 repeats), sides kept into each OT period and swapped at the OT half, loss-bonus ladder 1400..3400 with the starting loss count and step-down on win, $600 plant bonus, $50 CT kill bonus, no loss bonus for surviving Ts at time expiry. The $10,000 overtime money is the `mp_overtime_startmoney` default (re-checked with community convar references; configurable via `ModelSettings.ot_start_money`).
+- map_sim: round outcome logit (CT bias sign, pistol adjustment), side arrays per half and in overtime, half / pistol / race bookkeeping (race to N decided after 2N−1 rounds; the late-target fix for maps that end earlier; OT snapshot indexing), half-2 = regulation rounds 13-24 actually played, common random numbers in OT, calibration root finding and the exact reweighting.
+- round_model: penalised logistic likelihood and gradient, priors, antisymmetric buy table, as_of filtering.
+- player_props: quasi-Poisson effective sample factor, Gamma posterior mean/variance, method-of-moments tau² and NB size, the score-skew centring (marginal mean = kpr × E[rounds]), no look-ahead (cut-off rounded down).
+- match_engine/sim_series: series DP vs brute force for every format, slot p_played and conditional map distributions, winner-conditional kills in the match scope, scope conditioning conventions vs `engine.pricing`.
+
+**Issues found:**
+1. (major, fixed) Addendum not implemented: race-to-N for N > 13 was not published, so e.g. "first to 16 rounds" was unpriceable. Slots now publish `p_team1_race_to` and `p_neither_race_to` for every simulated N, and the default targets are 1..16 (previously 3, 5, 7, 10, 13, so "first to 4/6/8/9/11/12" were unpriceable too).
+2. (major, fixed) Addendum not implemented: `PlayerMapRecord.team_rounds_won` / `opponent_rounds_won` were ignored. The kill model now estimates the kills-score skew gamma and the historical margin variance per as_of (WLS with an HC0 variance, shrunk toward the 0.3 prior). On the synthetic universe it recovers gamma ≈ 0.48 (generator truth ≈ 0.5); on simulated data with known gamma it hits within 0.06.
+3. (major, fixed) Addendum not implemented: `ModelSettings` knobs, `LineupPlayer.role` and `MatchContext.start_sides` were not adopted. Added `engine_options`, `economy_from_settings`, `players_from_context` and `context_kwargs`.
+4. (major, fixed) Addendum not implemented: no pricing contract test. Added tests/models/sim/test_sim_pricing_contract.py: BO1 (known/unknown veto), BO2, BO3 (known/unknown) and BO5 predictions with full lineups. Every MarketType is priced through `price_outcome`. The tests check that nothing is unpriceable, that complementary selections sum to 1 − push − void with an identical void mass, that low ≤ central ≤ high for team1-favouring outcomes (strict for match/map winner), and that sigma > 0. Regulation-only totals and void masses of conditional scopes are covered too.
+5. (major, fixed) Multi-map player scopes beyond the format's minimum (BO3 "maps 1-3", BO5 "maps 1-4" / "1-5") were missing, so those kill and top-fragger markets were unpriceable. They are now produced exactly (`series_prefix_sum_pmf`), conditional on the last map being played, as pricing expects.
+6. (major, fixed) Non-finite map estimates (NaN p or sigma), p outside [0, 1], negative sigma and a non-finite logit_shift went straight into calibration and gave garbage probabilities. They now raise ValueError (safer than pricing on them).
+7. (minor, fixed) `PlayerKillModel.fit` aborted or silently used implausible stat lines. Malformed records (negative kills/deaths, rounds ≤ 0, > 5 kills per round, more deaths than rounds) are now skipped and counted in `fit_stats`.
+8. (minor, fixed) The shared `DEFAULT_SIMULATOR` and the kill model's as-of cache were not thread-safe: concurrent OrderedDict mutation could raise. Both are now guarded by locks and stay picklable (the lock is recreated on unpickle).
+9. (minor, fixed) `top_fragger_samples=0` fell back to n_sims silently, and negative values crashed deep inside numpy. Now `< 100` raises ValueError.
+
+**Tests added:** pricing contract (15 cases), `series_prefix_sum_pmf` vs enumeration for every format, race-to publishing and void mass, BO5 prefix scopes and conditional top fragger, invalid estimates, settings/context helpers end to end, a thread-safety check of the shared simulator, skew estimation (simulated truth, synthetic universe, fallbacks, no look-ahead), malformed records, save/load with scorelines and reading pre-review `.npz` files, kill-model pickling and thread safety.
+
+**Remaining concerns (not fixed):**
+- Low/high use different random numbers from the central run (and n_sims // 2 simulations). In the pricing sigma, the curvature term then picks up Monte Carlo noise of roughly 0.003-0.012 on strength-insensitive outcomes (half draw, odd/even). That is well below `max_sigma` = 0.05 and errs on the conservative side, but sharing the central run's random stream would remove it.
+- A BO5 prediction with 30 veto sequences and 10 players serialises to about 1.4 MB of JSON (1-16 race keys, many kill pmfs and scopes). Integration should keep that in mind when storing `match_analyses` payloads.
+- Behaviour parameters (BuyPolicy, RoundFlowParams) are still heuristics (see Known limitations). The round model only fits side/buy effects; real-data calibration is pending demo data.
+- Unknown starting sides are still an exact 50/50 mixture. Who chooses the side (the non-picking team) is not modelled.

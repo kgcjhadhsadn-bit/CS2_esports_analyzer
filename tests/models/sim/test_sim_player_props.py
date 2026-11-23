@@ -279,3 +279,119 @@ def test_empty_fit_uses_defaults() -> None:
     assert not r.known and r.base_kpr == pytest.approx(0.58)
     with pytest.raises(ValueError):
         PlayerKillModel().fit([], half_life_days=0)
+
+
+# ------------------------------------------------------------------------------------------- review round 1
+
+
+def _skew_records(
+    gamma: float, *, n_maps: int, seed: int = 0, with_scores: bool = True
+) -> list[PlayerMapRecord]:
+    """Ten players, kills ~ Poisson(kpr * (R + gamma * D)) with random scorelines (D = own - opp)."""
+    rng = np.random.default_rng(seed)
+    out = []
+    for j in range(n_maps):
+        loser = int(rng.integers(0, 12))
+        team1_won = bool(rng.random() < 0.5)
+        own1, own2 = (13, loser) if team1_won else (loser, 13)
+        for pid in range(10):
+            team = 1 if pid < 5 else 2
+            own, opp = (own1, own2) if team == 1 else (own2, own1)
+            r = own + opp
+            mu = 0.68 * (r + gamma * (own - opp))
+            out.append(
+                PlayerMapRecord(
+                    match_id=j,
+                    map_number=1,
+                    map_name="mirage",
+                    played_at=T0 + timedelta(hours=j),
+                    player_id=pid,
+                    team_id=team,
+                    opponent_team_id=3 - team,
+                    kills=int(rng.poisson(mu)),
+                    deaths=int(min(r, rng.poisson(0.68 * r))),
+                    rounds_played=r,
+                    team_rounds_won=own if with_scores else None,
+                    opponent_rounds_won=opp if with_scores else None,
+                )
+            )
+    return out
+
+
+def test_score_skew_is_estimated_from_scorelines() -> None:
+    as_of = T0 + timedelta(days=400)
+    flat = KillModelConfig(score_skew_prior_sd=10.0)  # (almost) no shrinkage: the raw estimate
+    for gamma in (0.15, 0.5):
+        model = PlayerKillModel(flat).fit(_skew_records(gamma, n_maps=400, seed=int(gamma * 100)))
+        est, hmv = model.score_params(as_of)
+        assert est == pytest.approx(gamma, abs=0.06)
+        assert 0.0 < hmv < 1.0
+        assert model.summary(as_of)["n_skew_records"] == 4000
+    # without scorelines (or with too few) the configured defaults are used
+    model = PlayerKillModel().fit(_skew_records(0.5, n_maps=400, with_scores=False))
+    cfg = KillModelConfig()
+    assert model.score_params(as_of) == (cfg.score_skew, cfg.hist_margin_var)
+    few = PlayerKillModel().fit(_skew_records(0.5, n_maps=10))
+    assert few.score_params(as_of) == (cfg.score_skew, cfg.hist_margin_var)
+    # estimation can be switched off; no look-ahead: nothing before the first record -> defaults
+    off = PlayerKillModel(KillModelConfig(estimate_score_skew=False)).fit(_skew_records(0.5, n_maps=400))
+    assert off.score_params(as_of) == (cfg.score_skew, cfg.hist_margin_var)
+    early = PlayerKillModel().fit(_skew_records(0.5, n_maps=400))
+    assert early.score_params(T0) == (cfg.score_skew, cfg.hist_margin_var)
+
+
+def test_score_skew_on_synthetic_universe(fitted_kill_model: PlayerKillModel) -> None:
+    """The synthetic generator gives the round winner ~4.3 kills and the loser ~1.3 per round, i.e.
+    gamma ~ 0.5; the shrunk estimate must move from the 0.3 prior toward it."""
+    gamma, hmv = fitted_kill_model.score_params(AS_OF)
+    assert 0.4 < gamma < 0.6
+    assert 0.02 < hmv < 0.3
+
+
+def test_malformed_records_are_skipped_not_fatal() -> None:
+    good = [r for r in _records({1: 0.7}, n_maps=20) if r.deaths <= r.rounds_played]  # one death per round
+    base = good[0]
+    bad = [
+        base.model_copy(update={"kills": -1}),
+        base.model_copy(update={"deaths": -3}),
+        base.model_copy(update={"rounds_played": 0}),
+        base.model_copy(update={"kills": 500}),  # > 5 per round
+        base.model_copy(update={"deaths": 40}),  # > rounds played
+    ]
+    inconsistent = base.model_copy(update={"team_rounds_won": 3, "opponent_rounds_won": 2})  # < rounds
+    model = PlayerKillModel().fit([*bad, *good, inconsistent])
+    assert model.n_records == len(good) + 1
+    assert model.fit_stats == {"n_records": len(good) + 1, "n_skipped": 5}
+    ref = PlayerKillModel().fit([*good, inconsistent])
+    as_of = T0 + timedelta(days=60)
+    assert model.rate(1, "mirage", 99, as_of=as_of) == ref.rate(1, "mirage", 99, as_of=as_of)
+
+
+def test_save_load_keeps_scorelines_and_reads_old_files(tmp_path: Path) -> None:
+    model = PlayerKillModel(KillModelConfig(score_skew_prior_sd=10.0)).fit(_skew_records(0.4, n_maps=300))
+    as_of = T0 + timedelta(days=400)
+    back = PlayerKillModel.load(model.save(tmp_path / "skew"))
+    assert back.score_params(as_of) == model.score_params(as_of)
+    assert back.config == model.config
+    # a file written before the scoreline columns existed loads with unknown scorelines
+    with np.load(tmp_path / "skew.npz", allow_pickle=False) as z:
+        legacy = {k: z[k] for k in z.files if k not in ("own_rounds", "opp_rounds")}
+    np.savez_compressed(tmp_path / "legacy.npz", **legacy)
+    old = PlayerKillModel.load(tmp_path / "legacy.npz")
+    assert old.n_records == model.n_records
+    assert old.score_params(as_of) == (old.config.score_skew, old.config.hist_margin_var)
+
+
+def test_kill_model_is_picklable_and_thread_safe() -> None:
+    import copy
+    import pickle
+    from concurrent.futures import ThreadPoolExecutor
+
+    model = PlayerKillModel(KillModelConfig(cache_size=2)).fit(_records({1: 0.7, 2: 0.6}, n_maps=40))
+    clone = pickle.loads(pickle.dumps(model))
+    assert copy.deepcopy(model).n_records == clone.n_records == model.n_records
+    dates = [T0 + timedelta(days=d) for d in range(5, 45)]
+    serial = [model.rate(1, "mirage", 99, as_of=d).kpr for d in dates]
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        parallel = list(pool.map(lambda d: clone.rate(1, "mirage", 99, as_of=d).kpr, dates))
+    assert parallel == serial

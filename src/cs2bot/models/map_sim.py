@@ -35,6 +35,7 @@ exploits this to find the ``d`` whose simulated map-win probability matches a ta
 from __future__ import annotations
 
 import math
+import threading
 import time
 from collections import OrderedDict
 from collections.abc import Callable
@@ -67,7 +68,10 @@ I16Array = npt.NDArray[np.int16]
 I8Array = npt.NDArray[np.int8]
 BoolArray = npt.NDArray[np.bool_]
 
-DEFAULT_RACE_TARGETS: tuple[int, ...] = (3, 5, 7, 10, 13)
+#: Race-to-N targets simulated by default: every N from 1 to 16. N <= 13 is always decided; 14-16 are only
+#: reachable in overtime (``p_neither_race_to`` carries the void mass). Betclic lists "first to N rounds"
+#: markets for varying N, so every plausible line is priceable.
+DEFAULT_RACE_TARGETS: tuple[int, ...] = tuple(range(1, 17))
 P_MIN, P_MAX = 0.001, 0.999
 D_MIN, D_MAX = -8.0, 8.0
 OT_DETAILED_PERIODS = 3  # overtime periods simulated with the full economy (P(4th OT) ~ 0.4 %)
@@ -758,7 +762,8 @@ def iid_round_prob_for_map(target_p: float, economy: EconomyParams = DEFAULT_ECO
 class MapSimulator:
     """Runs map simulations with LRU caches for outputs and strength calibrations.
 
-    Not thread-safe (plain dict caches); use one instance per thread.
+    Thread-safe: cache and statistics updates are guarded by a lock; simulations themselves run
+    outside it (two threads asking for the same uncached run may both compute it - same result).
     """
 
     def __init__(self, *, cache_size: int = 64, calibration_cache_size: int = 4096) -> None:
@@ -766,6 +771,7 @@ class MapSimulator:
         self._cal_cache: OrderedDict[tuple[Any, ...], float] = OrderedDict()
         self.cache_size = cache_size
         self.calibration_cache_size = calibration_cache_size
+        self._lock = threading.RLock()
         self.stats: dict[str, int] = {
             "simulations": 0,
             "sim_cache_hits": 0,
@@ -773,6 +779,16 @@ class MapSimulator:
             "calibration_cache_hits": 0,
             "calibration_evaluations": 0,
         }
+
+    def __getstate__(self) -> dict[str, Any]:
+        """Picklable / deep-copyable: the lock is dropped and recreated."""
+        state = self.__dict__.copy()
+        state.pop("_lock", None)
+        return state
+
+    def __setstate__(self, state: dict[str, Any]) -> None:
+        self.__dict__.update(state)
+        self._lock = threading.RLock()
 
     # ---------------------------------------------------------------- simulate
     def simulate(
@@ -789,11 +805,12 @@ class MapSimulator:
         key: tuple[Any, ...] | None = None
         if isinstance(rng, int | np.integer) and not record_rounds:
             key = (inp.cache_key(), int(n_sims), int(rng))
-            hit = self._out_cache.get(key)
-            if hit is not None:
-                self._out_cache.move_to_end(key)
-                self.stats["sim_cache_hits"] += 1
-                return hit
+            with self._lock:
+                hit = self._out_cache.get(key)
+                if hit is not None:
+                    self._out_cache.move_to_end(key)
+                    self.stats["sim_cache_hits"] += 1
+                    return hit
         gen = rng if isinstance(rng, np.random.Generator) else np.random.default_rng(rng)
         t0 = time.perf_counter()
         rec, diag, log = _simulate_core(inp, int(n_sims), gen, record_rounds=record_rounds)
@@ -809,11 +826,12 @@ class MapSimulator:
             elapsed_s=time.perf_counter() - t0,
             round_log=log,
         )
-        self.stats["simulations"] += 1
-        if key is not None:
-            self._out_cache[key] = out
-            while len(self._out_cache) > self.cache_size:
-                self._out_cache.popitem(last=False)
+        with self._lock:
+            self.stats["simulations"] += 1
+            if key is not None:
+                self._out_cache[key] = out
+                while len(self._out_cache) > self.cache_size:
+                    self._out_cache.popitem(last=False)
         return out
 
     # ---------------------------------------------------------------- calibration
@@ -854,11 +872,13 @@ class MapSimulator:
         target = min(max(float(target_p), P_MIN), P_MAX)
         base_key = inp.cache_key(include_strength=False)
         cal_key = (base_key, round(target, 9), int(n_sims), int(rng_seed), round(float(tol), 9))
-        self.stats["calibrations"] += 1
-        cached = self._cal_cache.get(cal_key)
+        with self._lock:
+            self.stats["calibrations"] += 1
+            cached = self._cal_cache.get(cal_key)
+            if cached is not None:
+                self._cal_cache.move_to_end(cal_key)
+                self.stats["calibration_cache_hits"] += 1
         if cached is not None:
-            self._cal_cache.move_to_end(cal_key)
-            self.stats["calibration_cache_hits"] += 1
             return cached, self.simulate(inp.with_strength(cached), n_sims, int(rng_seed))
 
         evaluated: dict[float, MapSimOutput] = {}
@@ -867,13 +887,15 @@ class MapSimulator:
             dd = float(min(max(d, D_MIN), D_MAX))
             out = self.simulate(inp.with_strength(dd), n_sims, int(rng_seed))
             evaluated[dd] = out
-            self.stats["calibration_evaluations"] += 1
+            with self._lock:
+                self.stats["calibration_evaluations"] += 1
             return out.p_team1_win - target
 
         d_best = self._root(f, target, inp.economy, tol, max_iter, evaluated)
-        self._cal_cache[cal_key] = d_best
-        while len(self._cal_cache) > self.calibration_cache_size:
-            self._cal_cache.popitem(last=False)
+        with self._lock:
+            self._cal_cache[cal_key] = d_best
+            while len(self._cal_cache) > self.calibration_cache_size:
+                self._cal_cache.popitem(last=False)
         return d_best, evaluated[d_best]
 
     @staticmethod
@@ -950,8 +972,14 @@ class MapSimulator:
         return best()
 
     def clear_caches(self) -> None:
-        self._out_cache.clear()
-        self._cal_cache.clear()
+        with self._lock:
+            self._out_cache.clear()
+            self._cal_cache.clear()
+
+    def stats_snapshot(self) -> dict[str, int]:
+        """A consistent copy of :attr:`stats`."""
+        with self._lock:
+            return dict(self.stats)
 
 
 #: Process-wide default simulator (caches shared across predictions in one process).

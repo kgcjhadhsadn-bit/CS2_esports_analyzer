@@ -75,7 +75,15 @@ class SupportsWait(Protocol):
 
 @dataclass
 class FetchOptions:
-    """Fetcher knobs that are not (yet) part of :class:`cs2bot.config.HLTVSettings`."""
+    """Resolved fetcher knobs.
+
+    :class:`cs2bot.config.HLTVSettings` is the source of truth for ``challenge_wait_s``,
+    ``cooldown_base_s``, ``cooldown_max_s``, ``block_resources`` and ``browser_profile_dir``: build the
+    options with :meth:`from_settings` (what :class:`HLTVFetcher` does when ``options`` is None). The
+    remaining fields are not settings (polling interval, transport retries, locale). Constructing
+    ``FetchOptions(...)`` directly is meant for tests / special callers; its defaults mirror the settings
+    defaults except ``browser_profile_dir`` (None = a throw-away browser context).
+    """
 
     challenge_wait_s: float = 20.0  # browser mode: how long a challenge may take to clear by itself
     challenge_poll_s: float = 1.0
@@ -86,6 +94,19 @@ class FetchOptions:
     block_resources: bool = True  # browser: skip images / media / fonts (less traffic for HLTV and us)
     browser_profile_dir: Path | None = None  # browser: persistent profile (keeps cookies between runs)
     locale: str = "en-US"
+
+    @classmethod
+    def from_settings(cls, settings: HLTVSettings, **overrides: Any) -> FetchOptions:
+        """Options taken from ``settings``; ``overrides`` replace individual fields (non-settings knobs)."""
+        values: dict[str, Any] = {
+            "challenge_wait_s": max(0.0, float(settings.challenge_wait_s)),
+            "cooldown_base_s": max(0.0, float(settings.cooldown_base_s)),
+            "cooldown_max_s": max(0.0, float(settings.cooldown_max_s)),
+            "block_resources": settings.block_resources,
+            "browser_profile_dir": settings.browser_profile_dir,
+        }
+        values.update(overrides)
+        return cls(**values)
 
 
 @dataclass
@@ -120,36 +141,6 @@ def detect_challenge(html: str) -> str | None:
             if pattern.search(html):
                 return name
     return None
-
-
-class InjectableRateLimiter(RateLimiter):
-    """:class:`RateLimiter` with an injectable clock / sleep / RNG (deterministic tests)."""
-
-    def __init__(
-        self,
-        min_interval_s: float,
-        max_interval_s: float | None = None,
-        *,
-        clock: Callable[[], float] = time.monotonic,
-        sleep: Callable[[float], None] = time.sleep,
-        rng: random.Random | None = None,
-    ) -> None:
-        super().__init__(min_interval_s, max_interval_s)
-        self._clock = clock
-        self._sleep = sleep
-        self._rng = rng or random.Random()
-        self._mutex = threading.Lock()
-        self._next_at: float | None = None
-
-    def wait(self) -> float:
-        with self._mutex:
-            now = self._clock()
-            sleep_for = 0.0 if self._next_at is None else max(0.0, self._next_at - now)
-            gap = self._rng.uniform(self.min_interval_s, self.max_interval_s)
-            self._next_at = max(now, self._next_at or now) + gap
-        if sleep_for > 0:
-            self._sleep(sleep_for)
-        return sleep_for
 
 
 # ============================================================================================ cache
@@ -249,6 +240,23 @@ def playwright_proxy(proxy_url: str) -> dict[str, str]:
     return proxy
 
 
+def browser_launch_kwargs(settings: HLTVSettings, *, headless: bool) -> dict[str, Any]:
+    """Chromium launch arguments from the settings (executable path and proxy are settings, never fixed)."""
+    kwargs: dict[str, Any] = {"headless": headless}
+    if settings.chromium_executable:
+        kwargs["executable_path"] = settings.chromium_executable
+    if settings.proxy_url is not None:
+        kwargs["proxy"] = playwright_proxy(settings.proxy_url.get_secret_value())
+    return kwargs
+
+
+def browser_context_kwargs(settings: HLTVSettings, *, locale: str = "en-US") -> dict[str, Any]:
+    kwargs: dict[str, Any] = {"locale": locale}
+    if settings.user_agent:
+        kwargs["user_agent"] = settings.user_agent
+    return kwargs
+
+
 class ChallengePage(Protocol):
     """The subset of a Playwright ``Page`` used while waiting for a challenge to clear."""
 
@@ -297,7 +305,7 @@ class BrowserPageLoader:
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self.settings = settings
-        self.options = options or FetchOptions()
+        self.options = options or FetchOptions.from_settings(settings)
         self._clock = clock
         self._playwright: Any = None
         self._browser: Any = None
@@ -305,18 +313,10 @@ class BrowserPageLoader:
         self._page: Any = None
 
     def _launch_kwargs(self) -> dict[str, Any]:
-        kwargs: dict[str, Any] = {"headless": self.settings.headless}
-        if self.settings.chromium_executable:
-            kwargs["executable_path"] = self.settings.chromium_executable
-        if self.settings.proxy_url is not None:
-            kwargs["proxy"] = playwright_proxy(self.settings.proxy_url.get_secret_value())
-        return kwargs
+        return browser_launch_kwargs(self.settings, headless=self.settings.headless)
 
     def _context_kwargs(self) -> dict[str, Any]:
-        kwargs: dict[str, Any] = {"locale": self.options.locale}
-        if self.settings.user_agent:
-            kwargs["user_agent"] = self.settings.user_agent
-        return kwargs
+        return browser_context_kwargs(self.settings, locale=self.options.locale)
 
     def _ensure_page(self) -> Any:
         if self._page is not None:
@@ -430,6 +430,34 @@ class HttpPageLoader:
 # ============================================================================================ fetcher
 
 
+def _bare_host(netloc: str) -> str:
+    host = netloc.lower().rsplit("@", 1)[-1]
+    return host[4:] if host.startswith("www.") else host
+
+
+def hltv_url(base_url: str, path_or_url: str) -> str:
+    """Absolute URL of ``path_or_url`` on the configured HLTV host.
+
+    Absolute URLs (and scheme-relative ``//host/...``) must point at the same site as ``base_url``
+    (``hltv.org`` and ``www.hltv.org`` are the same site) and are rewritten onto ``base_url``; any other
+    host raises :class:`ValueError`, so a link scraped from a page can never make the bot fetch
+    elsewhere. Fragments are dropped.
+    """
+    base = base_url.rstrip("/")
+    value = path_or_url.strip()
+    if value.lower().startswith(("http://", "https://", "//")):
+        parts = urlsplit(value)
+        if not parts.netloc or _bare_host(parts.netloc) != _bare_host(urlsplit(base).netloc):
+            raise ValueError(f"refusing to fetch a non-HLTV URL: {value!r}")
+        value = parts.path or "/"
+        if parts.query:
+            value += f"?{parts.query}"
+    value = value.split("#", 1)[0]
+    if not value.startswith("/"):
+        value = "/" + value
+    return base + value
+
+
 class HLTVFetcher:
     """``get(path_or_url) -> html`` with disk cache, rate limit and challenge back-off.
 
@@ -451,7 +479,7 @@ class HLTVFetcher:
         rng: random.Random | None = None,
     ) -> None:
         self.settings = settings
-        self.options = options or FetchOptions()
+        self.options = options or FetchOptions.from_settings(settings)
         self.base_url = settings.base_url.rstrip("/")
         self.cache_dir = resolve_path(settings.cache_dir)
         self.stats = FetchStats()
@@ -461,8 +489,8 @@ class HLTVFetcher:
         self._sleep = sleep
         self._clock = clock
         self._now = now
-        self._limiter: SupportsWait = rate_limiter or InjectableRateLimiter(
-            settings.min_delay_s, settings.max_delay_s, clock=clock, sleep=sleep, rng=rng
+        self._limiter: SupportsWait = rate_limiter or RateLimiter(
+            max(0.0, settings.min_delay_s), max(0.0, settings.max_delay_s), clock=clock, sleep=sleep, rng=rng
         )
         self._lock = threading.RLock()
         self._blocked_until: datetime | None = None
@@ -473,14 +501,7 @@ class HLTVFetcher:
     # ------------------------------------------------------------------ public API
     def url_for(self, path_or_url: str) -> str:
         """Absolute URL on the configured HLTV host (other hosts are refused)."""
-        value = path_or_url.strip()
-        if value.startswith(("http://", "https://")):
-            if urlsplit(value).netloc.lower() != urlsplit(self.base_url).netloc.lower():
-                raise ValueError(f"refusing to fetch a non-HLTV URL: {value!r}")
-            return value
-        if not value.startswith("/"):
-            value = "/" + value
-        return self.base_url + value
+        return hltv_url(self.base_url, path_or_url)
 
     def get(self, path_or_url: str, *, max_age_minutes: int | None = None) -> str:
         """HTML of a page: from the cache when fresh enough, otherwise from the network.

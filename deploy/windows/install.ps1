@@ -324,8 +324,9 @@ try {
     Write-Host "  3. Open the dashboard:  $(Get-DashboardUrl)"
     Write-Host '  4. Watch a dry run first (CS2BOT_EXECUTOR__DRY_RUN=true places no real bets).'
     Write-Host '     To go live set CS2BOT_EXECUTOR__DRY_RUN=false in .env and restart the bot.'
-    Write-Host '  5. Optional: start automatically at logon:  deploy\windows\register-autostart.ps1'
-    Write-Host '  6. Optional: daily database backup:         deploy\windows\backup-db.cmd'
+    Write-Host '  5. Optional: start automatically at sign-in: deploy\windows\register-autostart.cmd'
+    Write-Host '  6. Optional: daily database backup:          deploy\windows\backup-db.cmd -Schedule 04:30'
+    Write-Host '  7. Keep the PC awake before matches:         deploy\windows\power-settings.cmd'
     exit 0
 } catch {
     Write-Fail $_.Exception.Message

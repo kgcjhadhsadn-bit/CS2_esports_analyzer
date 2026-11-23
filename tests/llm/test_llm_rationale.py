@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 
+import pytest
+
 from cs2bot.domain.enums import ContextFlagType, MatchFormat
 from cs2bot.domain.predictions import PredictionCore
 from cs2bot.llm import prompts
@@ -162,3 +164,47 @@ def test_sanitize_markdown_neutralises_unsafe_links() -> None:
     assert (
         sanitize_markdown("odds [1.80] (after tax) and p[0](x) < 3") == "odds [1.80] (after tax) and p0 < 3"
     )
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "They lose most pistol rounds on Nuke.",
+        "After their loss to NAVI the team rebuilt.",
+        "Losing streak of five maps.",
+        "Risks: none worth mentioning.",
+    ],
+)
+def test_incidental_loss_words_do_not_suppress_the_disclaimer(text: str) -> None:
+    """Review round 1: only a statement about the bets losing counts as the risk sentence."""
+    assert finalize_rationale(text).endswith(f"*{RISK_DISCLAIMER}*")
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Even high-probability bets lose regularly.",
+        "Any stake can be lost.",
+        "Losses are always possible.",
+        "It is possible that this produces losses.",
+        "Straty są możliwe.",
+        "Każdy zakład może przegrać.",
+    ],
+)
+def test_explicit_risk_statements_are_recognised(text: str) -> None:
+    assert finalize_rationale(text) == text
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("<img\nsrc=x\nonerror=alert(1)>hi", "hi"),
+        ("<a href='javascript:alert(1)'\n>click</a>", "click"),
+        ("<scr<b>ipt>alert(1)</script>", "alert(1)"),
+        ("x <img src=x onerror=alert(1)", "x < img src=x onerror=alert(1)"),
+        ("p < 0.75 and EV > 0.03; 2<3", "p < 0.75 and EV > 0.03; 2<3"),
+    ],
+)
+def test_sanitize_markdown_handles_multiline_nested_and_unclosed_tags(text: str, expected: str) -> None:
+    """Review round 1: tags spanning lines, re-forming after one pass, or left unclosed are defused."""
+    assert sanitize_markdown(text) == expected

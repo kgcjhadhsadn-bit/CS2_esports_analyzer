@@ -1,0 +1,4 @@
+# Windows scripts: CRLF on checkout. cmd.exe misreads some LF-only batch files, and Windows
+# PowerShell 5.1 reads .ps1 files without a BOM in the ANSI code page, so they must stay pure ASCII.
+*.ps1 text eol=crlf
+*.cmd text eol=crlf

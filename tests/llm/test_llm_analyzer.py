@@ -250,7 +250,9 @@ def test_context_only_evidence_is_accepted() -> None:
     client = FakeClient([fake_response(context_result(lineup_unknown))])
     flag = _analyzer(client).analyze_match(make_ctx(team1_lineup=[]), [], now=NOW)[0]
     assert flag.veto is True and flag.evidence == ["context"]
-    assert "team1 lineup: not known yet" in client.user_text()
+    assert "team1 lineup: not in our database" in client.user_text()
+    # Review round 1: a missing lineup is a data gap, not grounds for a veto by itself.
+    assert "gap in our data, not evidence" in client.system_text()
 
 
 def test_low_confidence_veto_is_demoted() -> None:

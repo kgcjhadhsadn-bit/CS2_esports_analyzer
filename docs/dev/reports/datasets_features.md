@@ -1,6 +1,6 @@
 # datasets_features: implementation report
 
-Tests: `.venv/bin/python -m pytest tests/learning -q -n 2` - 63 passed, 0 failed (16 s). `tests/foundation`: 37 passed. `ruff check`, `ruff format --check` and `mypy` are clean on `src/cs2bot/datasets`, `src/cs2bot/features`, `tests/learning`.
+Tests: `.venv/bin/python -m pytest tests/learning -q -n 2` - 68 passed, 0 failed (17 s; 63 before review round 1). `tests/foundation`: 37 passed. `ruff check`, `ruff format --check` and `mypy` are clean on `src/cs2bot/datasets`, `src/cs2bot/features`, `tests/learning`.
 
 ## Summary
 
@@ -45,11 +45,11 @@ Conventions shared by the loaders:
 
 - **Time window:** `since <= t < until`, where `t` is `maps_played.played_at`, falling back to `matches.scheduled_at` (vetoes use `scheduled_at`). `until=as_of` returns exactly what was known strictly before `as_of`. Naive datetimes are read as UTC.
 - **Skipped, never fatal:** cancelled matches, matches without both teams, maps whose winner has fewer than 13 rounds or with equal scores, placeholder map names (`TBA`), rows that fail validation.
-- **Map results:** `picked_by` is `None` for the decider and for an unknown pick. Lineups come from `match_lineups`, else from the players with a stat line on the map. `is_lan` / `tier` fall back to the tournament.
+- **Map results:** `picked_by` is `None` for the decider (`is_decider` wins over a contradicting `picked_by_team_id`) and for an unknown pick. Lineups come from `match_lineups`, else from the players with a stat line on the map. `is_lan` / `tier` fall back to the tournament.
 - **Rounds:** economy fields are assigned to team1/team2 by `team1_side`. HLTV rows keep them `None`. `team1_score_before` / `team2_score_before` are cumulative within the map and become `None` after a gap in the stored rounds.
 - **Player records:** the preferred source row supplies kills / deaths / team; optional fields it lacks (for example the HLTV rating next to a DEMO row) are filled from the next source. `awp_kills` falls back to counting the `kills` table when that map's kills carry weapon names.
 - **`data_completeness` weights:** lineups 0.30 (5 players in `match_lineups` for this match; half credit for a lineup carried over from the previous match), recent maps 0.25 (8 maps per team in 90 days), veto history 0.15 (3 vetoes per team in 180 days), player stats 0.20 (5 stat lines per lineup player in 180 days), odds link 0.10 (a Betclic event linked AUTO or CONFIRMED). With the default gate of 0.95 every component must be essentially complete; a missing Betclic link alone gives 0.90.
-- **`load_match_actuals`:** `round_winners` only when every round is present and the winners add up to the score (rounds table first, then `maps_played.extra["hltv"]["rounds"]`). `forfeited` reads `Match.extra["hltv"]["forfeit"]` (also `extra["pandascore"]["forfeit"]`). `cancelled` = status CANCELED without a forfeit flag. `complete` is `False` for an undecided series, a series score that disagrees with the maps, and a series with single forfeited maps.
+- **`load_match_actuals`:** `round_winners` only when every round is present and the winners add up to the score (rounds table first, then `maps_played.extra["hltv"]["rounds"]`). `forfeited` = a forfeit flag (`Match.extra["hltv"]["forfeit"]`, `extra["pandascore"]["forfeit"]` or top-level `extra["forfeit"]`) **and no map played**. `cancelled` = status CANCELED, no forfeit flag **and no map played**. Both void every bet, so neither is set while a decided map exists. `complete` is `False` for an undecided series, a series score that disagrees with the maps, a forfeit flag or HLTV `forfeited_maps` next to played maps (HLTV sets `forfeit=True` for partial forfeits too), and a CANCELED match with played maps - settlement then answers UNKNOWN and asks the bookmaker.
 
 ### `cs2bot.features`
 
@@ -61,6 +61,7 @@ FeatureStore.build(map_results, *, player_maps=(), rounds=(), vetoes=(), team_de
                    config: FeatureConfig | None = None, patch_timeline: PatchTimeline | "default" | None = "default") -> FeatureStore
 FeatureStore.from_session(session, *, since=None, until=None, in_scope_only=True, with_rounds=True, with_demo=True,
                           config=None, patch_timeline="default") -> FeatureStore
+store.cutoff(as_of, exclude_match_id=None) -> datetime     # as_of, or the start of exclude_match_id when earlier
 store.team_features(team_id, map_name, as_of, *, lineup=(), standins=None, exclude_match_id=None) -> dict[str, float]
 store.matchup_features(team1_id, team2_id, map_name, as_of, *, exclude_match_id=None) -> dict[str, float]
 store.map_features(map_name, as_of, *, exclude_match_id=None) -> dict[str, float]
@@ -111,7 +112,7 @@ Rules the consumer must know:
 - **Rating provider at past timestamps:** `MapRatingModel.predict` refuses an `as_of` before its last game. Fit it with `record_history=True` (its `historical_predict` is then used automatically) or pass `WalkForwardRatings`. The refusal is passed on, never swallowed.
 - **`pick_*` are all 0 for a decider and for an unknown pick.** Before the veto is published, pass each candidate picker from `MapSequenceProbability.pickers` as `picked_by`.
 - **`mirror=True`** adds each map again with the teams swapped (label flipped). Group cross-validation folds by `match_id`.
-- **`features_for_match_map`** clamps `as_of` to the start of the match when the store already holds it, so backtests over finished matches stay pre-match.
+- **`exclude_match_id` cuts the query time:** every store query and `match_map_features` use `store.cutoff(as_of, exclude_match_id)`, i.e. `as_of` is clamped to the start of the excluded match when the store holds it. `features_for_match_map` passes `ctx.match_id`, so backtests over finished matches and live calls during a running series stay pre-match.
 
 Wiring example:
 
@@ -145,7 +146,6 @@ actuals = datasets.load_match_actuals(session, match_id)            # None if th
 - **Change-point detection is slow by design:** a shift of 0.10 in round share is flagged within 20 maps in 68 % of 300 simulated series, with a false alarm about 1 % of the time. `regime_break_prob` is a weak feature in a universe without drift.
 - **`adj_round_share_90d` regresses to the mean** when team strength does not drift (the proxy has already absorbed the surprise). Its sign is for the ensemble to learn; it is not a "hot team wins" indicator.
 - **The store is immutable.** New results need a rebuild: about 0.5 s per 3,000 maps plus loading. Loading two years of round rows takes on the order of 10 s; use `with_rounds=False` for frequent rebuilds.
-- **`exclude_match_id` only removes trailing records.** Queries with an `as_of` after the start of the excluded match, with other matches in between, would see it; `features_for_match_map` and `build_training_rows` never do that.
 - **`team1_starts_ct` is off by default** (`FeatureConfig.use_start_side`): the side is unknown before the veto, so the feature would exist in training and be missing live.
 - **Player features use the lineup that played** in training rows. Lineups announced late are a live-data risk, not a leak.
 - **No role-based features in the row yet.** Roles are written to `players` and exposed through `LineupPlayer.role`; role matchups belong to the round model.
@@ -160,3 +160,28 @@ actuals = datasets.load_match_actuals(session, match_id)            # None if th
 ## New dependency requests
 
 None.
+
+## Review round 1
+
+Independent review of the whole package (brief incl. Addendum, every module, tests). Checks after the fixes: `pytest tests/learning -n 2` 68 passed (17 s), `tests/foundation` 37 passed, `ruff check`, `ruff format --check` and `mypy` clean.
+
+**Verified (re-derived, not trusted):** loader orientation and the per-side economy mapping by `team1_side`; cumulative score-before with gap handling; source preference and field fill-in; AWP counting without team kills; the `since <= t < until` window; side-split arithmetic (`CT rounds played = own CT wins + opponent T wins`); prefix-sum windows and the trailing-exclusion logic; matches-in-window counting; roster streaks; h2h orientation flip; the strength proxy (pre-game values only); BOCPD (Student-t predictive of the NIG model, hazard split, parameter updates, tail merge, strictly online); patch-file loading; role rules; `data_completeness` weights; `load_match_actuals` against the settlement engine's contract (`engine/settlement.py`) and the HLTV / PandaScore sync conventions for forfeits (`ingest/hltv/sync/matches.py`, `ingest/pandascore/sync.py`); `RatingProvider` against `MapRatingModel.historical_predict` / `records_history`. The Addendum is fully implemented (loaders, `team_rounds_won` / `opponent_rounds_won`, `rounds.source`, `LineupPlayer.role`, `MatchContext.start_sides`).
+
+**Issues found**
+
+1. **Major, fixed - partial forfeits voided bets on maps that were played.** The HLTV parser sets `extra["hltv"]["forfeit"] = True` whenever any map is a "Default" map or a note mentions a forfeit, not only for walkovers. `load_match_actuals` turned that into `forfeited=True, complete=True`, and settlement voids every bet on a forfeited match - a lost bet on a played map 1 would have been booked as a refund (ledger and bankroll overstated). Now `forfeited` requires that no map was played; a forfeit flag or `forfeited_maps` next to played maps gives `complete=False` (settlement answers UNKNOWN and asks the bookmaker). The existing test only set `forfeited_maps` without `forfeit`, which is not what the HLTV sync writes.
+2. **Major, fixed - a CANCELED match with played maps voided those maps too** (`cancelled=True` regardless of played maps). Now `cancelled` requires no played map; otherwise the match is incomplete and left to the bookmaker.
+3. **Moderate, fixed - `exclude_match_id` only removed trailing records** (documented limitation). A query with `as_of` after the start of the excluded match saw other teams' later results, and window counts (`maps_30d`, `map_maps_*`, `maps_14d`) went negative (-1 reproduced). New `FeatureStore.cutoff(as_of, exclude_match_id)`: every store query and `match_map_features` (so meta and rating features too) clamp `as_of` to the start of the excluded match; window lower bounds are clamped to the upper bound.
+4. **Minor, fixed - `maps_played.is_decider` was ignored**: a decider row that also carried `picked_by_team_id` became a pick. `is_decider` now wins.
+5. **Minor, fixed - `standin_count` reported 0 for a team without any stat line in that match** (unknown, not "no stand-in"); it is now `None` -> NaN, matching the live path when no lineup is known.
+6. **Minor, fixed - context flags with a non-finite severity / confidence / logit shift** were either dropped by a validation error or (NaN / inf shift) passed through and would poison every probability; they are now skipped with a debug log. Betting vetoes are not affected: `engine.decision` reads veto flags from the DB itself.
+
+New tests: `test_actuals_partial_forfeit_as_stored_by_hltv_never_voids_played_maps`, `test_actuals_cancelled_match_with_played_maps_is_left_to_the_bookmaker`, `test_context_skips_flags_with_non_finite_values`, `test_decider_flag_wins_over_a_contradicting_picker`, `test_excluded_match_cuts_every_query_at_its_start`, plus an assertion for unknown stand-in counts.
+
+**Remaining concerns (not changed)**
+
+- PostgreSQL is still untested (no test database). The SQL is portable by construction (the GROUP BY of `load_team_demo_stats` repeats the `COALESCE` expression, as PostgreSQL requires).
+- Roles are only checked on handcrafted fixtures; thresholds are literature-based, not fitted.
+- Patch-file dates marked `date_verified: false` were not re-researched in this round.
+- A decider and an unknown pick still look identical in training rows (`MapResultRecord` has no `is_decider`; see the foundation change request above).
+- `data_completeness` with the default gate of 0.95 effectively requires confirmed lineups in `match_lineups` (a carried-over lineup alone gives at most 0.85). That is intended, but it means no bets until HLTV/PandaScore publish lineups.

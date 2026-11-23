@@ -248,6 +248,24 @@ def test_select_news_never_looks_ahead(session: Session) -> None:
     assert select_news_for_match(session, ctx, limit=25, now=NOW - timedelta(hours=6)) == []
 
 
+def test_select_news_ignores_triage_verdicts_written_after_now(session: Session) -> None:
+    """Review round 1: a verdict from the future must not filter, rank or attach teams at ``now``."""
+    ctx = seed_match(session)
+    later = NOW + timedelta(hours=1)
+    # Marked irrelevant later -> still shown at NOW (as untriaged).
+    first = add_news(session, 1, title="judged irrelevant later", team_ids=[TEAM1_ID], hours_ago=5)
+    # Team attached only by a later verdict -> not about this match at NOW.
+    row = add_news(session, 2, title="teams from a later verdict", team_ids=[], hours_ago=4)
+    for news_row, label in ((first, "irrelevant"), (row, "stand_in")):
+        news_row.triage_label, news_row.relevance, news_row.triaged_at = label, 0.9, later
+    row.extra = {"llm": {"triage": {"team_ids": [TEAM1_ID]}}}
+    session.flush()
+    assert _titles(select_news_for_match(session, ctx, limit=25, now=NOW)) == ["judged irrelevant later"]
+    assert select_news_for_match(session, ctx, limit=25, now=NOW, include_untriaged=False) == []
+    after = later + timedelta(minutes=1)
+    assert _titles(select_news_for_match(session, ctx, limit=25, now=after)) == ["teams from a later verdict"]
+
+
 def test_select_news_is_chronological_and_limited_by_relevance(session: Session) -> None:
     ctx = seed_match(session)
     add_news(session, 1, title="r90 old", team_ids=[TEAM1_ID], label="stand_in", relevance=0.9, hours_ago=50)

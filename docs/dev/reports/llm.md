@@ -1,6 +1,6 @@
 # llm: implementation report
 
-**Tests:** `.venv/bin/python -m pytest tests/llm -q` - 200 passed, 0 failed (about 7 s with `-n 2`; lint/type clean: True)
+**Tests:** `.venv/bin/python -m pytest tests/llm -q` - 216 passed, 0 failed (after review round 1) (about 7 s with `-n 2`; lint/type clean: True)
 
 ## Summary
 
@@ -110,7 +110,7 @@ news_row_to_input(row: NewsItem) -> NewsItemIn
 ```
 
 - `persist_flags` deactivates the match's active rows and inserts the new ones; identical flags are a no-op. An empty list deactivates everything, so pass it only after a successful analysis.
-- `select_news_for_match` never returns items published after `now`. Untriaged items are included, so a triage outage cannot hide a fresh roster story.
+- `select_news_for_match` never returns items published after `now`, and ignores triage verdicts written after `now` (such an item counts as untriaged). Untriaged items are included, so a triage outage cannot hide a fresh roster story.
 
 ### Pipeline helpers (what the jobs should call)
 
@@ -132,6 +132,7 @@ refresh_match_context(session, analyzer, ctx: MatchContext, *, now=None, form_su
 - `suggestion_to_flag(...)`, `ADVERSE_FLAG_TYPES`, `VETO_MIN_CONFIDENCE`.
 - Schemas: `TriageLabel`, `TriageItem`, `TriageBatch`, `ContextFlagSuggestion`, `MatchContextResult`, `RationaleOutput`.
 - `cs2bot.llm.rationale.sanitize_markdown(text) -> str` for any other LLM-derived text shown in the dashboard.
+- `cs2bot.llm.rationale.has_risk_statement(text) -> bool`: whether a text says the bets can lose (English or Polish); `finalize_rationale` appends `RISK_DISCLAIMER` when it does not.
 
 ### Wiring example
 
@@ -183,3 +184,33 @@ None is required. Two optional ones:
 ## New dependency requests
 
 None.
+
+## Review round 1
+
+Reviewer: independent, round 1. I re-read the brief (no addendum work beyond "nothing changed"), every module and every test, checked the calls against the installed SDK (anthropic 2.12.0: `messages.parse` has `output_config`/`output_format` and no `fallbacks`; `beta.messages.parse` has `fallbacks`/`betas`; `stop_details` is a `RefusalStopDetails`), and probed the code with adversarial inputs.
+
+**Verified, no change needed**
+
+- Request parameters: Opus via `beta.messages.parse` with `betas=["server-side-fallback-2026-07-01"]`, `fallbacks="default"` only when `use_server_fallbacks` is on; Haiku never gets `fallbacks`/`betas`; `effort` always sent; no `temperature`/`top_p`/`top_k`/`thinking`/prefill (wire tests check the HTTP body).
+- `stop_reason` is checked before `parsed_output`; refusal logs `stop_details.category`; `max_tokens` and incomplete JSON give an empty result. Errors are caught most specific first. Nothing raises into the pipeline.
+- `combine_flags`: per-flag clip, then confidence weighting, then total clip; expiry uses `expires_at < now`, which matches `engine.decision` and `datasets.context` (`expires_at > now` = active); veto at confidence >= 0.6; NaN/inf handled; naive `now` rejected.
+- Orientation: `logit_shift` is from team1's side everywhere (prompt, direction check, `persist_flags` team-id mapping, `load_active_flags` reverse mapping via the match row).
+- A low-confidence veto is demoted before persisting, so `engine.decision` (which blocks on any active veto row) agrees with `combine_flags`.
+- Prompt injection: all external text is HTML-escaped and wrapped in tags. A body containing `</news_item>` cannot close the tag. The injection warning appears in the system prompt and after the data. The schema cannot be changed from the data.
+- Persistence is idempotent. A failed analysis never wipes stored flags. The DB marker and the memo cost guard behave as documented.
+
+**Issues found and fixed**
+
+1. *(major, fixed)* `finalize_rationale` treated any use of "lose"/"loss" as the required risk statement. A text like "they lose most pistol rounds" or "after their loss to NAVI" got no disclaimer, so the brief's "say that losses are possible" was not guaranteed. Now only a real risk statement counts ("losses ... possible", a bet or stake that can lose, and the Polish equivalents); otherwise `RISK_DISCLAIMER` is appended (`has_risk_statement`, new). Tests: `test_incidental_loss_words_do_not_suppress_the_disclaimer`, `test_explicit_risk_statements_are_recognised`.
+2. *(minor, fixed; defence in depth)* `sanitize_markdown` missed HTML tags that span lines (`<img\nsrc=x\nonerror=...>`). It also missed tags that re-form after one pass (`<scr<b>ipt>`) and an unclosed tag at the end. Tags may now span lines, stripping repeats until nothing changes, and any remaining `<` before a letter, `/` or `!` gets a space after it. Comparisons such as `p < 0.75` stay unchanged. Test: `test_sanitize_markdown_handles_multiline_nested_and_unclosed_tags`.
+3. *(minor, fixed; look-ahead)* `select_news_for_match` used triage verdicts (label, relevance, team ids added by triage) even when `triaged_at` was after `now`. In a historical replay, a later verdict could filter or attach items. Such verdicts are now ignored and the item counts as untriaged. Test: `test_select_news_ignores_triage_verdicts_written_after_now`.
+4. *(minor, fixed; false-veto risk)* When our database had no lineup for a team, the context prompt said "lineup: not known yet". The veto rule said "a lineup that is still unknown ... within hours of the start", so the model could veto a match because of a gap in our own data. The block now says "not in our database". The system prompt explains that this is a data gap and that a listed lineup may be carried over from the previous match, and the veto rule now requires *news* that reports an unknown or disputed lineup. Test updated in `test_context_only_evidence_is_accepted`.
+5. *(nit, fixed)* An unused `type: ignore` in `tests/llm/test_llm_memo_prompts.py` (reported by mypy when it checks the tests).
+
+**Remaining concerns (not changed)**
+
+- An Opus analysis also runs for matches with no news at all, to catch context-only situations. That costs about one request per match every 6 h (every hour in the last 3 h). If cost matters, skip the analysis when there is no news and both lineups are confirmed. That would need a "lineup confirmed" marker that `MatchContext` does not have.
+- `context_fingerprint` does not include the configured bounds or the prompt version. After the owner changes `max_flag_logit_shift`, unchanged inputs are not re-analysed until the interval runs out. `combine_flags` still enforces the new bounds.
+- `dedupe_flags` keeps one flag per (type, team), so two genuinely separate `other` situations about the same team merge into the stronger one. This is conservative.
+- `UsageTotals` counters are updated without a lock. They are for display only.
+- Still untested against the live API (no key on this machine).

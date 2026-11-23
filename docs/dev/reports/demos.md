@@ -1,6 +1,6 @@
 # demos: implementation report
 
-**Tests:** `.venv/bin/python -m pytest tests/ingest/demos -q` - 301 passed, 0 failed, 14 skipped (the 14 are the opt-in real-demo checks, which pass when the demos are downloaded: 14 passed) (lint/type clean: True)
+**Tests:** `.venv/bin/python -m pytest tests/ingest/demos -q` - 311 passed, 0 failed, 14 skipped (after review round 1) (the 14 are the opt-in real-demo checks, which pass when the demos are downloaded: 14 passed) (lint/type clean: True)
 
 ## Summary
 
@@ -44,7 +44,9 @@ JOB_NAME = "demos.process"
 - **Blocked source:** an exception class named `HLTVBlockedError` or `DemoDownloadBlockedError` stops the batch, puts the row back to `PENDING` without using an attempt and sets `report.blocked`.
 - **Never raises for one bad demo.** It stops early (with a warning) when less than `min_free_bytes` is free on the demo volume.
 - **`ProcessReport`:** `job, selected, parsed, failed, unavailable, maps_persisted, rounds_persisted, blocked, errors, warnings, demo_ids, match_ids`, plus `.items`, `.ok`, `.as_dict()` (for `JobTracker.details`).
-- Relative demo URLs are resolved against `settings.hltv.base_url`. `session_factory` is a `sessionmaker` (sessions are opened one after another, never nested; no threads).
+- Relative demo URLs are resolved against `settings.hltv.base_url`, protocol-relative ones (`//host/...`) get `https:`. Any other non-`http(s)` URL (`file:`, `javascript:`, ...) is never handed to a downloader: the row becomes `UNAVAILABLE` without using an attempt.
+- Clean-up only ever deletes files inside the demo's work directory: a downloader that returns a file kept elsewhere (a cache) keeps it.
+- A blocked download restores the row's previous status, attempt count and `error`. `session_factory` is a `sessionmaker` (sessions are opened one after another, never nested; no threads).
 
 Wiring for `cs2bot demos process --limit N` and the scheduler's demo job (slow lane; do not run it while an `HLTVFetcher` holds the same browser profile open):
 
@@ -127,7 +129,9 @@ Definitions (the full list with reasons is in the module docstring of `parse.py`
 
 - **Real rounds only:** warmup, knife round, rounds before the final match restart and rounds replayed after a backup restore are dropped. Numbers come from `total_rounds_played`, so pistol rounds (1, 13) and overtime (25+, no pistol round) are right even when a demo starts late.
 - **Buy type:** per-player average equipment value at freeze end; below 1500 eco, below 3800 force, else full (the same thresholds as `models.round_model.classify_buy`).
-- **Trade:** the killer dies to a teammate of his victim within `settings.trade_window_s` (inclusive).
+- **Trade:** the killer dies to a teammate of his victim within `settings.trade_window_s` (inclusive); kills on the same tick count in either event order.
+- **Bomb blast / world deaths** (`NON_KILL_WEAPONS`: `planted_c4`, `c4`, `world`, `trigger_hurt`) are deaths but nobody's kill (no kill, opening or trade credit), whoever the event names as attacker.
+- **Knife round:** only the first round of a (re)started match (`total_rounds_played == 0`) can be one; a late-starting demo whose first round is decided by a knife kill keeps it.
 - **Damage:** capped by the victim's remaining health; no team or self damage. Utility damage is HE plus fire.
 - **Assists** include flash assists. **KAST** = kill, non-flash assist, survived or traded (HLTV's definition).
 - **Clutch:** `1vN` at the moment a player becomes the last of his side; won when his side wins the round.
@@ -196,3 +200,53 @@ ALL_MAPS = "*"
 ## New dependency requests
 
 None. (`demoparser2`, `rarfile`, `zstandard`, `httpx`, `playwright`, `rapidfuzz` and `pandas` are already installed; `awpy` is not needed.)
+
+## Review round 1
+
+Independent review against the brief (including the Addendum) and the foundation contracts. All
+definition-of-done checks pass: `pytest tests/ingest/demos` 311 passed / 14 skipped (the opt-in
+real-demo module), ruff check + format clean, mypy clean, `pytest tests/foundation` 37 passed.
+
+**Verified (re-derived, not trusted):** round cleaning (warmup, knife, final restart, backup-restore
+replacement, pseudo round ends, numbering from `total_rounds_played`), reason-code and winner tables
+against demoparser2's `ROUND_WIN_REASON`, buy classification incl. pistol rounds 1/13 and no OT
+pistol, damage capped by remaining health (never above 100 per victim per round, team/self/world
+damage excluded), KAST (non-flash assist), clutch detection, position sampling (alive, not dead
+before the sample tick, sample tick <= round end), trade window boundary, steam ids kept as exact
+ints, persistence orientation (lineup -> clan name -> start side -> score, raising before any
+delete), idempotent replace of `Round` rows of any source written with `source=DEMO` (Addendum),
+`Player.extra` assigned as a new dict, pipeline status flow / attempts / retries / blocked handling /
+keep flags, aggregates' half-open window `[as_of - window_days, as_of)` (no look-ahead), replace
+per `window_end`. Archive extraction is zip-slip safe (flattened, sanitised names, size limits) and
+RAR tools are called with an argument list (no shell).
+
+**Issues found and fixed** (each has a regression test in `tests/ingest/demos/test_demos_review1.py`):
+
+1. *major* - A demo that starts recording late and whose first round is decided by knife kills only
+   had that round dropped as a "knife round", and every later round was renumbered one too low
+   (round 13 lost its pistol flag, OT detection shifted). Only a round with `total_rounds_played == 0`
+   can now be a knife round.
+2. *minor* - Trades between kills on the same tick were only found when the demo listed the earlier
+   kill first; both orders are now checked (affects `is_trade`, `was_traded`, KAST).
+3. *minor* - A bomb-blast death whose event names the planter as attacker would have been credited
+   as a kill (and opening kill / trade). Weapons in `NON_KILL_WEAPONS` never give a kill.
+4. *minor (safety)* - `_cleanup` deleted whatever path an injected downloader returned, even outside
+   the work directory; now restricted to files inside it.
+5. *minor (safety)* - Scraped demo URLs with any scheme were handed to the downloader (a `file:` URL
+   would have been opened by Chromium); only `http(s)` URLs are used now, protocol-relative URLs get
+   `https:`, others mark the row `UNAVAILABLE`.
+6. *minor* - A blocked download cleared the row's previous `error`; it is restored now.
+
+**Remaining concerns (not fixed):**
+
+- Clutches: when a 1vN turns into a 1v1 both last players get a clutch situation (`1vN` and `1v1`).
+  HLTV's exact counting rule could not be checked from this machine.
+- Whether CS2 names the planter or the world as attacker of a bomb-blast death was not confirmed
+  on a real demo; the code is correct either way now.
+- `resolve_steamids` step 5 loads every `players` row outside the lineup when some demo player is
+  unresolved (a full-table scan per map); fine for thousands of players, worth a JSON index or a
+  `player_steamids` table later.
+- HLTV sync (`cs2bot.ingest.hltv.sync.matches._write_round_rows`, opt-in) writes `Round` rows without
+  `source=DataSource.HLTV`, so they get the column default `DEMO`. `persist_parsed_demo` replaces
+  them anyway, but `datasets` filtering on `source` would mistake them for demo rows.
+- The real-demo validation module was not re-run in this review (the demos are not cached here).

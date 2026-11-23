@@ -493,3 +493,68 @@ def test_context_map_pool_follows_the_patch_calendar_when_nothing_else_is_known(
     upcoming = datasets.load_match_context(session, 2, settings=settings, now=now)
     assert upcoming.map_pool == ["ancient", "anubis", "cache", "dust2", "inferno", "mirage", "nuke"]
     assert len(upcoming.map_pool) == 7 and upcoming.team1_lineup == []
+
+
+# ------------------------------------------------------------------------------------- review round 1
+
+
+def test_actuals_partial_forfeit_as_stored_by_hltv_never_voids_played_maps(session: Session):
+    """HLTV sets ``forfeit=True`` for a partial forfeit too (any "Default" map). Bets on the maps that
+    were played stand at the bookmaker, so the match must not be reported as a walkover."""
+    _series(
+        session,
+        [(13, 7), (9, 13)],
+        team1_score=2,
+        team2_score=1,
+        extra={"hltv": {"forfeit": True, "forfeit_winner_team_id": 1, "forfeited_maps": [3]}},
+    )
+    actuals = datasets.load_match_actuals(session, 1)
+    assert actuals is not None
+    assert (actuals.forfeited, actuals.cancelled, actuals.complete) == (False, False, False)
+    assert actuals.maps_played == 2  # the played maps are still listed
+    # a forfeit note next to fully played maps (no "Default" map recorded) is just as ambiguous
+    match = session.get(Match, 1)
+    match.extra = {"hltv": {"forfeit": True, "forfeit_note": "Team 2 forfeited map 3"}}
+    session.flush()
+    actuals = datasets.load_match_actuals(session, 1)
+    assert (actuals.forfeited, actuals.complete) == (False, False)
+    # PandaScore's flag follows the same rule
+    match.extra = {"pandascore": {"forfeit": True}}
+    session.flush()
+    assert datasets.load_match_actuals(session, 1).forfeited is False
+
+
+def test_actuals_cancelled_match_with_played_maps_is_left_to_the_bookmaker(session: Session):
+    _series(session, [(13, 7)], status=MatchStatus.CANCELED)
+    actuals = datasets.load_match_actuals(session, 1)
+    assert actuals is not None and actuals.maps_played == 1
+    assert (actuals.cancelled, actuals.forfeited, actuals.complete) == (False, False, False)
+    # once no map was played, it is a plain cancellation again
+    session.execute(delete(MapPlayed).where(MapPlayed.match_id == 1))
+    session.flush()
+    actuals = datasets.load_match_actuals(session, 1)
+    assert (actuals.cancelled, actuals.forfeited, actuals.complete) == (True, False, True)
+
+
+def test_context_skips_flags_with_non_finite_values(session: Session, settings: Settings):
+    uni = populate_small(session)
+    match = uni.matches[-1]
+    now = match.played_at - timedelta(hours=1)
+    base = {
+        "match_id": match.id,
+        "flag_type": ContextFlagType.STAND_IN,
+        "severity": 0.5,
+        "confidence": 0.5,
+        "rationale": "x",
+        "created_at": now - timedelta(hours=2),
+    }
+    session.add_all(
+        [
+            ContextFlagRow(**{**base, "logit_shift": float("inf")}),  # SQLite cannot store NaN
+            ContextFlagRow(**{**base, "confidence": float("inf")}),
+            ContextFlagRow(**{**base, "logit_shift": -0.1}),
+        ]
+    )
+    session.flush()
+    ctx = datasets.load_match_context(session, match.id, settings=settings, now=now)
+    assert [f.logit_shift for f in ctx.context_flags] == [pytest.approx(-0.1)]

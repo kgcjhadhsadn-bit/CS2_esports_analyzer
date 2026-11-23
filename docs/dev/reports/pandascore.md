@@ -1,6 +1,6 @@
 # pandascore: implementation report
 
-**Tests:** `.venv/bin/python -m pytest tests/ingest/pandascore -q` - 136 passed, 0 failed (ruff check / ruff format --check / mypy clean on `src/cs2bot/ingest/pandascore`, `src/cs2bot/ingest/scope.py`; `tests/foundation` still passes)
+**Tests:** `.venv/bin/python -m pytest tests/ingest/pandascore -q` - 147 passed, 0 failed (ruff check / ruff format --check / mypy clean on `src/cs2bot/ingest/pandascore`, `src/cs2bot/ingest/scope.py`; `tests/foundation` still passes)
 
 ## Summary
 
@@ -60,6 +60,8 @@ PandaScoreClient(settings: PandaScoreSettings, *, http_client: httpx.Client | No
 - `ClientStats`: `requests`, `retries`, `pages`, `invalid_items`, `rate_limit_remaining` (last `X-Rate-Limit-Remaining`).
 - Default limiter: `utils.http.RateLimiter` with a gap of `3600 / settings.max_requests_per_hour` seconds between requests (3.6 s at the default 1000/h). Set `CS2BOT_PANDASCORE__MAX_REQUESTS_PER_HOUR=10000` on the historical / real-time plans.
 - A malformed list item is skipped and passed to `on_invalid(raw, exc)` (or logged); it never aborts the list.
+  This includes out-of-range numeric timestamps and non-hashable ids. `paginate` stops when a
+  page only repeats rows already yielded (a server ignoring `page[number]` cannot loop it forever).
 - `format_timestamp(dt) -> str` gives the `2026-11-21T00:00:00Z` form used in `range[...]`.
 - Errors, all subclasses of `PandaScoreError`:
   - `PandaScoreAuthError`: no token configured (raised before any request) or HTTP 401.
@@ -103,6 +105,9 @@ sync_modified(session, client, settings: Settings, since: datetime, until: datet
 pandascore_round_records(session, map_played: MapPlayed) -> list[RoundRecord]   # round history fallback without a demo
 ```
 
+- Status merge with HLTV: PandaScore's status wins, except that it never re-opens a match HLTV saw
+  finished, nor one HLTV deleted (`extra['hltv']['status'] == "deleted"`, stored CANCELED) unless
+  PandaScore reports it finished.
 - `sync_upcoming`: not-started matches of the next `settings.scope.max_hours_ahead` hours plus running matches. Open matches we store that vanished from both lists are re-fetched one by one (at most 40 per run); that is how results, cancellations and far-away reschedules arrive. Run it on the scheduler's `upcoming_sync_min` interval.
 - `sync_past`: matches that began in `[since, until]`, oldest first, in 30-day windows. It is both the results job (`since = now - 2 days`) and the backfill (`since = settings.scope.backfill_start`, with `commit_every`).
 - `sync_match`: one match with game details and rosters whatever its scope.
@@ -207,3 +212,63 @@ Suggested job order: PandaScore `sync_upcoming`, then HLTV `sync_rankings` / `sy
 ## New dependency requests
 
 - (none)
+
+## Review round 1
+
+Independent review of the whole package against the brief (including the Addendum), the foundation
+contracts and the HLTV package it converges with. Checks re-run: 147 tests pass (`-n 2`, ~6 s);
+ruff check / format and mypy clean on the owned paths; `tests/foundation` passes.
+
+**Verified (no change needed):** every brief item and the Addendum (shared `SyncReport`,
+`resolve_player(update_current_team=False)` via the 30-day window, one match row whichever source runs
+first); status / format / tier / LAN / prize-pool mapping tables; BO2 / first_to handling; overtime
+(MR12, 24 regulation rounds) and side splits from the round history; orientation of scores, rounds,
+sides and winners on a linked match HLTV created in swapped order; field ownership between the two
+sources (`scheduled_at`, `format`, `is_lan`, `stage`, `tournament_id`, scores, map rows) - no field is
+written back and forth by the two syncs; reschedule handling and reconciliation of vanished matches;
+idempotent re-runs; token never in URLs, logs, exceptions or `repr` (httpx also drops the
+`Authorization` header on cross-origin redirects); retry / `Retry-After` logic incl. HTTP-date form;
+scope rule and the as-of-date rank history (no look-ahead from today's rank for old matches).
+
+**Issues found and fixed:**
+
+1. (major) An out-of-range numeric timestamp in one list item (e.g. `"end_at": 1e20`) raised
+   `OSError` / `OverflowError` from `datetime.fromtimestamp` inside a pydantic validator. Pydantic only
+   converts `ValueError`, so the error escaped `_typed`, ended the whole list and propagated out of
+   `sync_upcoming` / `sync_past` as an exception. `models._to_datetime` now turns it into a validation
+   error (booleans are rejected too), `client._typed` also treats `TypeError` / `ArithmeticError` /
+   `OSError` as a malformed item, and `sync._consume` records any unexpected iterator exception in the
+   report instead of raising. Tests: `test_absurd_timestamps_are_validation_errors`,
+   `test_absurd_timestamp_and_unhashable_id_do_not_abort_the_sync`.
+2. (major) A list item with a non-hashable `id` (list / object) crashed `paginate`'s de-duplication
+   with `TypeError`, aborting the batch. Only int / str ids are de-duplicated now; the item reaches
+   validation and is reported as malformed. Test: `test_unhashable_ids_are_passed_on_not_fatal`.
+3. (major) A server that ignores `page[number]` but keeps sending `rel="next"` made `paginate` loop
+   forever (de-duplication hid the repeats, so the loop never ended). It now stops when a page holds
+   only rows already yielded. Test: `test_pagination_stops_when_the_server_ignores_page_numbers`.
+4. (major) Cross-source status flip-flop: for a linked match HLTV marked "Match deleted" (CANCELED)
+   while PandaScore still listed it `not_started`, PandaScore set SCHEDULED and the next HLTV sync set
+   CANCELED again (its merge never moves CANCELED back), on every run - the betting pipeline would see
+   a cancelled match as open every other cycle. PandaScore now keeps CANCELED in that case unless it
+   reports the match finished (then FINISHED wins, as both syncs agree). Tests:
+   `test_hltv_deleted_match_is_not_reopened_by_pandascore`,
+   `test_pandascore_finished_still_overrides_an_hltv_deletion`.
+5. (minor) `store_out_of_scope=False` decided with today's `Team.hltv_rank`, so a backfill stored old
+   matches of teams that only became good later (and could drop ones of teams that were top-N then).
+   It now uses `scope.team_rank_as_of` like `refresh_match_scope`. Test:
+   `test_store_out_of_scope_false_uses_the_rank_as_of_the_match`.
+6. (minor) The running-matches list ignored `options.max_pages`; malformed-item error messages echoed
+   an untrusted id of unbounded length (now truncated to 40 characters).
+
+**Remaining concerns (not fixed):**
+
+- If HLTV deletes a match because it was rescheduled under a NEW HLTV id, the PandaScore-linked row now
+  stays CANCELED and HLTV creates a second, HLTV-only row for the new date (`find_match` will not reuse
+  a row carrying another `hltv_id`). Before this review the same case produced a flip-flopping row plus
+  that duplicate. A proper fix needs the HLTV sync to relink (`hltv_id` replacement) when the linked
+  row is a deleted match of the same teams - an HLTV package change.
+- An existing PandaScore match whose teams changed while it is HLTV-linked is reported as an error on
+  every run (by design: it never rewrites a row HLTV owns); this needs a human look when it appears.
+- `refresh_match_scope` is sticky, and recent matches (< 45 days) use today's rank: a mild selection
+  effect for datasets, documented in `scope.py`.
+- Everything is still unverified against the live API (no token); see "Known limitations".

@@ -30,10 +30,21 @@ from cs2bot.utils.time import parse_datetime
 
 
 def _to_datetime(value: Any) -> datetime | None:
+    """Timestamp -> aware UTC datetime; anything unusable raises ``ValueError`` (= a ValidationError).
+
+    ``datetime.fromtimestamp`` raises ``OverflowError`` / ``OSError`` for out-of-range numbers, which
+    pydantic would NOT turn into a ValidationError: one absurd number in one item would then escape
+    the per-item error handling and abort a whole list. Booleans are not timestamps.
+    """
     if value is None or value == "":
         return None
+    if isinstance(value, bool):
+        raise ValueError("not a timestamp: bool")
     if isinstance(value, str | int | float | datetime):
-        return parse_datetime(value)
+        try:
+            return parse_datetime(value)
+        except (OverflowError, OSError) as exc:
+            raise ValueError(f"timestamp out of range: {value!r}"[:80]) from exc
     raise ValueError(f"not a timestamp: {type(value).__name__}")
 
 

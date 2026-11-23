@@ -899,7 +899,12 @@ def test_predict_for_sequences_gives_one_estimate_per_map() -> None:
     want = 0.6 * as_pick.p_team1_win + 0.4 * as_decider.p_team1_win
     assert mixed["nuke"].p_team1_win == pytest.approx(want)
     assert as_pick.p_team1_win < mixed["nuke"].p_team1_win < as_decider.p_team1_win
-    assert mixed["nuke"].sigma == pytest.approx(0.6 * as_pick.sigma + 0.4 * as_decider.sigma)
+    # law of total variance over the two picker scenarios (review round 1: was a plain average)
+    mean_sq = 0.6 * (as_pick.sigma**2 + as_pick.p_team1_win**2) + 0.4 * (
+        as_decider.sigma**2 + as_decider.p_team1_win**2
+    )
+    assert mixed["nuke"].sigma == pytest.approx(math.sqrt(mean_sq - want**2))
+    assert mixed["nuke"].sigma > 0.6 * as_pick.sigma + 0.4 * as_decider.sigma - 1e-12
     assert mixed["nuke"].components["p_picked_by_team2"] == pytest.approx(0.6)
     assert mixed["nuke"].components["pick_shift"] == pytest.approx(-0.4 * 0.6)
     assert mixed["mirage"].p_team1_win == pytest.approx(
@@ -931,3 +936,14 @@ def test_sigma_matches_the_real_error_against_ground_truth() -> None:
     assert sum(abs(z) < 2.0 for z in z_scores) / n > 0.85
     assert math.sqrt(sum(e * e for e in errors) / n) < 0.2
     assert abs(sum(errors) / n) < 0.06  # no systematic bias toward team1 / team2
+
+
+def test_negative_round_counts_are_ignored() -> None:
+    """Review round 1: a malformed score (negative rounds) must not be rated as a draw-like result."""
+    model = MapRatingModel()
+    assert model.update(map_result(1, 1, 2, score=(-1, 13))) is False
+    assert model.update(map_result(2, 1, 2, score=(13, -3), day=1)) is False
+    assert model.n_processed == 0
+    assert model.update(map_result(3, 1, 2, score=(13, 5), day=2)) is True
+    wf = evaluate_walk_forward(MapRatingModel(), [map_result(4, 1, 2, score=(-2, 13), day=3)])
+    assert wf.n == 0

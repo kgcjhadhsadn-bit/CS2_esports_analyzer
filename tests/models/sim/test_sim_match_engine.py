@@ -224,14 +224,14 @@ def test_player_props_scopes(
     )
     for core in (pred.central, pred.low, pred.high):
         assert core is not None
-        assert set(core.player_kills_by_scope) == {"map:1", "map:2", "map:3", "maps:1,2", "match"}
+        scopes = {"map:1", "map:2", "map:3", "maps:1,2", "maps:1,2,3", "match"}
+        assert set(core.player_kills_by_scope) == scopes
         for scope, projs in core.player_kills_by_scope.items():
             assert set(projs) == {str(p.player_id) for p in players}
             for proj in projs.values():
                 assert sum(proj.kills_pmf.values()) == pytest.approx(1.0), scope
                 assert proj.kills_var > 0
-        base_scopes = {"map:1", "map:2", "map:3", "maps:1,2", "match"}
-        for scope in base_scopes:
+        for scope in scopes:
             assert sum(core.top_fragger[scope].values()) == pytest.approx(1.0)
             for team in ("team1", "team2"):
                 assert sum(core.top_fragger[f"{scope}|{team}"].values()) == pytest.approx(1.0)
@@ -245,6 +245,13 @@ def test_player_props_scopes(
             exp_match = sum(s.p_played * k[f"map:{s.map_number}"][pid].kills_mean for s in core.slots)
             assert k["match"][pid].kills_mean == pytest.approx(exp_match, rel=1e-6)
             assert core.slots[0].players[pid] == k["map:1"][pid]
+            # maps 1-3 given that map 3 is played (1-1 after two maps): close to the sum of the slot
+            # means (only the score skew moves it), and above the two-map total
+            three = k["maps:1,2,3"][pid].kills_mean
+            assert three == pytest.approx(
+                k["maps:1,2"][pid].kills_mean + k["map:3"][pid].kills_mean, rel=0.03
+            )
+            assert three > k["maps:1,2"][pid].kills_mean
 
 
 def test_player_kill_mean_is_kpr_times_expected_rounds(
@@ -320,3 +327,142 @@ def test_zero_sigma_scenarios_reuse_central_run() -> None:
     assert pred.sigma_team1_win == 0.0
     for k in range(3):
         assert pred.low.slots[k].score_pmf == pred.central.slots[k].score_pmf == pred.high.slots[k].score_pmf
+
+
+# ------------------------------------------------------------------------------------------- review round 1
+
+
+def test_race_to_n_published_for_every_target_with_void_mass() -> None:
+    seq = [MapSequenceProbability(maps=["nuke"], pickers=[None], probability=1.0)]
+    slot = _predict(MatchFormat.BO1, seq).central.slots[0]
+    assert set(slot.p_team1_race_to) == {str(n) for n in range(1, 17)}
+    assert set(slot.p_neither_race_to) == set(slot.p_team1_race_to)
+    scores = {tuple(int(x) for x in k.split("-")): p for k, p in slot.score_pmf.items()}
+    for key, p1 in slot.p_team1_race_to.items():
+        n = int(key)
+        neither = slot.p_neither_race_to[key]
+        expected_neither = sum(p for (a, b), p in scores.items() if max(a, b) < n)
+        assert neither == pytest.approx(expected_neither, abs=1e-9)
+        assert 0.0 <= p1 <= 1.0 - neither + 1e-9
+        if n <= 13:
+            assert neither == 0.0
+    assert slot.p_neither_race_to["16"] == pytest.approx(1.0 - slot.p_overtime, abs=1e-9)
+
+
+def test_bo5_prefix_scopes_and_conditional_top_fragger(
+    fitted_kill_model: PlayerKillModel, synthetic_universe: SynthUniverse
+) -> None:
+    uni = synthetic_universe
+    players = lineup(uni, 1, 2)
+    pred = _predict(
+        MatchFormat.BO5,
+        veto_sequences(uni.map_pool, 5, n_seq=3, seed=21),
+        map_estimates=estimates(dict.fromkeys(uni.map_pool, 0.55)),
+        players=players,
+        kill_model=fitted_kill_model,
+        as_of=AS_OF,
+        top_fragger_samples=3000,
+    )
+    core = pred.central
+    prefixes = {"maps:1,2", "maps:1,2,3", "maps:1,2,3,4", "maps:1,2,3,4,5"}
+    assert prefixes <= set(core.player_kills_by_scope)
+    for scope in prefixes:
+        assert sum(core.top_fragger[scope].values()) == pytest.approx(1.0)
+        for proj in core.player_kills_by_scope[scope].values():
+            assert sum(proj.kills_pmf.values()) == pytest.approx(1.0)
+    pid = str(players[0].player_id)
+    means = [core.player_kills_by_scope[s][pid].kills_mean for s in sorted(prefixes, key=len)]
+    assert means == sorted(means)  # every extra map adds kills
+    assert core.player_kills_by_scope["maps:1,2,3,4,5"][pid].kills_mean > (
+        core.player_kills_by_scope["match"][pid].kills_mean
+    )  # all five maps played vs the unconditional match total
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        {"p_team1_win": float("nan")},
+        {"sigma": float("nan")},
+        {"sigma": -0.1},
+        {"p_team1_win": 1.5},
+    ],
+)
+def test_invalid_map_estimates_are_rejected(bad: dict[str, float]) -> None:
+    est = estimates(PROBS)
+    est["mirage"] = est["mirage"].model_copy(update=bad)
+    seq = [MapSequenceProbability(maps=["mirage"], pickers=[None], probability=1.0)]
+    with pytest.raises(ValueError, match="MapWinEstimate"):
+        _predict(MatchFormat.BO1, seq, map_estimates=est)
+    with pytest.raises(ValueError, match="logit_shift"):
+        _predict(MatchFormat.BO1, seq, logit_shift=float("inf"))
+
+
+def test_settings_and_context_helpers() -> None:
+    from cs2bot.config import ModelSettings
+    from cs2bot.domain.match import LineupPlayer, MatchContext
+    from cs2bot.models.match_engine import context_kwargs, economy_from_settings, engine_options
+
+    ms = ModelSettings(
+        n_map_simulations=1200, scenario_n_simulations=600, ot_start_money=12_500, random_seed=3
+    )
+    opts = engine_options(ms, match_id=42)
+    assert opts["n_sims"] == 1200 and opts["scenario_n_sims"] == 600
+    assert opts["economy"].ot_start_money == 12_500 and opts["top_fragger_samples"] == ms.top_fragger_samples
+    assert opts["seed"] == engine_options(ms, match_id=42)["seed"] != engine_options(ms, match_id=43)["seed"]
+    assert engine_options(ModelSettings(random_seed=None))["seed"] is None
+    assert economy_from_settings(ModelSettings()).ot_start_money == 10_000
+
+    from cs2bot.domain.enums import PlayerRole
+
+    ctx = MatchContext(
+        match_id=42,
+        scheduled_at=AS_OF,
+        format=MatchFormat.BO1,
+        team1_id=1,
+        team2_id=2,
+        team1_lineup=[LineupPlayer(player_id=10, nickname="a", role=PlayerRole.AWPER)],
+        team2_lineup=[LineupPlayer(player_id=20, nickname="b"), LineupPlayer(player_id=10, nickname="dup")],
+        start_sides={"de_mirage": Side.T},
+    )
+    kw = context_kwargs(ctx)
+    assert [(p.player_id, p.team, p.role) for p in kw["players"]] == [
+        (10, TeamSlot.TEAM1, PlayerRole.AWPER),
+        (20, TeamSlot.TEAM2, None),
+    ]
+    seq = [MapSequenceProbability(maps=["mirage"], pickers=[None], probability=1.0)]
+    pred = build_match_prediction(
+        **kw,
+        **opts,
+        veto_distribution=seq,
+        map_estimates=estimates(PROBS),
+        round_model=RoundModel.default(),
+        kill_model=PlayerKillModel(),
+        model_version="ctx",
+        created_at=AS_OF,
+        simulator=MapSimulator(),
+    )
+    assert pred.match_id == 42 and pred.components["start_sides"] == {"mirage": "t"}
+    assert pred.components["economy"]["ot_start_money"] == 12_500
+    assert pred.components["n_sims"] == {"central": 1200, "low": 600, "high": 600}
+    assert set(pred.central.slots[0].players) == {"10", "20"}
+
+
+def test_shared_simulator_is_thread_safe() -> None:
+    from concurrent.futures import ThreadPoolExecutor
+
+    seqs = veto_sequences(POOL, 3, n_seq=3, seed=31)
+    sim = MapSimulator(cache_size=4, calibration_cache_size=8)  # small caches -> constant eviction
+
+    def run(seed: int) -> float:
+        return _predict(MatchFormat.BO3, seqs, seed=seed, simulator=sim).central.slots[0].p_overtime
+
+    serial = [run(s) for s in (1, 2, 3, 4)]
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        parallel = list(pool.map(run, (1, 2, 3, 4)))
+    assert parallel == serial
+
+
+def test_top_fragger_samples_validated() -> None:
+    seq = [MapSequenceProbability(maps=["mirage"], pickers=[None], probability=1.0)]
+    with pytest.raises(ValueError, match="top_fragger_samples"):
+        _predict(MatchFormat.BO1, seq, top_fragger_samples=0)

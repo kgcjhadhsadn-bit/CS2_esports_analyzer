@@ -42,7 +42,9 @@ class HLTVSyncOptions:
     near_start_window_minutes: int = 120  # vetoes / lineups appear ~1 h before the start ...
     near_start_ttl_minutes: int = 10  # ... so re-fetch the match page often in that window
     match_link_window_hours: float = 12.0  # db.repo.find_match window when linking PandaScore matches
-    write_round_rows: bool = False  # also write HLTV round history into ``rounds`` (see sync docs)
+    # Also write complete HLTV round histories into ``rounds`` (source=HLTV). Maps that already have
+    # DEMO rounds are never touched; demo parsing later replaces the HLTV rows.
+    write_round_rows: bool = True
     max_news_articles: int = 100  # article pages fetched per sync_news call
     min_ranking_rows_for_cleanup: int = 30  # clear stale Team.hltv_rank only after a full ranking
     commit_every: int | None = None  # sync_results: commit after every N matches (long backfills)
@@ -72,11 +74,19 @@ def fetch_guard(report: SyncReport, what: str) -> Iterator[None]:
 def fetch_page(
     source: PageSource, report: SyncReport, path: str, what: str, *, max_age_minutes: int | None = None
 ) -> str | None:
-    """Fetch one page; on any fetch error record it in ``report`` and return None."""
+    """Fetch one page; on any fetch error record it in ``report`` and return None.
+
+    A :class:`ValueError` from the fetcher (a scraped link pointing at another host, refused by
+    :func:`cs2bot.ingest.hltv.fetcher.hltv_url`) is recorded as a failure too, never raised.
+    """
     try:
         with fetch_guard(report, what):
             html = source.get(path, max_age_minutes=max_age_minutes)
     except (HLTVBlockedError, HLTVNotFoundError, HLTVFetchError):
+        return None
+    except ValueError as exc:
+        report.failed += 1
+        report.add_error(f"{what}: {exc}")
         return None
     report.fetched_pages += 1
     return html
@@ -98,6 +108,31 @@ def _external_is_in_scope() -> Callable[..., Any] | None:
         return None
     fn = getattr(module, "is_in_scope", None)
     return fn if callable(fn) else None
+
+
+def rank_as_of(
+    session: Session, team: Team | None, when: datetime | None, *, now: datetime | None = None
+) -> int | None:
+    """HLTV rank of ``team`` that applies to a match at ``when``.
+
+    Delegates to ``cs2bot.ingest.scope.team_rank_as_of`` (ranking history for old matches, so a
+    backfill does not pull in 2023 matches of teams that are only good today); falls back to the
+    current ``Team.hltv_rank`` when that module is not available.
+    """
+    if team is None:
+        return None
+    try:
+        module = importlib.import_module("cs2bot.ingest.scope")
+        fn = getattr(module, "team_rank_as_of", None)
+    except ImportError:
+        fn = None
+    if callable(fn):
+        try:
+            value = fn(session, team, when, now=now)
+            return value if value is None or isinstance(value, int) else None
+        except Exception as exc:  # incompatible signature during parallel development
+            logger.debug("ingest.scope.team_rank_as_of failed (%s); using the current rank", exc)
+    return team.hltv_rank
 
 
 def in_scope(tier: Tier | None, rank1: int | None, rank2: int | None, scope: ScopeSettings) -> bool:
@@ -141,11 +176,12 @@ def resolve_hltv_player(
 ) -> Player | None:
     """Find or create a player seen in an HLTV match of ``team_id`` at ``seen_at``.
 
-    ``db.repo.resolve_player`` always moves ``current_team_id`` to the given team. When syncing old
-    matches (backfill walks newest -> oldest) that would leave players on their *oldest* team, so for
-    players already known by HLTV id the current team only moves when this match is newer than the
-    last HLTV sighting (``players.extra['hltv_team_seen_at']``). Stand-ins (``move_team=False``) never
-    move a known player's team.
+    When syncing old matches (a backfill walks newest -> oldest) blindly moving ``current_team_id``
+    would leave players on their *oldest* team, so for players already known by HLTV id the current
+    team only moves when this match is newer than the last HLTV sighting
+    (``players.extra['hltv_team_seen_at']``). Stand-ins (``move_team=False``) never move a known
+    player's team (``db.repo.resolve_player(update_current_team=False)``); a brand-new player still
+    gets the team they were seen with.
     """
     if not nickname:
         return None
@@ -158,6 +194,7 @@ def resolve_hltv_player(
             source=SOURCE,
             external_id=hltv_id,
             team_id=team_id,
+            update_current_team=move_team,
             country=country,
             real_name=real_name,
         )

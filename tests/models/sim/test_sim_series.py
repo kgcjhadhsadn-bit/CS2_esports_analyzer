@@ -8,7 +8,7 @@ import numpy as np
 import pytest
 
 from cs2bot.domain.enums import MatchFormat
-from cs2bot.models.sim_series import played_mask, series_outcome, series_sum_pmf
+from cs2bot.models.sim_series import played_mask, series_outcome, series_prefix_sum_pmf, series_sum_pmf
 
 
 def _brute(fmt: MatchFormat, p: list[float]) -> tuple[list[float], dict[tuple[int, int], float]]:
@@ -92,3 +92,46 @@ def test_played_mask_matches_probabilities() -> None:
     res = series_outcome(MatchFormat.BO5, p)
     np.testing.assert_allclose(mask.mean(axis=1), res.p_played, atol=0.005)
     assert played_mask(MatchFormat.BO2, won[:2]).all()
+
+
+@pytest.mark.parametrize("fmt", list(MatchFormat))
+def test_series_prefix_sum_pmf_matches_enumeration(fmt: MatchFormat) -> None:
+    """Sum of X_1..X_j conditional on map j being played, against brute-force enumeration."""
+    rng = np.random.default_rng(11)
+    n = fmt.n_maps
+    p = list(rng.uniform(0.2, 0.8, n))
+    pw = [rng.dirichlet(np.ones(4)) for _ in range(n)]
+    pl = [rng.dirichlet(np.ones(3)) for _ in range(n)]
+    need = fmt.maps_to_win
+    p_played = series_outcome(fmt, p).p_played
+    for upto in range(1, n + 1):
+        mass, got = series_prefix_sum_pmf(fmt, p, pw, pl, upto)
+        expected = np.zeros(4 * n + 1)
+        total = 0.0
+        for outcome in itertools.product((True, False), repeat=n):
+            prob = float(np.prod([p[k] if outcome[k] else 1 - p[k] for k in range(n)]))
+            a = b = 0
+            acc = np.array([1.0])
+            played = True
+            for k in range(upto):
+                if need is not None and max(a, b) >= need:
+                    played = False
+                    break
+                acc = np.convolve(acc, pw[k] if outcome[k] else pl[k])
+                a += outcome[k]
+                b += not outcome[k]
+            if played:
+                expected[: acc.size] += prob * acc
+                total += prob
+        assert mass == pytest.approx(total) and mass == pytest.approx(p_played[upto - 1])
+        np.testing.assert_allclose(got, (expected / total)[: got.size], atol=1e-12)
+        assert got.sum() == pytest.approx(1.0)
+    with pytest.raises(ValueError):
+        series_prefix_sum_pmf(fmt, p, pw, pl, n + 1)
+
+
+def test_series_prefix_sum_pmf_unplayable_map() -> None:
+    """BO3 map 3 cannot be played when one team surely wins maps 1 and 2."""
+    one = [np.array([0.0, 1.0])] * 3
+    mass, pmf = series_prefix_sum_pmf(MatchFormat.BO3, [1.0, 1.0, 0.5], one, one, 3)
+    assert mass == 0.0 and pmf.tolist() == [1.0]

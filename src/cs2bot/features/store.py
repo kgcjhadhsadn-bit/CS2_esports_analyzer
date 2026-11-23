@@ -7,8 +7,9 @@ by time once and keeps prefix sums, so a window aggregate is two binary searches
 Leakage rules (enforced here, relied upon by everything above)
 --------------------------------------------------------------
 * A query at ``as_of`` reads records with ``played_at`` **strictly before** ``as_of``.
-* Records of ``exclude_match_id`` are skipped as well, whatever their timestamps say (maps of the
-  match being predicted, should the caller pass an ``as_of`` after the match started).
+* With ``exclude_match_id`` the query time is cut at the start of that match when the store holds
+  it (:meth:`FeatureStore.cutoff`), and its records are skipped: a match is always predicted from
+  what was known before it began, even when the caller passes a later ``as_of``.
 * Values that are themselves derived from history (strength proxy, change-point filter, roster
   streaks) are computed online in chronological order and stored *per record*, so reading the value
   attached to "the last record before ``as_of``" cannot see the future either.
@@ -94,8 +95,8 @@ class _Series:
 
     def end(self, ts: float, exclude_match_id: int | None = None) -> int:
         """Number of leading records usable at ``ts``: strictly earlier than ``ts``, minus trailing
-        records of the excluded match (records of that match followed by other records are not
-        removed - callers therefore never pass a ``ts`` after the start of the excluded match).
+        records of the excluded match. Records of that match followed by other records would not be
+        removed; :meth:`FeatureStore.cutoff` guarantees ``ts`` never lies after its start.
         """
         i = bisect.bisect_left(self.t, ts)
         if exclude_match_id is not None:
@@ -539,12 +540,13 @@ class FeatureStore:
 
     def _index_players(self, player_maps: Iterable[PlayerMapRecord]) -> None:
         rows: dict[int, list[tuple[float, int, int, list[float]]]] = defaultdict(list)
-        standins: dict[tuple[int, int], set[int]] = defaultdict(set)
+        standins: dict[tuple[int, int], set[int]] = {}
         for p in player_maps:
             if p.rounds_played <= 0:
                 continue
+            fielded = standins.setdefault((p.match_id, p.team_id), set())  # known, maybe 0 stand-ins
             if p.is_standin:
-                standins[(p.match_id, p.team_id)].add(p.player_id)
+                fielded.add(p.player_id)
             rounds = float(p.rounds_played)
             kast = None if p.kast is None else (p.kast / 100.0 if p.kast > 1.5 else p.kast)
             has_opening = p.first_kills is not None and p.first_deaths is not None
@@ -649,11 +651,24 @@ class FeatureStore:
         """Earliest ``played_at`` among the indexed maps of a match (the pre-match ``as_of``)."""
         return self._match_start.get(match_id)
 
+    def cutoff(self, as_of: datetime, exclude_match_id: int | None = None) -> datetime:
+        """The effective query time: ``as_of``, or the start of ``exclude_match_id`` when earlier.
+
+        Predicting a match means knowing nothing from its start on - neither its own maps nor other
+        teams' results that came in while it was being played. Every query that takes an
+        ``exclude_match_id`` is therefore cut at the start of that match when the store holds it.
+        """
+        t = ensure_utc(as_of)
+        if exclude_match_id is not None:
+            start = self._match_start.get(exclude_match_id)
+            if start is not None and start < t:
+                return start
+        return t
+
     def standin_count(self, match_id: int, team_id: int) -> int | None:
-        """Stand-ins a team fielded in an indexed match (``None`` without player records)."""
-        if not self.has_player_data:
-            return None
-        return self._standins.get((match_id, team_id), 0)
+        """Stand-ins a team fielded in an indexed match; ``None`` when the store holds no stat line of
+        that team in that match (unknown - not "no stand-in")."""
+        return self._standins.get((match_id, team_id))
 
     def last_lineup(
         self, team_id: int, as_of: datetime, *, exclude_match_id: int | None = None
@@ -662,24 +677,31 @@ class FeatureStore:
         team = self._teams.get(team_id)
         if team is None:
             return ()
-        e = team.series.end(ensure_utc(as_of).timestamp(), exclude_match_id)
+        e = team.series.end(self.cutoff(as_of, exclude_match_id).timestamp(), exclude_match_id)
         return tuple(sorted(team.ref_lineup[e - 1])) if e > 0 else ()
 
     def recent_regime_break(
         self, team_id: int, as_of: datetime, *, exclude_match_id: int | None = None
     ) -> RegimeBreak:
         """See :meth:`cs2bot.features.meta.RegimeDetector.recent_regime_break`."""
-        return self._regimes.recent_regime_break(team_id, as_of, exclude_match_id=exclude_match_id)
+        return self._regimes.recent_regime_break(
+            team_id, self.cutoff(as_of, exclude_match_id), exclude_match_id=exclude_match_id
+        )
 
     def form_trend(self, team_id: int, as_of: datetime, *, exclude_match_id: int | None = None) -> float:
         """See :meth:`cs2bot.features.meta.RegimeDetector.form_trend`."""
-        return self._regimes.form_trend(team_id, as_of, exclude_match_id=exclude_match_id)
+        return self._regimes.form_trend(
+            team_id, self.cutoff(as_of, exclude_match_id), exclude_match_id=exclude_match_id
+        )
 
     def team_strength(
         self, team_id: int, map_name: str | None, as_of: datetime, *, exclude_match_id: int | None = None
     ) -> tuple[float, float]:
         """(overall proxy rating, map offset) before ``as_of``; NaN for a team / map without history."""
-        return self._strength(team_id, map_name, ensure_utc(as_of).timestamp(), exclude_match_id)
+        if map_name is not None:
+            map_name = normalize_map_name(map_name)
+        ts = self.cutoff(as_of, exclude_match_id).timestamp()
+        return self._strength(team_id, map_name, ts, exclude_match_id)
 
     def _strength(
         self, team_id: int, map_name: str | None, ts: float, exclude: int | None
@@ -718,7 +740,8 @@ class FeatureStore:
         lineup (``None`` = unknown -> NaN).
         """
         cfg = self.config
-        ts = ensure_utc(as_of).timestamp()
+        as_of = self.cutoff(as_of, exclude_match_id)
+        ts = as_of.timestamp()
         map_name = normalize_map_name(map_name)
         out: dict[str, float] = {}
         team = self._teams.get(team_id)
@@ -726,7 +749,8 @@ class FeatureStore:
         e = s.end(ts, exclude_match_id) if s is not None else 0
 
         def window(days: int) -> tuple[int, int]:
-            return (s.start(ts - days * _DAY), e) if s is not None else (0, 0)
+            # min(): never a negative count, whatever ``exclude_match_id`` removed
+            return (min(s.start(ts - days * _DAY), e), e) if s is not None else (0, 0)
 
         # -- form: win rate and round differential per map, overall
         for days in cfg.form_windows_days:
@@ -741,7 +765,7 @@ class FeatureStore:
         ms = tm.series if tm is not None else None
         me = ms.end(ts, exclude_match_id) if ms is not None else 0
         for days in cfg.map_form_windows_days:
-            lo = ms.start(ts - days * _DAY) if ms is not None else 0
+            lo = min(ms.start(ts - days * _DAY), me) if ms is not None else 0
             n = me - lo
             out[f"map_maps_{days}d"] = float(n)
             out[f"map_win_rate_{days}d"] = _rate(ms.total("win", lo, me), n) if ms is not None else NAN
@@ -755,7 +779,7 @@ class FeatureStore:
         out[f"adj_win_{d}d"] = _rate(s.total("wresid", lo, hi), n) if s is not None else NAN
         out[f"opp_strength_{d}d"] = _rate(s.total("opp_elo", lo, hi), n) if s is not None else NAN
         d = cfg.map_adjusted_window_days
-        lo = ms.start(ts - d * _DAY) if ms is not None else 0
+        lo = min(ms.start(ts - d * _DAY), me) if ms is not None else 0
         out[f"map_adj_round_share_{d}d"] = (
             _rate(ms.total("resid", lo, me), me - lo) if ms is not None else NAN
         )
@@ -809,7 +833,7 @@ class FeatureStore:
             _rate(s.total("t_w", lo, hi), s.total("t_n", lo, hi)) if s is not None else NAN
         )
         d = cfg.map_side_window_days
-        lo = ms.start(ts - d * _DAY) if ms is not None else 0
+        lo = min(ms.start(ts - d * _DAY), me) if ms is not None else 0
         out[f"map_ct_win_pct_{d}d"] = (
             _rate(ms.total("ct_w", lo, me), ms.total("ct_n", lo, me)) if ms is not None else NAN
         )
@@ -926,7 +950,7 @@ class FeatureStore:
         for name in self._maps_of_team.get(team_id, ()):
             tm = self._team_maps[(team_id, name)]
             hi = tm.series.end(ts, exclude)
-            lo = tm.series.start(since)
+            lo = min(tm.series.start(since), hi)
             n = hi - lo
             if n >= cfg.pool_min_maps:
                 depth += 1
@@ -937,7 +961,7 @@ class FeatureStore:
                 this_picks = tm.series.total("pick_own", lo, hi)
         total_n = total_picks = 0.0
         if s is not None:
-            lo = s.start(since)
+            lo = min(s.start(since), e)
             total_n = float(e - lo)
             total_picks = s.total("pick_own", lo, e)
         known = s is not None and e > 0
@@ -962,7 +986,8 @@ class FeatureStore:
         ms = self._veto_team_map.get((team_id, map_name))
         if ms is None:
             return {f"map_ban_rate_{d}d": 0.0, f"map_pick_rate_{d}d": 0.0}
-        lo, hi = ms.start(since), ms.end(ts, exclude)
+        hi = ms.end(ts, exclude)
+        lo = min(ms.start(since), hi)
         return {
             f"map_ban_rate_{d}d": ms.total("ban", lo, hi) / n,
             f"map_pick_rate_{d}d": ms.total("pick", lo, hi) / n,
@@ -1087,7 +1112,7 @@ class FeatureStore:
           probability of team1.
         """
         cfg = self.config
-        ts = ensure_utc(as_of).timestamp()
+        ts = self.cutoff(as_of, exclude_match_id).timestamp()
         map_name = normalize_map_name(map_name)
         out = {
             "h2h_maps": 0.0,
@@ -1129,7 +1154,7 @@ class FeatureStore:
         currently plays); ``map_global_maps``: how many times it was played (popularity / sample).
         """
         d = self.config.map_meta_window_days
-        ts = ensure_utc(as_of).timestamp()
+        ts = self.cutoff(as_of, exclude_match_id).timestamp()
         ms = self._maps.get(normalize_map_name(map_name))
         if ms is None:
             return {f"map_ct_round_share_{d}d": NAN, f"map_global_maps_{d}d": 0.0}

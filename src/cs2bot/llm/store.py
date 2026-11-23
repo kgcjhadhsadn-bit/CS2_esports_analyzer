@@ -320,7 +320,9 @@ def select_news_for_match(
       attached) or one of the players in the context's lineups (``player_ids``);
     * **relevant** - triaged with a label other than ``irrelevant`` and ``relevance >= min_relevance``.
       Items that have not been triaged yet are included too (``include_untriaged``), so a triage
-      outage cannot hide a fresh roster story from the context model.
+      outage cannot hide a fresh roster story from the context model. A verdict whose ``triaged_at``
+      lies after ``now`` is ignored (the item counts as untriaged), so a historical ``now`` sees
+      only what was known then.
 
     In addition, up to ``max_global`` recent ``meta_patch`` items (game updates / map-pool changes)
     are included although they mention neither team.
@@ -350,16 +352,22 @@ def select_news_for_match(
         when = _news_time(row)
         if when is None or when > current or when < since:
             continue
-        label = row.triage_label
+        # A verdict written after ``now`` did not exist yet at ``now`` (historical replays): the item
+        # is then treated exactly like an untriaged one, including the team ids the verdict attached.
+        known_verdict = row.triage_label is not None and (
+            row.triaged_at is None or ensure_utc(row.triaged_at) <= current
+        )
+        label = row.triage_label if known_verdict else None
         if label == TriageLabel.IRRELEVANT.value:
             continue
         triaged = label is not None
-        relevance = float(row.relevance) if row.relevance is not None else 0.0
+        relevance = float(row.relevance) if triaged and row.relevance is not None else 0.0
         if triaged and relevance < threshold:
             continue
         if not triaged and not include_untriaged:
             continue
-        mentions = bool(team_ids & _mentioned_team_ids(row)) or bool(player_ids & _int_set(row.player_ids))
+        mentioned = _mentioned_team_ids(row) if triaged else _int_set(row.team_ids)
+        mentions = bool(team_ids & mentioned) or bool(player_ids & _int_set(row.player_ids))
         rank = relevance if triaged else _UNTRIAGED_RANK
         if mentions:
             specific.append((rank, when, row))

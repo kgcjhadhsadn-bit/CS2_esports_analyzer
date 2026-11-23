@@ -3,13 +3,15 @@
 from __future__ import annotations
 
 import itertools
+from datetime import timedelta
 
 import pytest
 
 from cs2bot.domain.enums import MatchFormat, TeamSlot
 from cs2bot.domain.predictions import MapSequenceProbability
+from cs2bot.models.ratings import MapRatingModel, RatingConfig
 from cs2bot.models.veto import VetoModel, map_slot_distribution, p_map_played
-from cs2bot.models.veto_truncation import slot_marginal_rank, truncate_sequences
+from cs2bot.models.veto_truncation import marginal_rank, slot_marginal_rank, truncate_sequences
 from cs2bot.testing.synthetic import SynthUniverse
 
 from .rv_helpers import POOL7, universe, veto_steps
@@ -61,10 +63,10 @@ def test_default_top_k_keeps_slot_marginals_exact(
         for m in uni.map_pool:
             assert p_map_played(cut, m) == pytest.approx(p_map_played(full, m), abs=1e-9)
         # the most likely sequences are all kept and never lose probability
-        rank = slot_marginal_rank([_key(s) for s in full])
+        rank = marginal_rank([_key(s) for s in full])
         head = full[: 50 - rank]
         got = {_key(s): s.probability for s in cut}
-        assert len(head) >= 19
+        assert len(head) >= 12
         assert all(got[_key(s)] >= s.probability - 1e-12 for s in head)
 
 
@@ -158,3 +160,64 @@ def test_known_steps_and_truncation_work_together(fitted: tuple[VetoModel, Synth
     assert len(full) > 40 >= len(cut)
     assert all("nuke" not in s.maps for s in cut)
     assert _max_slot_error(full, cut, uni.map_pool) < 1e-9
+
+
+def _picker_marginals(seqs: list[MapSequenceProbability]) -> dict[tuple[str, object], float]:
+    """P(slot k picked by p) and P(map m picked by p) of a sequence list."""
+    out: dict[tuple[str, object], float] = {}
+    total = sum(s.probability for s in seqs)
+    for s in seqs:
+        for k, (m, p) in enumerate(zip(s.maps, s.pickers, strict=True)):
+            for cell in ((f"slot{k}", p), (m, p)):
+                out[cell] = out.get(cell, 0.0) + s.probability / total
+    return out
+
+
+@pytest.mark.parametrize("fmt", [MatchFormat.BO3, MatchFormat.BO5])
+def test_truncation_keeps_picker_marginals_when_the_first_veto_is_unknown(
+    fitted: tuple[VetoModel, SynthUniverse], fmt: MatchFormat
+) -> None:
+    """Review round 1: ties between mirrored sequences of unknown (evenly rated) teams were broken
+    toward team1, so the cut list said team1 picks map 1 with probability ~0.95-0.99 instead of 0.5."""
+    model, uni = fitted
+    for team1, team2 in [(990001, 990002), (1, 2)]:
+        full = model.predict_sequences(team1, team2, fmt, uni.map_pool, first_veto=None, top_k=None)
+        cut = model.predict_sequences(team1, team2, fmt, uni.map_pool, first_veto=None)
+        assert len(cut) <= 50 < len(full)
+        want, got = _picker_marginals(full), _picker_marginals(cut)
+        assert set(got) <= set(want)
+        assert max(abs(want[c] - got.get(c, 0.0)) for c in want) < 1e-9
+        if team1 == 990001:
+            assert got[("slot0", T1)] == pytest.approx(0.5, abs=1e-9)
+        assert _max_slot_error(full, cut, uni.map_pool) < 1e-9
+
+
+def test_per_map_estimates_are_the_same_from_the_cut_list(fitted: tuple[VetoModel, SynthUniverse]) -> None:
+    """``predict_for_sequences`` (which reads who picked each map) gives identical estimates."""
+    model, uni = fitted
+    recs = uni.map_results()
+    ratings = MapRatingModel(RatingConfig(pick_advantage=0.3)).fit(recs)
+    as_of = max(r.played_at for r in recs) + timedelta(days=1)
+    full = model.predict_sequences(3, 11, MatchFormat.BO5, uni.map_pool, first_veto=None, top_k=None)
+    cut = model.predict_sequences(3, 11, MatchFormat.BO5, uni.map_pool, first_veto=None)
+    a = ratings.predict_for_sequences(3, 11, full, as_of)
+    b = ratings.predict_for_sequences(3, 11, cut, as_of)
+    assert set(a) == set(b)
+    for m in a:
+        assert b[m].p_team1_win == pytest.approx(a[m].p_team1_win, abs=1e-9)
+        assert b[m].sigma == pytest.approx(a[m].sigma, abs=1e-9)
+
+
+def test_marginal_rank_with_unknown_first_veto() -> None:
+    def keys(n_slots: int, pattern: tuple[TeamSlot | None, ...]) -> list[Key]:
+        return [tuple(zip(maps, pattern, strict=True)) for maps in itertools.permutations(POOL7, n_slots)]
+
+    bo3, bo3_rev = keys(3, (T1, T2, None)), keys(3, (T2, T1, None))
+    bo5, bo5_rev = keys(5, (T1, T2, T1, T2, None)), keys(5, (T2, T1, T2, T1, None))
+    # a known order: the pickers follow from the slots, nothing to add
+    assert marginal_rank(bo3) == slot_marginal_rank(bo3) == 19
+    assert marginal_rank(bo5) == slot_marginal_rank(bo5) == 31
+    # unknown order: one extra constraint per map
+    assert marginal_rank(bo3 + bo3_rev) == 26
+    assert marginal_rank(bo5 + bo5_rev) == 38
+    assert marginal_rank([]) == 0

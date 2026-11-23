@@ -129,6 +129,9 @@ MIN_MATCH_ROUNDS = 13  # a map cannot end before one team has 13 rounds
 
 POST_ROUND_SECONDS = 7.0  # mp_round_restart_delay: used when round_officially_ended is missing
 UTILITY_DAMAGE_WEAPONS: frozenset[str] = frozenset({"hegrenade", "inferno", "molotov", "incgrenade"})
+# Deaths caused by the bomb blast (or the map) are never a player's kill, whoever the event names as
+# the attacker: the scoreboard and HLTV credit nobody with them. They still count as deaths.
+NON_KILL_WEAPONS: frozenset[str] = frozenset({"planted_c4", "c4", "world", "trigger_hurt"})
 
 EVENT_NAMES: tuple[str, ...] = (
     "round_start",
@@ -879,7 +882,9 @@ def _clean_rounds(
     cleaned: list[list[_RawRound]] = []
     for segment in segments:
         offset = 0
-        if _is_knife_round(segment[0], deaths, hurts):
+        # Only the very first round of a (re)started match can be the knife round: a demo that starts
+        # recording late can open with a gun round that happens to be decided by a knife kill.
+        if segment[0].trp_eff == 0 and _is_knife_round(segment[0], deaths, hurts):
             segment = segment[1:]
             offset = 1
             knife += 1
@@ -1038,10 +1043,16 @@ def _blinds_from_flash_duration(
 
 
 def _mark_trades(kills: list[_Death], window_ticks: float) -> None:
-    """Set ``is_trade`` / ``was_traded`` on the enemy kills of one round (ordered by tick)."""
+    """Set ``is_trade`` / ``was_traded`` on the enemy kills of one round (ordered by tick).
+
+    Kills on the same tick are considered in both orders: the demo does not guarantee that a
+    player's kill is listed before his own death when both happen on one tick.
+    """
     enemy_kills = [k for k in kills if k.enemy and k.attacker is not None and k.victim is not None]
     for i, first in enumerate(enemy_kills):
-        for later in enemy_kills[i + 1 :]:
+        for j, later in enumerate(enemy_kills):
+            if j == i or later.tick < first.tick:
+                continue
             if later.tick - first.tick > window_ticks:
                 break
             if (
@@ -1269,6 +1280,7 @@ def _parse(
             death.enemy = (
                 death.attacker is not None
                 and death.attacker != death.victim
+                and death.weapon not in NON_KILL_WEAPONS
                 and (
                     death.attacker_side is None
                     or death.victim_side is None

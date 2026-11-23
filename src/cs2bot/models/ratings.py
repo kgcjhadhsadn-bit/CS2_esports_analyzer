@@ -449,8 +449,8 @@ class MapRatingModel:
         """Process one finished map. Records must arrive in chronological order.
 
         Returns ``False`` (and changes nothing) for an already processed ``(match_id, map_number)``
-        or a record without a winner / with identical teams; raises ``ValueError`` for a record
-        older than the last processed one.
+        or a record without a winner / with identical teams / with a negative round count; raises
+        ``ValueError`` for a record older than the last processed one.
         """
         key = (record.match_id, record.map_number)
         if key in self._processed:
@@ -461,7 +461,12 @@ class MapRatingModel:
                 f"records must be processed chronologically: {t.isoformat()} is before the last "
                 f"processed game {self._last.isoformat()}"
             )
-        if record.team1_id == record.team2_id or record.team1_rounds == record.team2_rounds:
+        if (
+            record.team1_id == record.team2_id
+            or record.team1_rounds == record.team2_rounds
+            or record.team1_rounds < 0
+            or record.team2_rounds < 0
+        ):
             return False
         self._process(record, t)
         self._processed.add(key)
@@ -810,8 +815,9 @@ class MapRatingModel:
         match engine takes a single estimate per map, but the same map can be picked by either team
         (or be the decider) in different sequences. ``picked_by`` of the returned estimate is the
         picker when it is the same in every sequence containing the map, else ``None``; with
-        ``config.pick_advantage != 0`` the probability and sigma are the averages over the picker
-        scenarios weighted by their sequence probability (the marginal over the veto uncertainty).
+        ``config.pick_advantage != 0`` the probability is the average over the picker scenarios
+        weighted by their sequence probability (the marginal over the veto uncertainty) and sigma
+        the standard deviation of that mixture (law of total variance).
         """
         t = self._check_as_of(as_of)
         weights: dict[str, dict[TeamSlot | None, float]] = {}
@@ -835,7 +841,10 @@ class MapRatingModel:
                 continue
             modal = max(by_picker, key=lambda k: by_picker[k])
             p = sum(by_picker[k] * ests[k].p_team1_win for k in ests) / total
-            sd = sum(by_picker[k] * ests[k].sigma for k in ests) / total
+            # Law of total variance over the picker scenarios: the spread of p within a scenario
+            # (rating uncertainty) plus the spread between the scenarios' means.
+            second = sum(by_picker[k] * (ests[k].sigma ** 2 + ests[k].p_team1_win ** 2) for k in ests) / total
+            sd = math.sqrt(max(second - p * p, 0.0))
             components = dict(ests[modal].components)
             components["map"] = p
             components["overall"] = sum(by_picker[k] * ests[k].components["overall"] for k in ests) / total
@@ -1313,7 +1322,11 @@ def evaluate_walk_forward(model: MapRatingModel, records: Iterable[MapResultReco
             model.update(recs[idx])
             continue
         for r in by_match[mid]:
-            if r.team1_rounds == r.team2_rounds or r.team1_id == r.team2_id:
+            if (
+                r.team1_rounds == r.team2_rounds
+                or r.team1_id == r.team2_id
+                or min(r.team1_rounds, r.team2_rounds) < 0
+            ):
                 continue
             est = model.predict(
                 r.team1_id,

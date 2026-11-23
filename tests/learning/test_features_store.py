@@ -12,7 +12,7 @@ from sqlalchemy.orm import Session
 from cs2bot import datasets
 from cs2bot.domain.enums import BuyType, MatchFormat, Side, TeamSlot, Tier
 from cs2bot.domain.records import MapResultRecord, PlayerMapRecord, RoundRecord
-from cs2bot.features import FeatureConfig, FeatureStore, build_training_rows
+from cs2bot.features import FeatureConfig, FeatureStore, build_training_rows, match_map_features
 from cs2bot.testing.synthetic import SynthUniverse, generate_universe
 from tests.learning.learning_helpers import same_features
 
@@ -296,6 +296,8 @@ def test_round_level_and_player_aggregates():
     assert f1["pl_awp_share_max"] == pytest.approx(18 / 27) and f1["pl_awp_kpr_max"] == pytest.approx(1.0)
     assert f2["pl_known"] == 1 and math.isnan(f2["pl_rating_mean"]) and math.isnan(f2["pl_awp_share_max"])
     assert store.standin_count(1, 1) == 1 and store.standin_count(1, 2) == 0
+    # no stat line of that team in that match: unknown, not "no stand-in"
+    assert store.standin_count(1, 99) is None and store.standin_count(424242, 1) is None
 
 
 def test_features_on_the_synthetic_universe_are_complete_and_sane(universe_store: FeatureStore):
@@ -466,3 +468,46 @@ def test_store_from_session_equals_store_from_records(learning_db: Session, univ
     assert 0 < len(half) < len(store) and not half.has_round_data
     assert all(r.played_at < cut for r in half.map_results)
     assert len(datasets.load_map_results(learning_db, until=cut)) == len(half)
+
+
+def test_excluded_match_cuts_every_query_at_its_start():
+    """With ``exclude_match_id`` a later ``as_of`` must neither see the match itself nor anything that
+    happened after it began, and window counts never go negative."""
+    records = [_rec(k, float(k), 1, 2, (13, 5)) for k in range(1, 6)]
+    records += [_rec(10, 20, 1, 2, (13, 5)), _rec(11, 25, 1, 3, (2, 13)), _rec(12, 300, 1, 3, (2, 13))]
+    store = FeatureStore.build(records, patch_timeline=None)
+    start = store.match_start(10)
+    assert start == T0 + 20 * DAY
+    late = T0 + 200 * DAY
+    assert store.cutoff(late, 10) == start and store.cutoff(late) == late
+    assert store.cutoff(T0, 10) == T0  # an earlier as_of is kept
+    at_start = store.team_features(1, "mirage", start, exclude_match_id=10)
+    later = store.team_features(1, "mirage", late, exclude_match_id=10)
+    assert same_features(at_start, later) == []  # match 11 (day 25) stays invisible
+    assert later["maps_alltime"] == 5
+    assert not any(later[k] < 0 for k in later if k.startswith(("maps_", "map_maps_", "matches_")))
+    assert (
+        same_features(
+            store.matchup_features(1, 3, "mirage", late, exclude_match_id=10),
+            store.matchup_features(1, 3, "mirage", start, exclude_match_id=10),
+        )
+        == []
+    )
+    assert store.last_lineup(1, late, exclude_match_id=10) == store.last_lineup(1, start)
+    assert store.team_strength(1, "de_mirage", late, exclude_match_id=10) == store.team_strength(
+        1, "mirage", start
+    )
+    # the shared row builder cuts the meta features at the same instant
+    row_late = build_training_rows([records[5]], store=store)[0]
+    direct = match_map_features(
+        store,
+        team1_id=1,
+        team2_id=2,
+        map_name="mirage",
+        as_of=late,
+        tier=Tier.A,
+        fmt=MatchFormat.BO3,
+        team1_standins=None,
+        exclude_match_id=10,
+    )
+    assert same_features(direct, row_late.iloc[0].to_dict()) == []

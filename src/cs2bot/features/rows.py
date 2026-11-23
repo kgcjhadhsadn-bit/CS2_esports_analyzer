@@ -131,7 +131,9 @@ def match_map_features(
     ``store.config.use_start_side`` is on and the map was picked (see ``FeatureConfig``).
     """
     map_name = normalize_map_name(map_name)
-    as_of = ensure_utc(as_of)
+    # cut at the start of the excluded match (see FeatureStore.cutoff): the meta and rating features
+    # must be as of the same instant as the store features
+    as_of = store.cutoff(as_of, exclude_match_id)
     f1 = store.team_features(
         team1_id,
         map_name,
@@ -201,10 +203,7 @@ def features_for_match_map(
       already holds its maps (backtests over finished matches), and its records are excluded.
     """
     name = normalize_map_name(map_name)
-    t = ensure_utc(as_of)
-    start = store.match_start(ctx.match_id)
-    if start is not None and start < t:
-        t = start
+    t = store.cutoff(as_of, ctx.match_id)
     picker = _picker_from_veto(ctx, name) if picked_by == "auto" else picked_by
     lineup1 = [p.player_id for p in ctx.team1_lineup]
     lineup2 = [p.player_id for p in ctx.team2_lineup]

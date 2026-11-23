@@ -171,7 +171,9 @@ def test_sync_finished_bo3_creates_everything(session: Session, app_settings: Se
     assert vit.hltv_rank == 1 and navi.hltv_rank == 3
     assert vit.hltv_rank_updated_at == datetime(2026, 11, 16, tzinfo=UTC)
     assert count(session, TeamRanking) == 2
-    assert count(session, Round) == 0  # round history goes to maps_played.extra by default
+    # complete round histories also go to ``rounds`` (source HLTV)
+    assert count(session, Round) == 24 + 20 + 36
+    assert set(session.scalars(select(Round.source))) == {DataSource.HLTV}
 
 
 def test_sync_match_is_idempotent(session: Session, app_settings: Settings) -> None:
@@ -202,12 +204,57 @@ def test_round_history_is_kept_and_exposed_as_records(session: Session, app_sett
     assert {r.end_reason for r in records} <= set(RoundEndReason)
 
 
-def test_round_rows_are_opt_in(session: Session, app_settings: Settings) -> None:
-    opts = HLTVSyncOptions(write_round_rows=True)
+def test_round_rows_can_be_switched_off(session: Session, app_settings: Settings) -> None:
+    opts = HLTVSyncOptions(write_round_rows=False)
     sync_match(session, FakeFetcher(), 2378001, settings=app_settings, options=opts)
+    assert count(session, Round) == 0
+
+
+def test_round_rows_are_idempotent_and_never_overwrite_demo_rounds(
+    session: Session, app_settings: Settings
+) -> None:
+    sync_match(session, FakeFetcher(), 2378001, settings=app_settings)
     assert count(session, Round) == 24 + 20 + 36
-    sync_match(session, FakeFetcher(), 2378001, settings=app_settings, options=opts)
-    assert count(session, Round) == 24 + 20 + 36  # never duplicated / never touches existing rounds
+    m = match_by_hltv(session, 2378001)
+    maps = {mp.map_number: mp for mp in session.scalars(select(MapPlayed).where(MapPlayed.match_id == m.id))}
+    # a corrupted HLTV row is repaired on the next sync, an extra one removed
+    first = session.scalar(select(Round).where(Round.map_played_id == maps[1].id, Round.round_number == 1))
+    assert first is not None and first.source is DataSource.HLTV
+    expected_winner = first.winner_team_id
+    first.winner_team_id = None
+    session.add(
+        Round(
+            map_played_id=maps[1].id,
+            round_number=99,
+            team1_side=Side.CT,
+            winner_side=Side.CT,
+            source=DataSource.HLTV,
+        )
+    )
+    # map 2 was parsed from a demo: its rounds must survive the HLTV sync untouched
+    for r in session.scalars(select(Round).where(Round.map_played_id == maps[2].id)):
+        session.delete(r)
+    session.flush()
+    session.add(
+        Round(
+            map_played_id=maps[2].id,
+            round_number=1,
+            team1_side=Side.T,
+            winner_side=Side.T,
+            source=DataSource.DEMO,
+            ct_equipment_value=4100,
+        )
+    )
+    session.flush()
+    sync_match(session, FakeFetcher(), 2378001, settings=app_settings)
+    session.expire_all()
+    assert count(session, Round) == 24 + 1 + 36
+    repaired = session.scalar(select(Round).where(Round.map_played_id == maps[1].id, Round.round_number == 1))
+    assert repaired is not None and repaired.winner_team_id == expected_winner
+    assert session.scalar(select(Round).where(Round.round_number == 99)) is None
+    demo_rows = list(session.scalars(select(Round).where(Round.map_played_id == maps[2].id)))
+    assert len(demo_rows) == 1 and demo_rows[0].source is DataSource.DEMO
+    assert demo_rows[0].ct_equipment_value == 4100
 
 
 def test_links_pandascore_match_in_swapped_orientation(session: Session, app_settings: Settings) -> None:
@@ -473,6 +520,9 @@ def test_sync_results_uses_db_ranks_for_unstarred_matches(session: Session, app_
     ence = resolve_team(session, name="ENCE", source=DataSource.HLTV, external_id=4869)
     assert ence is not None
     ence.hltv_rank = 38  # top-50 -> the unstarred forfeit becomes relevant
+    # the ranking history makes the test independent of today's date (old matches use history)
+    session.add(TeamRanking(team_id=ence.id, source=DataSource.HLTV, rank=38, ranked_on=date(2026, 11, 16)))
+    session.flush()
     fetcher = FakeFetcher()
     sync_results(session, fetcher, settings=app_settings, since=datetime(2026, 11, 15, tzinfo=UTC))
     assert match_by_hltv(session, 2378030).status is MatchStatus.CANCELED
@@ -735,3 +785,104 @@ def test_standin_does_not_move_a_known_players_team(session: Session, app_settin
     assert known.current_team_id == home.id  # still his own team
     regular = player(session, 9216)  # FalleN, not a stand-in
     assert regular.current_team_id == team(session, 8297).id
+
+
+_OLD_RESULT_ROW = """<div class="results-sublist">
+<div class="standard-headline">Results for March 1st 2024</div>
+<div class="result-con" data-zonedgrouping-entry-unix="1709301600000">
+<a href="/matches/2300001/ence-vs-nobodies" class="a-reset"><div class="result"><table><tbody><tr>
+<td class="team-cell"><div class="line-align team1"><div class="team team-won">ENCE</div></div></td>
+<td class="result-score"><span class="score-won">2</span> - <span class="score-lost">0</span></td>
+<td class="team-cell"><div class="line-align team2"><div class="team">Nobodies</div></div></td>
+<td class="event"><span class="event-name">Some Cup 2024</span></td>
+<td class="star-cell"><div class="map-text">bo3</div></td>
+</tr></tbody></table></div></a></div></div>"""
+
+
+def test_backfill_relevance_uses_rank_at_match_time(session: Session, app_settings: Settings) -> None:
+    """A team that is top-5 *today* does not make its unstarred 2024 matches relevant by itself."""
+    ence = resolve_team(session, name="ENCE", source=DataSource.HLTV, external_id=4869)
+    assert ence is not None
+    ence.hltv_rank, ence.hltv_rank_updated_at = 5, datetime(2026, 11, 16, tzinfo=UTC)
+    session.flush()
+    html = f"<html><body><div class='results-all'>{_OLD_RESULT_ROW}</div></body></html>"
+    fetcher = FakeFetcher({r"^/results": html}, use_defaults=False)
+    since = datetime(2024, 1, 1, tzinfo=UTC)
+    report = sync_results(session, fetcher, settings=app_settings, since=since, max_pages=1)
+    assert not fetcher.requested(r"^/matches/2300001") and report.skipped == 1
+
+    # with a ranking from that time (rank 7 in February 2024) the match is relevant
+    session.add(TeamRanking(team_id=ence.id, source=DataSource.HLTV, rank=7, ranked_on=date(2024, 2, 26)))
+    session.flush()
+    sync_results(session, fetcher, settings=app_settings, since=since, max_pages=1)
+    assert fetcher.requested(r"^/matches/2300001")
+
+
+def test_foreign_host_links_are_reported_not_raised(session: Session, tmp_path: object) -> None:
+    """A scraped link to another host is refused by the real fetcher and must not abort the sync."""
+    from pathlib import Path
+
+    from cs2bot.config import HLTVSettings
+    from cs2bot.ingest.hltv import HLTVFetcher
+
+    archive = (
+        "<html><body>"
+        '<a class="newsline article" href="https://evil.example.com/news/43100/x">'
+        '<div class="newstext">Phishing</div><div class="newsrecent">2026-11-21</div></a>'
+        '<a class="newsline article" href="/news/43100/natus-vincere-bench-jl-iam-to-stand-in">'
+        '<div class="newstext">NAVI bench jL</div><div class="newsrecent">2026-11-21</div></a>'
+        "</body></html>"
+    )
+    article = load_fixture("news_article_43100.html")
+    urls: list[str] = []
+
+    def loader(url: str) -> str:
+        urls.append(url)
+        return archive if "/news/archive/" in url else article
+
+    assert isinstance(tmp_path, Path)
+    settings = HLTVSettings(cache_dir=tmp_path / "c", min_delay_s=0.0, max_delay_s=0.0)
+    with HLTVFetcher(settings, page_loader=loader, sleep=lambda _s: None) as fetcher:
+        report = sync_news(session, fetcher, months=1, now=datetime(2026, 11, 22, tzinfo=UTC))
+    assert any("non-HLTV URL" in e for e in report.errors) and report.failed >= 1
+    assert not any("evil" in u for u in urls)
+    assert count(session, NewsItem) == 1
+
+
+def test_one_missing_lineup_block_keeps_that_teams_stored_lineup(
+    session: Session, app_settings: Settings
+) -> None:
+    html = load_fixture("match_upcoming.html")
+    fetcher = FakeFetcher()
+    sync_match(session, fetcher, 2378010, settings=app_settings, with_mapstats=False)
+    m = match_by_hltv(session, 2378010)
+    assert count(session, MatchLineup) == 10
+    # the second team's block lost its player cells (layout hiccup / not shown): keep its stored rows
+    start = html.index(
+        '<div class="lineup standard-box">', html.index('<div class="lineup standard-box">') + 1
+    )
+    end = html.index("</table>", start)
+    broken = html[:start] + '<div class="lineup standard-box"><div class="players"><table>' + html[end:]
+    fetcher.routes[r"^/matches/2378010(/|$)"] = broken
+    sync_match(session, fetcher, 2378010, settings=app_settings, with_mapstats=False)
+    rows = list(session.scalars(select(MatchLineup).where(MatchLineup.match_id == m.id)))
+    assert len(rows) == 10 and {r.team_id for r in rows} == {m.team1_id, m.team2_id}
+
+
+def test_latest_ranking_with_settings_refreshes_upcoming_scope(session: Session, settings: Settings) -> None:
+    heroic = resolve_team(session, name="Heroic", source=DataSource.HLTV, external_id=7175)
+    nobody = resolve_team(session, name="Nobody Five", source=DataSource.HLTV, external_id=999_001)
+    assert heroic is not None and nobody is not None
+    upcoming = Match(
+        team1_id=nobody.id,
+        team2_id=heroic.id,
+        scheduled_at=datetime.now(UTC) + timedelta(days=1),
+        status=MatchStatus.SCHEDULED,
+    )
+    session.add(upcoming)
+    session.flush()
+    assert not upcoming.in_scope
+    sync_rankings(session, FakeFetcher())  # without settings: ranks only
+    assert not upcoming.in_scope
+    report = sync_rankings(session, FakeFetcher(), settings=settings)
+    assert report.ok and upcoming.in_scope and report.details["scope_changed"] == 1

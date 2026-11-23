@@ -28,12 +28,32 @@ RISK_DISCLAIMER = (
     "No outcome is certain: these are model estimates, even high-probability bets lose regularly, "
     "and losses are possible."
 )
-# English wording plus the Polish equivalents ("strata", "przegrać") in case the language is switched.
-_LOSS_PATTERN = re.compile(
-    r"\b(loss|losses|lose|loses|losing|strat(?:a|y|ę|ą|om|ami|ach)?|przegra\w*)\b", re.IGNORECASE
+# A *risk statement* - not merely any use of "lose": "they lose most pistol rounds" or "after their loss
+# to X" say nothing about the bet, so they must not suppress the disclaimer. Accepted: "losses" next to
+# "possible" / "happen" / "inevitable" ..., or "lose" next to "bet" / "stake" / "money" in the same
+# sentence; plus the Polish equivalents ("straty są możliwe", "zakład można przegrać") in case the
+# rationale language is switched. When unsure, the disclaimer is appended (a repeat is harmless).
+_SENTENCE = r"[^.!?\n]{0,60}"
+_RISK_STATEMENT_PATTERNS: tuple[re.Pattern[str], ...] = tuple(
+    re.compile(pattern, re.IGNORECASE)
+    for pattern in (
+        rf"\blosses\b{_SENTENCE}\b(?:possible|happen|occur|inevitable|expected|likely)",
+        rf"\b(?:possible|inevitable|expect)\w*{_SENTENCE}\blosses\b",
+        rf"\b(?:bet|bets|wager|wagers|stake|stakes)\b{_SENTENCE}\blos(?:e|es|ing|t)\b",
+        rf"\blos(?:e|es|ing|t)\b{_SENTENCE}\b(?:bet|bets|wager|wagers|stake|stakes|money)\b",
+        rf"\bstrat(?:a|y|ę|ą|om|ami|ach)?\b{_SENTENCE}\bmożliw\w*",
+        rf"\bmożliw\w*{_SENTENCE}\bstrat(?:a|y|ę|ą|om|ami|ach)?\b",
+        rf"\bzakład\w*{_SENTENCE}\bprzegra\w*",
+        rf"\bprzegra\w*{_SENTENCE}\bzakład\w*",
+    )
 )
 # A tag starts with a letter, "/" or "!" right after "<" - so "p < 0.75 and EV > 0.03" is left alone.
-_HTML_TAG = re.compile(r"</?[A-Za-z!][^>\n]{0,400}>")
+# Tags may span lines ("<img\nsrc=x\nonerror=...>" is one tag for a browser) but not contain "<".
+_HTML_TAG = re.compile(r"</?[A-Za-z!][^<>]{0,400}>")
+# Whatever still looks like the start of a tag after stripping (an unclosed "<img ..." at the end, or
+# the remains of "<scr<script>ipt>") is defused by a space: "< img" is text for every HTML parser.
+_TAG_START = re.compile(r"<(?=[A-Za-z!/])")
+_MAX_STRIP_PASSES = 10
 _MD_IMAGE = re.compile(r"!\[([^\]\n]*)\]\([^)\n]*\)")
 # Inline links "[text](target)" and reference definitions "[label]: target".
 _MD_LINK = re.compile(r"\[([^\]\n]*)\]\(\s*<?([^)\s>]*)[^)\n]*\)")
@@ -337,10 +357,20 @@ def sanitize_markdown(text: str) -> str:
     without_links = _MD_LINK.sub(
         lambda m: m.group(0) if _SAFE_LINK.match(m.group(2)) else m.group(1), without_images
     )
-    without_definitions = _MD_LINK_DEFINITION.sub(
+    text = _MD_LINK_DEFINITION.sub(
         lambda m: m.group(0) if _SAFE_LINK.match(m.group(1)) else "", without_links
     )
-    return _HTML_TAG.sub("", without_definitions)
+    for _ in range(_MAX_STRIP_PASSES):  # nested fragments ("<scr<b>ipt>") re-form a tag after one pass
+        stripped = _HTML_TAG.sub("", text)
+        if stripped == text:
+            break
+        text = stripped
+    return _TAG_START.sub("< ", text)
+
+
+def has_risk_statement(text: str) -> bool:
+    """Whether ``text`` says (in English or Polish) that the bets can lose / losses are possible."""
+    return any(pattern.search(text) for pattern in _RISK_STATEMENT_PATTERNS)
 
 
 def finalize_rationale(text: str) -> str:
@@ -348,6 +378,6 @@ def finalize_rationale(text: str) -> str:
     cleaned = sanitize_markdown(text).strip()
     if not cleaned:
         return ""
-    if not _LOSS_PATTERN.search(cleaned):
+    if not has_risk_statement(cleaned):
         cleaned = f"{cleaned}\n\n*{RISK_DISCLAIMER}*"
     return cleaned

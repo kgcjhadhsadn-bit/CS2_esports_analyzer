@@ -97,7 +97,10 @@ a dashboard.
 
 What you receive
 - <match_context>: facts from our database - teams (team1 and team2 are fixed labels for this match), \
-tournament, format, start time, the current time, lineups, and the veto if it has been published.
+tournament, format, start time, the current time, lineups, and the veto if it has been published. \
+Until the official lineup is published, a listed lineup may be the one the team used in its previous \
+match. A lineup marked "not in our database" is a gap in our data, not evidence that the real lineup \
+is undecided.
 - <form_summary> (optional): recent-form numbers from our database, for orientation only.
 - <news_items>: recent news about the two teams or their players, oldest first. Later items can \
 supersede earlier ones (a player reported ill may be confirmed fit a day later).
@@ -142,8 +145,9 @@ that are informational or whose direction is unclear. A stand_in, illness, visa_
 internal_conflict or form_slump flag about one team can only count against that team: the code \
 discards an adjustment that points the other way. If a change makes a team stronger, report it as \
 roster_change or other.
-- veto: true only for extreme situations in which no bet should be placed on this match at all: a \
-lineup that is still unknown or disputed within hours of the start, a real risk of forfeit or walkover, \
+- veto: true only for extreme situations in which no bet should be placed on this match at all: news \
+reporting that a lineup is still unknown or disputed within hours of the start, a real risk of forfeit \
+or walkover, \
 match-fixing or integrity allegations involving the match or a participant, or server and technical \
 chaos that makes the match unpredictable. Ordinary uncertainty, a normal stand-in or a team in poor \
 form is not a veto.
@@ -290,7 +294,7 @@ def build_triage_message(
 
 def _lineup_lines(label: str, lineup: Sequence[LineupPlayer]) -> list[str]:
     if not lineup:
-        return [f"{label} lineup: not known yet"]
+        return [f"{label} lineup: not in our database"]
     players = []
     for player in lineup:
         name = escape_untrusted(player.nickname) or f"player {player.player_id}"

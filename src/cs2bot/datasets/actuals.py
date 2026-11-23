@@ -30,11 +30,15 @@ def _source_extra(match: Match, source: str) -> Mapping[str, Any]:
 
 
 def _is_forfeit(match: Match) -> bool:
-    """Full walkover / default win.
+    """A source flagged the match as (at least partly) forfeited.
 
-    HLTV sync stores ``Match.extra["hltv"]["forfeit"]`` (docs/dev/reports/hltv.md). PandaScore's
-    match payload has a ``forfeit`` boolean; if its sync keeps it under ``extra["pandascore"]`` (or
-    at the top level) it is honoured too - an assumption, that package is not built yet.
+    HLTV sync stores ``Match.extra["hltv"]["forfeit"]`` (docs/dev/reports/hltv.md) and PandaScore sync
+    ``Match.extra["pandascore"]["forfeit"]``; a top-level ``extra["forfeit"] = True`` is honoured too.
+
+    The flag alone does **not** mean "walkover": the HLTV parser also sets it when only some maps
+    were awarded by default (``forfeited_maps``) or when a page note mentions a forfeit next to
+    maps that were really played. :func:`load_match_actuals` therefore only reports
+    ``forfeited=True`` (every bet void) when no map was played at all.
     """
     extra = match.extra if isinstance(match.extra, dict) else {}
     return bool(
@@ -129,13 +133,15 @@ def load_match_actuals(session: Session, match_id: int) -> MatchActuals | None:
       ``maps_played.extra["hltv"]["rounds"]``. Otherwise ``None``.
     * ``player_kills``: kills per player with the same source preference as the player records
       (DEMO > HLTV > PANDASCORE > SYNTHETIC).
-    * ``forfeited``: the match was a full walkover (see :func:`_is_forfeit`).
-      ``cancelled``: status CANCELED without a forfeit flag.
+    * ``forfeited``: a full walkover - a source flagged a forfeit (see :func:`_is_forfeit`) and no
+      map was played. ``cancelled``: status CANCELED without a forfeit flag and without any played
+      map. Both void every bet, so neither is ever set while a decided map exists.
     * ``complete``: ``True`` once nothing more is expected - a cancelled / forfeited match, or a
       FINISHED match whose stored maps are numbered 1..n without gaps, decide the series for its
       format and agree with ``matches.team1_score`` / ``team2_score`` when those hold map counts.
-      A series in which single maps were awarded by default (HLTV ``forfeited_maps``) is never
-      ``complete``: its played maps are listed, but the series result needs the bookmaker's ruling.
+      A partly forfeited series (forfeit flag or HLTV ``forfeited_maps`` next to played maps) and a
+      CANCELED match with played maps are never ``complete``: their played maps are listed, but the
+      result needs the bookmaker's ruling (settlement answers UNKNOWN instead of voiding).
     """
     match = session.get(Match, match_id)
     if match is None or match.team1_id is None or match.team2_id is None:
@@ -178,11 +184,18 @@ def load_match_actuals(session: Session, match_id: int) -> MatchActuals | None:
         n_rows = len(map_rows)
         fmt = MatchFormat.BO1 if n_rows == 1 else MatchFormat.BO5 if n_rows >= 4 else MatchFormat.BO3
 
-    forfeited = _is_forfeit(match)
-    cancelled = match.status is MatchStatus.CANCELED and not forfeited
+    forfeit_flag = _is_forfeit(match)
+    # A walkover voids every bet only when nothing was played. Played maps next to a forfeit flag or
+    # to "Default" maps (partial forfeit, disqualification mid-series) keep their own results - bets
+    # on those maps stand at the bookmaker - so the match is reported as incomplete instead and the
+    # settlement layer asks the bookmaker (UNKNOWN), never voiding a bet that was actually decided.
+    forfeited = forfeit_flag and not maps
+    # The same for a cancellation: a match abandoned after some maps were played is not "cancelled"
+    # for the maps that finished.
+    cancelled = match.status is MatchStatus.CANCELED and not forfeit_flag and not maps
     if forfeited or cancelled:
         complete = True
-    elif match.status is not MatchStatus.FINISHED or _has_forfeited_maps(match):
+    elif match.status is not MatchStatus.FINISHED or forfeit_flag or _has_forfeited_maps(match):
         complete = False
     else:
         contiguous = [m.map_number for m in maps] == list(range(1, len(maps) + 1))

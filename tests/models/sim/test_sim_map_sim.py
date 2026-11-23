@@ -48,8 +48,16 @@ def test_mr12_and_overtime_termination(simulator: MapSimulator, d: float) -> Non
     assert ot_mass == pytest.approx(out.p_overtime)
     for half in ("1", "2"):
         assert 0.0 <= out.p_team1_half[half] + out.p_half_draw[half] <= 1.0
+    assert out.race_targets == tuple(range(1, 17))  # every N 1..16 by default
+    t1, t2 = out.team1_rounds.astype(int), out.team2_rounds.astype(int)
     for tg in out.race_targets:
-        assert out.p_neither_race_to[str(tg)] == 0.0  # someone always reaches N <= 13
+        neither = out.p_neither_race_to[str(tg)]
+        if tg <= 13:
+            assert neither == 0.0  # someone always reaches N <= 13
+        else:  # N > 13 is unreached exactly when the final scores both stay below N
+            assert neither == pytest.approx(float(np.mean(np.maximum(t1, t2) < tg)))
+        assert 0.0 <= out.p_team1_race_to[str(tg)] <= 1.0 - neither + 1e-12
+    assert out.p_team1_race_to["1"] == pytest.approx(out.p_team1_pistol["1"])  # first to 1 = round 1
 
 
 def _ct_dominant_model(bias: float) -> RoundModel:

@@ -84,6 +84,7 @@ def browser_settings(tmp_path: Path, local_server: tuple[str, dict[str, int], li
         min_delay_s=0.0,
         max_delay_s=0.0,
         navigation_timeout_s=30.0,
+        browser_profile_dir=tmp_path / "profile",  # persistent context, never the repo's data dir
     )
 
 

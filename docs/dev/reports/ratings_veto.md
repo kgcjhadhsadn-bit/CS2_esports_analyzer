@@ -1,6 +1,6 @@
 # ratings_veto: implementation report
 
-**Tests:** `.venv/bin/python -m pytest tests/models/ratings_veto -q` - 174 passed, 0 failed (about 20 s with `-n 2`; lint/type clean: True)
+**Tests:** `.venv/bin/python -m pytest tests/models/ratings_veto -q` - 180 passed, 0 failed (about 20 s with `-n 2`; lint/type clean: True; 174 before review round 1)
 
 ## Summary
 
@@ -72,7 +72,7 @@ class MapRatingModel:
     def __init__(self, config: RatingConfig | None = None) -> None
     def fit(self, records: Iterable[MapResultRecord], *, record_history: bool = False) -> MapRatingModel
     def fit_until(self, records: Iterable[MapResultRecord], as_of: datetime, *, record_history: bool = False) -> MapRatingModel
-    def update(self, record: MapResultRecord) -> bool       # False = duplicate / no winner; ValueError if out of order
+    def update(self, record: MapResultRecord) -> bool       # False = duplicate / no winner / negative rounds; ValueError if out of order
     def predict(self, team1_id: int, team2_id: int, map_name: str, as_of: datetime, *, is_lan: bool = False,
                 team1_lineup: Sequence[int] = (), team2_lineup: Sequence[int] = (),
                 picked_by: TeamSlot | None = None) -> MapWinEstimate
@@ -117,7 +117,7 @@ def evaluate_walk_forward(model: MapRatingModel, records: Iterable[MapResultReco
 def chronological_split(records: Iterable[MapResultRecord], holdout_fraction: float = 0.25) -> tuple[list[MapResultRecord], list[MapResultRecord]]
 ```
 
-- `MapWinEstimate.components` keys: `overall` (p from overall ratings only), `map` (= `p_team1_win`), `logit_mean`, `logit_sd`, `team1_phi`, `team2_phi`, `team1_map_weight`, `team2_map_weight`, `team1_map_games`, `team2_map_games`, `team1_roster_changes`, `team2_roster_changes`, `lan`, `pick_shift`. `predict_for_sequences` adds `p_picked_by_team1` / `p_picked_by_team2` when the picker of a map differs between sequences.
+- `MapWinEstimate.components` keys: `overall` (p from overall ratings only), `map` (= `p_team1_win`), `logit_mean`, `logit_sd`, `team1_phi`, `team2_phi`, `team1_map_weight`, `team2_map_weight`, `team1_map_games`, `team2_map_games`, `team1_roster_changes`, `team2_roster_changes`, `lan`, `pick_shift`. `predict_for_sequences` adds `p_picked_by_team1` / `p_picked_by_team2` when the picker of a map differs between sequences; its `p_team1_win` is then the probability-weighted mean over the picker scenarios and `sigma` the standard deviation of that mixture (law of total variance).
 - `WalkForwardResult` has `predictions`, `n`, `log_loss`, `brier`, `accuracy`, `log_loss_of(overall=...)`, `brier_of(overall=...)`, `reliability(n_bins) -> list[ReliabilityBin]`, `ece(n_bins)`.
 - The `tune` report holds `best_params`, `best_log_loss`, `best_brier`, `baseline_log_loss`, `n_train`, `n_holdout` and `results` (sorted best first).
 - `MapRatingModel` and `WalkForwardRatings` both satisfy `cs2bot.features.RatingProvider`. `features.rows.rating_estimate` already uses `historical_predict` when the model has recorded history.
@@ -175,12 +175,13 @@ def p_map_played(sequences: Sequence[MapSequenceProbability], map_name: str, *, 
 - `MapSequenceProbability.maps` is the playing order: picks in pick order, then the leftover map. Lengths are 1 (BO1), 2 (BO2, no decider), 3 (BO3) and 5 (BO5); `pickers` has `None` for the leftover. This is the shape `build_match_prediction` expects.
 - An empty `map_pool` means `config.default_map_pool`.
 - `first_veto=None` is a 50/50 mixture of both orders; known steps that name a team resolve the order. A complete known veto returns one sequence with probability 1.
-- `top_k`: at most `top_k` sequences, probabilities sum to 1. With `preserve_marginals=True` (default) and `top_k` ≥ 19 (BO3) / 31 (BO5) on seven maps, `P(slot k is map m)` is exact. `top_k=None` returns every sequence (up to 420 for a BO3, 5040 for a BO5).
+- Without `template=`, known steps that contradict the default order but fit `BO1_TEMPLATE_2_3_1` (BO1, 7 maps: the first two bans by the same team) switch the remaining actors to that order.
+- `top_k`: at most `top_k` sequences, probabilities sum to 1. With `preserve_marginals=True` (default) `P(slot k is map m)`, `P(map m picked by team1 / team2 / decider)` and `P(slot k picked by team1)` are exact when `top_k` ≥ 19 (BO3) / 31 (BO5) on seven maps with a known first veto, ≥ 26 / 38 with an unknown one (below that only the slot marginals, then plain rescaling). `top_k=None` returns every sequence (up to 420 for a BO3, 5040 for a BO5).
 - `p_map_played` without `slot_reach` is the probability that the map is in the sequence; pass `slot_reach={3: p_decider_reached}` for the probability that it is actually played.
 
 ### `cs2bot.models.veto_truncation`, `cs2bot.models.ratings_glicko`
 
-- `truncate_sequences(totals: Mapping[tuple[tuple[str, P], ...], float], top_k: int | None, *, preserve_marginals: bool = True) -> list[tuple[tuple[tuple[str, P], ...], float]]` and `slot_marginal_rank(keys) -> int`.
+- `truncate_sequences(totals: Mapping[tuple[tuple[str, P], ...], float], top_k: int | None, *, preserve_marginals: bool = True) -> list[tuple[tuple[tuple[str, P], ...], float]]`, `slot_marginal_rank(keys) -> int` (slot cells only) and `marginal_rank(keys) -> int` (slot and picker cells: the tail size used by default).
 - `ratings_glicko`: `glicko2_rate`, `volatility_update`, `g`, `expected_score`, `inflate_phi`, `mov_score`, `mr12_map_win_probability`, `logistic_normal_moments`, `to_display`, `from_display`, `logit`, `sigmoid`.
 
 ### Wiring example
@@ -229,8 +230,8 @@ Incremental use between trainings: `ratings.update(record)` and `veto.update(rec
 - **A late result needs a refit.** `update` raises `ValueError` for a record older than the last processed one.
 - **A veto model fitted without `map_advantage` ignores `map_advantage` at prediction time**, because it has no weight for that term.
 - **Veto order is a template, not learned.** The model does not learn which team vetoes first or which order a tournament uses. Pass `template=` for other orders. `BO1_TEMPLATE_2_3_1` is my reading of the Valve Major rules and is unverified.
-- **Truncation approximates the joint distribution.** Slot marginals are exact, but which maps occur together in one series is only approximate in a 50-sequence list, and pickers of the re-assigned tail are approximate when the first veto is unknown (error up to about 0.07). Pass `top_k=None` for the exact distribution; the match engine's cost depends on the number of distinct maps, not sequences, but the list is stored in `MatchPrediction.veto_distribution`.
-- **Truncation cost on larger pools.** The linear programme takes up to 0.25 s for a BO5 on seven maps and about 1.6 s on nine maps (30,240 sequences).
+- **Truncation approximates the joint distribution.** Slot marginals and per-map / per-slot picker marginals are exact, but which maps occur together in one series (and the picker of a map in a particular slot) is only approximate in a 50-sequence list. Pass `top_k=None` for the exact distribution; the match engine's cost depends on the number of distinct maps, not sequences, but the list is stored in `MatchPrediction.veto_distribution`.
+- **Truncation cost on larger pools.** The linear programme takes up to 0.4 s for a BO5 on seven maps and about 2.2 s on nine maps with an unknown first veto (30,240 sequences).
 - **Recorded history is in memory only.** A loaded model cannot serve `historical_*` queries or `WalkForwardRatings`; refit with `record_history=True`.
 - **Volatility barely moves.** With a handful of games per 7-day period the Glicko-2 volatility stays close to `initial_sigma` (that is how the algorithm behaves), so `initial_sigma` effectively sets how fast uncertainty grows during inactivity.
 - **Roster rotation.** A team that rotates a sixth player is charged one roster change at every swap (12% reset by default).
@@ -239,9 +240,32 @@ Incremental use between trainings: `ratings.update(record)` and `veto.update(rec
 ## Foundation change requests
 
 - `docs/ARCHITECTURE.md`, P5 section: update the `predict_sequences` signature to `top_k: int | None = 50, as_of=None, map_advantage=None, template=None, preserve_marginals=True`, and mention `WalkForwardRatings` / `record_history=True` as the leakage-free provider for historical rows.
-- `docs/dev/STATUS.md`: set ratings_veto to done with 174 tests.
+- `docs/dev/STATUS.md`: set ratings_veto to done with 180 tests, reviewed (round 1).
 - `src/cs2bot/models/__init__.py` (shared, not edited): optionally re-export `MapRatingModel`, `RatingConfig`, `WalkForwardRatings`, `VetoModel`, `VetoConfig`.
 
 ## New dependency requests
 
 None. The truncation uses `scipy.optimize.linprog` (HiGHS), which ships with the scipy already installed.
+
+## Review round 1
+
+Independent review of the whole package (brief incl. addendum, report, all source and tests). Checks re-run after the fixes: 180/180 package tests (about 20 s with `-n 2`), `ruff check`, `ruff format --check` and `mypy` clean on the owned paths, 37/37 foundation tests, and the features tests that use the rating provider still pass.
+
+What I verified (re-derived, not trusted):
+- Glicko-2 maths against the paper: `g`, `E`, `v`, `Delta`, the Illinois iteration (bracket choice, `f(x)`, halving rule, stop criterion), `phi* / phi' / mu'`, the fractional-period generalisation; the multi-component Kalman split reduces exactly to Glicko-2 with one component (posterior variance `P/(1+P/v)`, mean step `P g (s-E)/(1+P/v)`).
+- Time inflation `min(phi0, sqrt(phi^2 + c sigma^2))`, map-offset drift and caps; first game on a map starts from the overall rating with the prior offset variance; shrinkage weight `1 - psi^2/psi0^2`.
+- MR12 + MR3 overtime win probability (regulation `C(12+k, k) p^13 q^k`, 12-12 tie, overtime as a race to 4 of 6 with 3-3 repeats); `mov_score` keeps a win strictly above 0.5.
+- No look-ahead: `predict`/`rating`/`map_advantage` refuse `as_of <= last`; `fit_until` is strict; history lookups use `bisect_left` (games at `as_of` excluded); veto features are computed before ingesting the veto and the advantage callable is queried at the veto's own time; walk-forward evaluation predicts a match before any of its maps is processed. `features.rows.rating_estimate` and both providers agree on the `predict` / `historical_predict` contract.
+- Veto: templates per format and generalised pool sizes, exact DP vs brute force (existing test), Bayesian conditioning on known steps (path likelihood of known steps reweights the first-veto mixture), complete known vetoes, the output shape consumed by `build_match_prediction` (BO2 length 2, leftover picker `None`).
+
+Issues found:
+1. **Major, fixed - truncation biased the pickers when the first veto is unknown.** The marginal-preserving cut only constrained `P(slot k is map m)`. For two evenly rated (e.g. unknown) teams with `first_veto=None`, exact probability ties between mirrored sequences were broken toward team1 and the LP put the tail on team1-first sequences: the default 50-sequence list said team1 makes the first pick with probability 0.945 (BO3) / 0.997 (BO5) instead of 0.5, and `predict_for_sequences` / the stored `veto_distribution` / the LLM rationale saw those pickers. Production calls with `first_veto=None` whenever the order is unknown, so this was the common case. The LP now also preserves `P(map m picked by team1 / team2 / decider)` and `P(slot k picked by team1 / team2)` (rank 26 / 38 instead of 19 / 31 with an unknown order, unchanged with a known one); when `top_k` is too small for that it falls back to slot marginals only, then plain rescaling. New `marginal_rank`. Tests: picker marginals exact for unknown and known teams (BO3/BO5), `predict_for_sequences` identical from the full and the cut list, ranks.
+2. **Minor, fixed - `predict_for_sequences` sigma for mixed pickers** was the weighted average of the scenario sigmas, which ignores the spread between the scenario means; it is now the mixture standard deviation (law of total variance). Test updated.
+3. **Minor, fixed - negative round counts** (malformed external data) were scored as `s = 0.5` updates (`mov_score` returns 0.5 for a non-positive total) instead of being skipped. `update` now returns `False` for them and `evaluate_walk_forward` skips them. Test added.
+4. **Minor, fixed - 2-3-1 BO1 vetoes with the default template.** Published steps whose teams contradict the alternating BO1 order kept the template's actors for the remaining steps (e.g. step 5 predicted for team1 after team1, team1, team2, team2). Without `template=`, known steps that do not fit the default order but fit `BO1_TEMPLATE_2_3_1` now switch to it (an explicit `template=` always wins). Test added.
+
+Remaining concerns (not changed):
+- `_check_as_of` makes one future-dated result block every prediction (already listed under known limitations; the wiring's `fit_until(records, now)` avoids it).
+- Malformed `known_steps` (duplicate step numbers or maps) raise `ValueError` from `predict_sequences`; the prediction service should catch it and fall back to no known steps.
+- Forfeits recorded as 1-0 / 16-0 maps are rated as full wins; the data layer should drop them if they appear.
+- All defaults still come from synthetic data (see known limitations).

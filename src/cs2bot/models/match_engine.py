@@ -35,8 +35,9 @@ only use is the sigma of each outcome, and they share common random numbers with
 seed and size per map), so ``p_high - p_low`` is far less noisy than either estimate. Maps whose
 ``sigma`` is 0 reuse the central run in all scenarios.
 
-Not thread-safe when the shared :data:`~cs2bot.models.map_sim.DEFAULT_SIMULATOR` is used; pass
-``simulator=MapSimulator()`` per thread.
+The shared :data:`~cs2bot.models.map_sim.DEFAULT_SIMULATOR` is thread-safe (locked caches), but
+its cache statistics in ``components["cache"]`` then also count other threads' work; pass
+``simulator=MapSimulator()`` for isolated statistics.
 """
 
 from __future__ import annotations
@@ -49,8 +50,10 @@ from typing import Any
 
 import numpy as np
 
+from cs2bot.config import ModelSettings
 from cs2bot.domain.context import ContextFlag
 from cs2bot.domain.enums import MatchFormat, Side, TeamSlot
+from cs2bot.domain.match import LineupPlayer, MatchContext
 from cs2bot.domain.predictions import (
     MapSequenceProbability,
     MapSlotPrediction,
@@ -75,7 +78,6 @@ from cs2bot.models.map_sim import (
     MapSimulator,
 )
 from cs2bot.models.player_props import (
-    KillModelConfig,
     KillsMixture,
     PlayerInput,
     PlayerKillModel,
@@ -85,7 +87,7 @@ from cs2bot.models.player_props import (
     top_fragger_probs,
 )
 from cs2bot.models.round_model import RoundModel
-from cs2bot.models.sim_series import played_mask, series_outcome, series_sum_pmf
+from cs2bot.models.sim_series import played_mask, series_outcome, series_prefix_sum_pmf, series_sum_pmf
 from cs2bot.models.sim_stats import (
     FloatArray,
     expit,
@@ -111,6 +113,10 @@ __all__ = [
     "SCENARIOS",
     "PlayerInput",
     "build_match_prediction",
+    "context_kwargs",
+    "economy_from_settings",
+    "engine_options",
+    "players_from_context",
     "scenario_probabilities",
 ]
 
@@ -195,6 +201,11 @@ def _prepare_sequences(seqs: Sequence[MapSequenceProbability], fmt: MatchFormat)
     return out, total
 
 
+def _estimate_ok(est: MapWinEstimate) -> bool:
+    p, sigma = float(est.p_team1_win), float(est.sigma)
+    return bool(np.isfinite(p) and 0.0 <= p <= 1.0 and np.isfinite(sigma) and sigma >= 0.0)
+
+
 def _validate_players(players: Sequence[PlayerInput]) -> list[PlayerInput]:
     seen: set[int] = set()
     out: list[PlayerInput] = []
@@ -206,7 +217,7 @@ def _validate_players(players: Sequence[PlayerInput]) -> list[PlayerInput]:
     return out
 
 
-def _kernel(rate: PlayerRate, out: MapSimOutput, cfg: KillModelConfig) -> _Kernel:
+def _kernel(rate: PlayerRate, out: MapSimOutput, score_skew: float, hist_margin_var: float) -> _Kernel:
     t1 = out.team1_rounds.astype(np.int64)
     t2 = out.team2_rounds.astype(np.int64)
     own, opp = (t1, t2) if rate.team is not TeamSlot.TEAM2 else (t2, t1)
@@ -219,8 +230,8 @@ def _kernel(rate: PlayerRate, out: MapSimOutput, cfg: KillModelConfig) -> _Kerne
         margin=margin,
         weights=w,
         margin_center=center,
-        score_skew=cfg.score_skew,
-        hist_margin_var=cfg.hist_margin_var,
+        score_skew=score_skew,
+        hist_margin_var=hist_margin_var,
     )
     own_won = mix.margins > 0  # no draws on a map
     team1_won = own_won if rate.team is not TeamSlot.TEAM2 else ~own_won
@@ -231,6 +242,10 @@ def _kernel(rate: PlayerRate, out: MapSimOutput, cfg: KillModelConfig) -> _Kerne
         pmf_team2_wins=mix.pmf(~team1_won),
         deaths_mean=rate.dpr * mix.expected_rounds,
     )
+
+
+def _sorted_int_keys(d: Mapping[str, float]) -> dict[str, float]:
+    return {k: float(d[k]) for k in sorted(d, key=int)}
 
 
 def _projection(pl: PlayerInput, pmf: FloatArray, deaths_mean: float | None) -> PlayerProjection:
@@ -252,11 +267,12 @@ def _top_fragger(
     runs: Mapping[str, _MapRun],
     players: Sequence[PlayerInput],
     rates: Mapping[str, Mapping[int, PlayerRate]],
-    cfg: KillModelConfig,
     *,
+    score_skew: float,
+    hist_margin_var: float,
     seed: int,
     n_samples: int,
-    always_played_scopes: Sequence[tuple[str, tuple[int, ...]]],
+    prefix_scopes: Sequence[tuple[str, int]],
 ) -> dict[str, dict[str, float]]:
     """Joint simulation of whole series -> P(top fragger) per scope (ties split evenly)."""
     rng = np.random.default_rng(seed)
@@ -290,7 +306,7 @@ def _top_fragger(
             np.average(out.team1_rounds.astype(np.int64) - out.team2_rounds, weights=out.weights)
         )
     kills = np.zeros((n_maps, n_samples, len(players)), dtype=np.int64)
-    skew, hmv = cfg.score_skew, cfg.hist_margin_var
+    skew, hmv = score_skew, hist_margin_var
     for j, pl in enumerate(players):
         kpr = np.asarray([rates[m][pl.player_id].kpr for m in names])
         s_eff = np.asarray(
@@ -327,8 +343,9 @@ def _top_fragger(
     result: dict[str, dict[str, float]] = {}
     for k in range(n_maps):
         add(f"map:{k + 1}", kills[k], played[k])
-    for scope, slots in always_played_scopes:
-        add(scope, kills[list(slots)].sum(axis=0), None)
+    for scope, upto in prefix_scopes:
+        # conditional on the last listed map being played (always true up to the format's minimum)
+        add(scope, kills[:upto].sum(axis=0), played[upto - 1])
     add("match", kills.sum(axis=0), None)
     return result
 
@@ -339,9 +356,8 @@ def _build_core(
     runs: Mapping[str, _MapRun],
     players: Sequence[PlayerInput],
     rates: Mapping[str, Mapping[int, PlayerRate]],
-    cfg: KillModelConfig | None,
+    score_params: tuple[float, float] | None,
     *,
-    rounds_to_win: int,
     tf_seed: int,
     tf_samples: int,
 ) -> PredictionCore:
@@ -377,20 +393,16 @@ def _build_core(
         slot_dists.append({m: v / norm for m, v in sorted(weights.items(), key=lambda kv: -kv[1]) if v > 0})
 
     kernels: dict[tuple[str, int], _Kernel] = {}
-    if players and cfg is not None:
+    if players and score_params is not None:
+        skew, hmv = score_params
         for m, run in runs.items():
             for pl in players:
-                kernels[(m, pl.player_id)] = _kernel(rates[m][pl.player_id], run.out, cfg)
+                kernels[(m, pl.player_id)] = _kernel(rates[m][pl.player_id], run.out, skew, hmv)
 
     slots: list[MapSlotPrediction] = []
     for k in range(n_maps):
         dist = slot_dists[k]
         outs = [(w, runs[m].out) for m, w in dist.items()]
-        race_keys = [
-            str(t)
-            for t in runs[next(iter(dist))].out.race_targets
-            if t <= rounds_to_win and all(o.p_neither_race_to.get(str(t), 0.0) < 1e-12 for _, o in outs)
-        ]
         slot_players: dict[str, PlayerProjection] = {}
         for pl in players if kernels else ():
             pmf = mix_pmfs([(w, kernels[(m, pl.player_id)].pmf) for m, w in dist.items()])
@@ -407,39 +419,47 @@ def _build_core(
                 p_team1_pistol=mix_dicts([(w, o.p_team1_pistol) for w, o in outs]),
                 p_team1_half=mix_dicts([(w, o.p_team1_half) for w, o in outs]),
                 p_half_draw=mix_dicts([(w, o.p_half_draw) for w, o in outs]),
-                p_team1_race_to={
-                    key: v
-                    for key, v in mix_dicts([(w, o.p_team1_race_to) for w, o in outs]).items()
-                    if key in race_keys
-                },
+                # every simulated N (1..16 by default); N > 13 can stay unreached (void mass)
+                p_team1_race_to=_sorted_int_keys(mix_dicts([(w, o.p_team1_race_to) for w, o in outs])),
+                p_neither_race_to=_sorted_int_keys(mix_dicts([(w, o.p_neither_race_to) for w, o in outs])),
                 players=slot_players,
             )
         )
 
-    always_scopes: list[tuple[str, tuple[int, ...]]] = []
-    if fmt.min_maps >= 2:
-        always_scopes.append(("maps:1,2", (0, 1)))
-    if fmt.min_maps >= 3:
-        always_scopes.append(("maps:1,2,3", (0, 1, 2)))
+    # "maps:1,2", "maps:1,2,3", ...: every prefix of the series, conditional on its last map being played
+    prefix_scopes = [("maps:" + ",".join(str(i + 1) for i in range(j)), j) for j in range(2, n_maps + 1)]
 
     by_scope: dict[str, dict[str, PlayerProjection]] = {}
     top: dict[str, dict[str, float]] = {}
     if kernels:
         for k, slot in enumerate(slots):
             by_scope[f"map:{k + 1}"] = dict(slot.players)
-        for scope, idx in always_scopes:
+        for scope, upto in prefix_scopes:
             scope_proj: dict[str, PlayerProjection] = {}
             for pl in players:
                 items: list[tuple[float, FloatArray]] = []
                 deaths = 0.0
                 for s in seqs:
-                    pmf = kernels[(s.maps[idx[0]], pl.player_id)].pmf
-                    for i in idx[1:]:
-                        pmf = np.convolve(pmf, kernels[(s.maps[i], pl.player_id)].pmf)
-                    items.append((s.q, pmf))
-                    deaths += s.q * sum(kernels[(s.maps[i], pl.player_id)].deaths_mean for i in idx)
-                scope_proj[str(pl.player_id)] = _projection(pl, mix_pmfs(items), deaths)
-            by_scope[scope] = scope_proj
+                    ks = [kernels[(m, pl.player_id)] for m in s.maps]
+                    p_last_played, pmf = series_prefix_sum_pmf(
+                        fmt,
+                        [p_map[m] for m in s.maps],
+                        [kk.pmf_team1_wins for kk in ks],
+                        [kk.pmf_team2_wins for kk in ks],
+                        upto,
+                    )
+                    weight = s.q * p_last_played
+                    if weight <= 0.0:
+                        continue
+                    items.append((weight, pmf))
+                    # deaths: per-map unconditional means (informational only)
+                    deaths += weight * sum(ks[i].deaths_mean for i in range(upto))
+                total_w = sum(w for w, _ in items)
+                if total_w <= 1e-15:
+                    break  # the last map of this scope (practically) cannot be played
+                scope_proj[str(pl.player_id)] = _projection(pl, mix_pmfs(items), deaths / total_w)
+            else:
+                by_scope[scope] = scope_proj
         match_proj: dict[str, PlayerProjection] = {}
         for pl in players:
             items = []
@@ -456,17 +476,18 @@ def _build_core(
                 deaths += s.q * sum(res.p_played[i] * ks[i].deaths_mean for i in range(n_maps))
             match_proj[str(pl.player_id)] = _projection(pl, mix_pmfs(items), deaths)
         by_scope["match"] = match_proj
-        assert cfg is not None
+        assert score_params is not None
         top = _top_fragger(
             fmt,
             seqs,
             runs,
             players,
             rates,
-            cfg,
+            score_skew=score_params[0],
+            hist_margin_var=score_params[1],
             seed=tf_seed,
             n_samples=tf_samples,
-            always_played_scopes=always_scopes,
+            prefix_scopes=[(scope, upto) for scope, upto in prefix_scopes if scope in by_scope],
         )
     return PredictionCore(
         p_team1_win=float(p_team1),
@@ -530,6 +551,10 @@ def build_match_prediction(
     as_of_dt = ensure_utc(as_of) if as_of is not None else created
     if n_sims < 200:
         raise ValueError("n_sims must be >= 200")
+    if not np.isfinite(logit_shift):
+        raise ValueError("logit_shift must be finite")
+    if top_fragger_samples is not None and top_fragger_samples < 100:
+        raise ValueError("top_fragger_samples must be >= 100 (or None for n_sims)")
     sc_sims = int(scenario_n_sims) if scenario_n_sims is not None else max(2000, n_sims // 2)
     sc_sims = max(200, min(sc_sims, n_sims))
     econ = economy or DEFAULT_ECONOMY
@@ -540,6 +565,15 @@ def build_match_prediction(
 
     seqs, veto_mass = _prepare_sequences(veto_distribution, fmt)
     estimates = {normalize_map_name(k): v for k, v in map_estimates.items()}
+    bad = [
+        m
+        for m in sorted({m for s in seqs for m in s.maps})
+        if m in estimates and not _estimate_ok(estimates[m])
+    ]
+    if bad:
+        raise ValueError(
+            f"MapWinEstimate needs a finite p_team1_win in [0, 1] and a finite sigma >= 0: {bad}"
+        )
     maps_needed = sorted({m for s in seqs for m in s.maps})
     missing = [m for m in maps_needed if m not in estimates]
     if missing:
@@ -558,7 +592,7 @@ def build_match_prediction(
 
     base_seed = int(seed) if seed is not None else int(np.random.default_rng().integers(0, 2**62))
     t_sim = time.perf_counter()
-    stats_before = dict(sim.stats)
+    stats_before = sim.stats_snapshot()
     runs: dict[str, dict[str, _MapRun]] = {sc: {} for sc in SCENARIOS}
     local: dict[tuple[str, Side | None, float, int], _MapRun] = {}
     hits = misses = 0
@@ -604,6 +638,7 @@ def build_match_prediction(
 
     rates: dict[str, dict[int, PlayerRate]] = {}
     cfg = kill_model.config if kill_model is not None else None
+    score_params = kill_model.score_params(as_of_dt) if kill_model is not None else None
     if kill_model is not None and player_list:
         for m in maps_needed:
             rates[m] = kill_model.lineup_rates(
@@ -613,7 +648,7 @@ def build_match_prediction(
         if unknown:
             warnings.append(f"players without history (role/global prior used): {unknown}")
     tf_seed = stable_seed(base_seed, "top-fragger")
-    tf_samples = int(top_fragger_samples or n_sims)
+    tf_samples = int(top_fragger_samples) if top_fragger_samples is not None else n_sims
     cores = {
         sc: _build_core(
             fmt,
@@ -621,8 +656,7 @@ def build_match_prediction(
             runs[sc],
             player_list,
             rates,
-            cfg,
-            rounds_to_win=econ.rounds_to_win,
+            score_params,
             tf_seed=tf_seed,
             tf_samples=tf_samples,
         )
@@ -665,7 +699,8 @@ def build_match_prediction(
         "player_props": {
             "n_players": len(player_list),
             "as_of": as_of_dt.isoformat(),
-            "score_skew": cfg.score_skew if cfg is not None else None,
+            "score_skew": round(score_params[0], 6) if score_params is not None else None,
+            "hist_margin_var": round(score_params[1], 6) if score_params is not None else None,
             "team_normalisation": cfg.normalise_teams if cfg is not None else None,
             "top_fragger_samples": tf_samples if player_list else 0,
         },
@@ -691,3 +726,69 @@ def build_match_prediction(
         n_simulations=n_sims,
         components=components,
     )
+
+
+# ====================================================================================== integration helpers
+
+
+def economy_from_settings(model_settings: ModelSettings, base: EconomyParams | None = None) -> EconomyParams:
+    """:class:`EconomyParams` with the configured overtime start money (``ModelSettings.ot_start_money``)."""
+    econ = base or DEFAULT_ECONOMY
+    if econ.ot_start_money == model_settings.ot_start_money:
+        return econ
+    return replace(econ, ot_start_money=int(model_settings.ot_start_money))
+
+
+def engine_options(model_settings: ModelSettings, *, match_id: int | None = None) -> dict[str, Any]:
+    """Keyword arguments for :func:`build_match_prediction` taken from ``Settings.models``.
+
+    ``n_sims`` = ``n_map_simulations``, ``scenario_n_sims`` = ``scenario_n_simulations`` (None keeps the
+    engine default ``max(2000, n_sims // 2)``), ``top_fragger_samples``, ``economy`` (overtime start
+    money) and ``seed``: ``random_seed`` mixed with ``match_id`` (stable across processes) so every
+    match gets its own reproducible random stream; ``random_seed=None`` -> a fresh random seed.
+    """
+    seed: int | None = None
+    if model_settings.random_seed is not None:
+        seed = stable_seed(int(model_settings.random_seed), match_id)
+    return {
+        "n_sims": int(model_settings.n_map_simulations),
+        "scenario_n_sims": model_settings.scenario_n_simulations,
+        "top_fragger_samples": int(model_settings.top_fragger_samples),
+        "economy": economy_from_settings(model_settings),
+        "seed": seed,
+    }
+
+
+def players_from_context(context: MatchContext) -> list[PlayerInput]:
+    """Engine player list from the context's lineups (team slot, nickname and role are carried over).
+
+    A player listed twice (in both lineups, or twice in one) is kept once, in the first lineup he
+    appears in (team1 first): duplicates would otherwise make :func:`build_match_prediction` raise.
+    """
+    out: list[PlayerInput] = []
+    seen: set[int] = set()
+    lineups: tuple[tuple[TeamSlot, list[LineupPlayer]], ...] = (
+        (TeamSlot.TEAM1, context.team1_lineup),
+        (TeamSlot.TEAM2, context.team2_lineup),
+    )
+    for slot, lineup in lineups:
+        for lp in lineup:
+            if lp.player_id in seen:
+                continue
+            seen.add(lp.player_id)
+            out.append(PlayerInput(player_id=lp.player_id, team=slot, nickname=lp.nickname, role=lp.role))
+    return out
+
+
+def context_kwargs(context: MatchContext) -> dict[str, Any]:
+    """Match identity, start sides, players and context flags of a :class:`MatchContext` as keyword
+    arguments for :func:`build_match_prediction` (the caller adds veto, estimates and models)."""
+    return {
+        "match_id": context.match_id,
+        "fmt": context.format,
+        "team1_id": context.team1_id,
+        "team2_id": context.team2_id,
+        "start_sides": dict(context.start_sides),
+        "players": players_from_context(context),
+        "context_flags": list(context.context_flags),
+    }

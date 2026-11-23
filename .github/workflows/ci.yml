@@ -1,0 +1,152 @@
+# Continuous integration: lint + types, tests on Linux (with PostgreSQL and Chromium) and Windows,
+# and the dashboard build. Local equivalent: scripts/test.sh (--pg for the PostgreSQL tests).
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# One run per branch / pull request; a newer push cancels the older run.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  UV_FROZEN: "1"          # use uv.lock exactly as committed
+  PYTHONUTF8: "1"
+  FORCE_COLOR: "1"
+  PYTHON_VERSION: "3.12"
+
+jobs:
+  lint:
+    name: Lint & types (ruff, mypy)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10.3.3  # setup-uv publishes no floating major tags
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+      - name: Install dependencies
+        run: uv sync --frozen
+      - name: ruff check
+        run: uv run ruff check src tests
+      - name: ruff format --check
+        run: uv run ruff format --check src tests
+      - name: mypy
+        run: uv run mypy
+
+  test-linux:
+    name: Tests (Linux, PostgreSQL, Chromium)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    services:
+      postgres:
+        image: postgres:16.16-bookworm  # same image as docker-compose.yml
+        env:
+          POSTGRES_USER: cs2bot
+          POSTGRES_PASSWORD: cs2bot
+          POSTGRES_DB: cs2bot_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U cs2bot -d cs2bot_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    env:
+      CS2BOT_TEST_DATABASE_URL: postgresql+psycopg://cs2bot:cs2bot@localhost:5432/cs2bot_test
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10.3.3
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+      - name: Install dependencies
+        run: uv sync --frozen
+      - name: Cache Playwright browsers
+        uses: actions/cache@v6
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ runner.os }}-${{ hashFiles('uv.lock') }}
+      - name: Install Chromium for the browser tests
+        run: uv run playwright install --with-deps chromium
+      - name: Expose Chromium at the path the browser tests use
+        # The browser tests launch /opt/pw-browsers/chromium (the developer machines' location);
+        # the executor tests also read PLAYWRIGHT_CHROMIUM_EXECUTABLE.
+        run: |
+          exe="$(uv run python -c 'from playwright.sync_api import sync_playwright
+          with sync_playwright() as p:
+              print(p.chromium.executable_path)')"
+          test -x "$exe"
+          sudo mkdir -p /opt/pw-browsers
+          sudo ln -sf "$exe" /opt/pw-browsers/chromium
+          echo "PLAYWRIGHT_CHROMIUM_EXECUTABLE=$exe" >> "$GITHUB_ENV"
+      - name: Tests (everything except PostgreSQL)
+        run: uv run pytest -q -n auto -m "not postgres"
+      - name: Tests (PostgreSQL)
+        # The postgres fixture drops and re-creates the schema of a single database, so these
+        # tests run in one process.
+        run: uv run pytest -q -p no:xdist -m postgres
+
+  test-windows:
+    name: Tests (Windows)
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10.3.3
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+      - name: Install dependencies
+        run: uv sync --frozen
+      - name: Tests (no browser, no PostgreSQL)
+        run: uv run pytest -q -n auto -m "not browser and not postgres"
+
+  dashboard:
+    name: Dashboard (lint, test, build)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: dashboard
+    steps:
+      - uses: actions/checkout@v7
+      - name: Is there a dashboard?
+        id: present
+        working-directory: .
+        run: |
+          if [ -f dashboard/package.json ]; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::dashboard/package.json not found - skipping the dashboard build."
+          fi
+      - uses: actions/setup-node@v7
+        if: steps.present.outputs.present == 'true'
+        with:
+          node-version: lts/*
+          cache: npm
+          cache-dependency-path: dashboard/package-lock.json
+      - name: npm ci
+        if: steps.present.outputs.present == 'true'
+        run: npm ci --no-audit --no-fund
+      - name: npm run lint
+        if: steps.present.outputs.present == 'true'
+        run: npm run lint --if-present
+      - name: npm test
+        if: steps.present.outputs.present == 'true'
+        run: npm run test --if-present
+      - name: npm run build
+        if: steps.present.outputs.present == 'true'
+        run: npm run build

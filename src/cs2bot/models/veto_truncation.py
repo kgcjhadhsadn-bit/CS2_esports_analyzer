@@ -24,12 +24,24 @@ What is preserved
    solution), a simplex vertex has at most ``rank(A)`` positive weights, and the objective puts the
    tail's mass on the most likely sequences that can carry it (head sequences included).
 
-The joint distribution of the maps of one series is only approximated (no list of 50 sequences can
-represent 420), and the pickers are not part of the constraints: who picked a map in the tail
-representatives is approximate when the first-veto team is unknown.
+Pickers. Besides the slot cells, the constraints also hold one cell per (map, picker) pair - the
+probability that map ``m`` is picked by team1 / picked by team2 / is the leftover, which is exactly
+what :meth:`cs2bot.models.ratings.MapRatingModel.predict_for_sequences` (and anything else that
+asks "who picked this map") reads from the list - and one per (slot, picker) pair (who picks the
+first map, ...). With a known first-veto team these cells are implied by the slot cells (the
+template fixes the picker of every slot), so ``r`` does not change; with an unknown first-veto team
+they add about one constraint per map (``r`` = 26 for a BO3 and 38 for a
+BO5 on seven maps). Without them, exact probability ties between mirrored sequences of
+two evenly rated teams were broken toward team1 and the cut list claimed team1 made the first pick
+with probability ~0.95-0.99 instead of 0.5 (found in review round 1).
 
-Fallback: when ``top_k`` is smaller than ``r``, when marginal preservation is switched off, or if
-the solver fails, the ``top_k`` most likely sequences are kept and rescaled to sum to 1 (plain
+The joint distribution of the maps of one series is only approximated (no list of 50 sequences can
+represent 420): which maps occur *together* and the picker of a map *in a given slot* are not
+constrained.
+
+Fallback: when ``top_k`` is smaller than ``r`` the picker cells are dropped (slot marginals only);
+when ``top_k`` is smaller than the slot-only rank, when marginal preservation is switched off, or
+if the solver fails, the ``top_k`` most likely sequences are kept and rescaled to sum to 1 (plain
 truncation). ``top_k=None`` never truncates.
 """
 
@@ -46,7 +58,7 @@ from cs2bot.utils.logging import get_logger
 
 log = get_logger(__name__)
 
-__all__ = ["slot_marginal_rank", "truncate_sequences"]
+__all__ = ["marginal_rank", "slot_marginal_rank", "truncate_sequences"]
 
 FloatArray = npt.NDArray[np.float64]
 
@@ -61,15 +73,25 @@ def _sort_token(key: Sequence[tuple[str, object]]) -> tuple[tuple[str, str], ...
     return tuple((m, "" if picker is None else str(picker)) for m, picker in key)
 
 
-def _incidence(keys: Sequence[Sequence[tuple[str, object]]]) -> sparse.csr_matrix:
-    """0/1 matrix ``A[cell, sequence]`` with one row per (slot index, map) cell that occurs."""
-    cells: dict[tuple[int, str], int] = {}
+def _incidence(keys: Sequence[Sequence[tuple[str, object]]], *, pickers: bool = False) -> sparse.csr_matrix:
+    """0/1 matrix ``A[cell, sequence]``: one row per (slot index, map) cell that occurs.
+
+    With ``pickers`` also one row per (map, picker) cell (``P(map m is picked by p)``; the picker
+    ``None`` is the leftover / decider) and one per (slot index, picker) cell.
+    """
+    cells: dict[tuple[object, ...], int] = {}
     rows: list[int] = []
     cols: list[int] = []
     for j, key in enumerate(keys):
-        for k, (m, _) in enumerate(key):
-            rows.append(cells.setdefault((k, m), len(cells)))
+        for k, (m, picker) in enumerate(key):
+            rows.append(cells.setdefault(("slot", k, m), len(cells)))
             cols.append(j)
+            if pickers:
+                picker_token = "" if picker is None else str(picker)
+                rows.append(cells.setdefault(("picker", m, picker_token), len(cells)))
+                cols.append(j)
+                rows.append(cells.setdefault(("slot_picker", k, picker_token), len(cells)))
+                cols.append(j)
     data = np.ones(len(rows), dtype=np.float64)
     return sparse.csr_matrix((data, (rows, cols)), shape=(len(cells), len(keys)))
 
@@ -83,6 +105,13 @@ def slot_marginal_rank(keys: Sequence[Sequence[tuple[str, object]]]) -> int:
     if not keys:
         return 0
     return _rank(_incidence(keys))
+
+
+def marginal_rank(keys: Sequence[Sequence[tuple[str, object]]]) -> int:
+    """Rank with the (map, picker) cells included: the tail size used by default (>= slot rank)."""
+    if not keys:
+        return 0
+    return _rank(_incidence(keys, pickers=True))
 
 
 def _rank(a: sparse.csr_matrix) -> int:
@@ -109,8 +138,9 @@ def truncate_sequences[P: Hashable](
     ``totals`` maps a played sequence ``((map, picker), ...)`` in playing order to its
     (unnormalised) probability; the picker type is opaque here (``TeamSlot | None`` in the veto model).
     The result always sums to 1. With ``preserve_marginals`` (default) and ``top_k`` at least
-    :func:`slot_marginal_rank`, the per-slot map marginals of the result equal those of the full
-    distribution (see the module docstring); otherwise the ``top_k`` most likely sequences are
+    :func:`marginal_rank`, the per-slot map marginals and the per-map picker marginals of the result
+    equal those of the full distribution; with ``top_k`` at least :func:`slot_marginal_rank` the
+    slot marginals (see the module docstring); otherwise the ``top_k`` most likely sequences are
     rescaled. Raises ``ValueError`` when ``totals`` has no positive mass or ``top_k < 1``.
     """
     if top_k is not None and top_k < 1:
@@ -128,14 +158,28 @@ def truncate_sequences[P: Hashable](
     if not preserve_marginals:
         return _plain(keys, probs, top_k)
 
-    a = _incidence(keys)
-    head = top_k - _rank(a)
-    if head < 0:
-        return _plain(keys, probs, top_k)
-    best = _reassign_tail(a, probs, head)
-    if best is None or int(np.count_nonzero(best)) > top_k:
-        log.warning("veto truncation: tail re-assignment failed; using plain truncation")
-        return _plain(keys, probs, top_k)
+    for with_pickers in (True, False):
+        a = _incidence(keys, pickers=with_pickers)
+        head = top_k - _rank(a)
+        if head < 0:
+            continue
+        best = _reassign_tail(a, probs, head)
+        if best is None or int(np.count_nonzero(best)) > top_k:
+            log.warning("veto truncation: tail re-assignment failed (pickers=%s)", with_pickers)
+            continue
+        return _refine(keys, probs, a, best, head, top_k)
+    return _plain(keys, probs, top_k)
+
+
+def _refine[P: Hashable](
+    keys: Sequence[tuple[tuple[str, P], ...]],
+    probs: FloatArray,
+    a: sparse.csr_matrix,
+    best: FloatArray,
+    head: int,
+    top_k: int,
+) -> list[tuple[tuple[tuple[str, P], ...], float]]:
+    n = len(keys)
     # The vertex usually needs fewer than ``rank`` sequences (it re-uses head sequences): spend the
     # unused budget on more exact head sequences. Bounded, and skipped for very large problems.
     for _ in range(_MAX_REFINEMENTS if n <= _REFINE_MAX_SEQUENCES else 0):

@@ -28,7 +28,15 @@ For player ``i`` on map ``M`` against opponent team ``O`` with ``R`` rounds play
   marginal mean at ``kpr * E[R]`` (no double counting with the opponent factor), while
   correlating player kills with the simulated map winner (top-fragger realism). The part of the
   historical over-dispersion explained by score variation is removed from ``1/s``
-  (``gamma**2 * hist_margin_var``). ``gamma = 0`` gives the plain model.
+  (``gamma**2 * hist_margin_var``). ``gamma = 0`` gives the plain model. When the records carry
+  ``team_rounds_won`` / ``opponent_rounds_won``, ``gamma`` and ``hist_margin_var`` are estimated per
+  ``as_of`` (:meth:`PlayerKillModel.score_params`): weighted least squares of the kill residual
+  ``k - mu`` on ``mu * (D - D_bar_player) / R`` (quasi-Poisson weights ``w / mu``, HC0 sandwich variance),
+  shrunk toward the configured prior ``score_skew`` (sd ``score_skew_prior_sd``); ``hist_margin_var`` is
+  the weighted mean of ``((D - D_bar_player) / R)**2``. Without such records the configured defaults
+  are used. Rough reference: a round winner kills ~4.4 opponents and loses ~2 players, i.e. per player
+  ``0.88 W + 0.40 L = 0.64 R + 0.24 D`` -> ``gamma ~ 0.24 / 0.64 ~ 0.37`` (the default 0.3 is a little
+  conservative).
 * **Team normalisation (optional).** Every kill is an opponent death. A team's expected kills
   should be consistent with the expected deaths of the *actual* opposing lineup: team A's rates are
   scaled by ``sqrt(mean DPR of B's lineup / B's historical team DPR)`` (geometric mean of the
@@ -42,9 +50,10 @@ from __future__ import annotations
 
 import json
 import math
+import threading
 from collections import OrderedDict
 from collections.abc import Iterable, Mapping, Sequence
-from dataclasses import asdict, dataclass, replace
+from dataclasses import asdict, dataclass, fields, replace
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -112,8 +121,12 @@ class KillModelConfig:
     min_records_for_size: int = 30
     unknown_player_cv_mult: float = 1.5
     deaths_prior_rounds: float = 150.0
-    score_skew: float = 0.3
-    hist_margin_var: float = 0.12  # Var(D / R) of historical maps (margin per round)
+    score_skew: float = 0.3  # prior / default gamma (used as is when records carry no scorelines)
+    hist_margin_var: float = 0.12  # default Var(D / R) of historical maps (margin per round)
+    estimate_score_skew: bool = True  # estimate gamma / hist_margin_var from team_rounds_won when present
+    score_skew_prior_sd: float = 0.15
+    score_skew_bounds: tuple[float, float] = (0.0, 1.0)
+    min_records_for_skew: int = 200
     normalise_teams: bool = True
     min_lineup_for_normalisation: int = 4
     normalisation_bounds: tuple[float, float] = (0.85, 1.18)
@@ -326,6 +339,9 @@ class _Estimates:
     global_tau2: float
     global_size: float
     n_records: int
+    score_skew: float
+    hist_margin_var: float
+    n_skew_records: int = 0
 
 
 class PlayerKillModel:
@@ -343,6 +359,7 @@ class PlayerKillModel:
         self._tid: dict[int, int] = {}
         self._mid: dict[str, int] = {}
         self._cache: OrderedDict[float, _Estimates] = OrderedDict()
+        self._lock = threading.RLock()  # guards the as-of cache (projections may run in threads)
         self._t: FloatArray = np.zeros(0)
         self._p: IntArray = np.zeros(0, dtype=np.int64)
         self._team: IntArray = np.zeros(0, dtype=np.int64)
@@ -352,11 +369,25 @@ class PlayerKillModel:
         self._deaths: FloatArray = np.zeros(0)
         self._rounds: FloatArray = np.zeros(0)
         self._role: npt.NDArray[np.int16] = np.zeros(0, dtype=np.int16)
+        self._own_rounds: FloatArray = np.zeros(0)  # team rounds won (NaN = unknown)
+        self._opp_rounds: FloatArray = np.zeros(0)  # opponent rounds won (NaN = unknown)
+        self.fit_stats: dict[str, int] = {}
+
+    def __getstate__(self) -> dict[str, Any]:
+        """Picklable / deep-copyable: the lock is dropped and recreated."""
+        state = self.__dict__.copy()
+        state.pop("_lock", None)
+        return state
+
+    def __setstate__(self, state: dict[str, Any]) -> None:
+        self.__dict__.update(state)
+        self._lock = threading.RLock()
 
     def _set_arrays(self, arr: FloatArray) -> None:
-        """Columns: t, player idx, team idx, opponent idx, map idx, kills, deaths, rounds, role code."""
+        """Columns: t, player idx, team idx, opponent idx, map idx, kills, deaths, rounds, role code,
+        team rounds won, opponent rounds won (NaN when unknown)."""
         if arr.size == 0:
-            arr = np.zeros((0, 9))
+            arr = np.zeros((0, _N_COLS))
         self._t = arr[:, 0].copy()
         self._p = arr[:, 1].astype(np.int64)
         self._team = arr[:, 2].astype(np.int64)
@@ -366,6 +397,8 @@ class PlayerKillModel:
         self._deaths = arr[:, 6].copy()
         self._rounds = arr[:, 7].copy()
         self._role = arr[:, 8].astype(np.int16)
+        self._own_rounds = arr[:, 9].copy()
+        self._opp_rounds = arr[:, 10].copy()
 
     # ------------------------------------------------------------------ fitting
     def fit(self, records: Iterable[PlayerMapRecord], *, half_life_days: float = 120.0) -> PlayerKillModel:
@@ -376,32 +409,37 @@ class PlayerKillModel:
         pid: dict[int, int] = {}
         tid: dict[int, int] = {}
         mid: dict[str, int] = {}
-        cols: list[tuple[float, int, int, int, int, float, float, float, int]] = []
+        cols: list[tuple[float, ...]] = []
+        skipped = 0
         for rec in records:
-            if rec.rounds_played <= 0:
+            row = _record_row(rec)
+            if row is None:  # malformed / implausible stat line: skip it, never abort the batch
+                skipped += 1
                 continue
-            t = ensure_utc(rec.played_at).timestamp() / 86400.0
-            role = rec.role
-            code = ROLE_CODE[role] if role is not None and role is not PlayerRole.UNKNOWN else NO_ROLE
+            t, map_name, kills, deaths, rounds, code, own, opp = row
             cols.append(
                 (
                     t,
                     pid.setdefault(rec.player_id, len(pid)),
                     tid.setdefault(rec.team_id, len(tid)),
                     tid.setdefault(rec.opponent_team_id, len(tid)),
-                    mid.setdefault(normalize_map_name(rec.map_name), len(mid)),
-                    float(rec.kills),
-                    float(rec.deaths),
-                    float(rec.rounds_played),
+                    mid.setdefault(map_name, len(mid)),
+                    kills,
+                    deaths,
+                    rounds,
                     code,
+                    own,
+                    opp,
                 )
             )
+        self.fit_stats = {"n_records": len(cols), "n_skipped": skipped}
         self._pid, self._tid, self._mid = pid, tid, mid
         self._player_ids = sorted(pid, key=lambda k: pid[k])
         self._team_ids = sorted(tid, key=lambda k: tid[k])
         self._maps = sorted(mid, key=lambda k: mid[k])
-        self._set_arrays(np.asarray(cols, dtype=np.float64).reshape(-1, 9))
-        self._cache.clear()
+        with self._lock:
+            self._set_arrays(np.asarray(cols, dtype=np.float64).reshape(-1, _N_COLS))
+            self._cache.clear()
         return self
 
     @property
@@ -418,15 +456,16 @@ class PlayerKillModel:
 
     def _estimates(self, as_of: datetime) -> _Estimates:
         key = self._cutoff(as_of)
-        hit = self._cache.get(key)
-        if hit is not None:
-            self._cache.move_to_end(key)
-            return hit
-        est = self._compute(key)
-        self._cache[key] = est
-        while len(self._cache) > self.config.cache_size:
-            self._cache.popitem(last=False)
-        return est
+        with self._lock:
+            hit = self._cache.get(key)
+            if hit is not None:
+                self._cache.move_to_end(key)
+                return hit
+            est = self._compute(key)
+            self._cache[key] = est
+            while len(self._cache) > self.config.cache_size:
+                self._cache.popitem(last=False)
+            return est
 
     def _default_estimates(self) -> _Estimates:
         cfg = self.config
@@ -451,6 +490,8 @@ class PlayerKillModel:
             global_tau2=tau2,
             global_size=cfg.default_size,
             n_records=0,
+            score_skew=cfg.score_skew,
+            hist_margin_var=cfg.hist_margin_var,
         )
 
     def _compute(self, cutoff: float) -> _Estimates:
@@ -553,6 +594,7 @@ class PlayerKillModel:
         tdpr_num = np.bincount(team, weights=w * dth, minlength=n_t)
         tdpr_den = np.bincount(team, weights=wr, minlength=n_t)
         team_dpr = (tdpr_num + cfg.deaths_prior_rounds * gd) / (tdpr_den + cfg.deaths_prior_rounds)
+        skew, hmv, n_skew = self._score_skew(sel, w, p, k, lam[p] * r * adj, r, n_p)
         return _Estimates(
             g=g,
             gd=gd,
@@ -571,7 +613,57 @@ class PlayerKillModel:
             global_tau2=float(global_tau2),
             global_size=float(global_size),
             n_records=int(sel.size),
+            score_skew=skew,
+            hist_margin_var=hmv,
+            n_skew_records=n_skew,
         )
+
+    def _score_skew(
+        self,
+        sel: IntArray,
+        w: FloatArray,
+        p: IntArray,
+        k: FloatArray,
+        mu: FloatArray,
+        r: FloatArray,
+        n_p: int,
+    ) -> tuple[float, float, int]:
+        """``(gamma, hist_margin_var, n records used)`` from records with known scorelines.
+
+        See the module docstring. Returns the configured defaults when estimation is disabled or
+        fewer than ``min_records_for_skew`` records carry scorelines.
+        """
+        cfg = self.config
+        own = self._own_rounds[sel]
+        opp = self._opp_rounds[sel]
+        has = np.isfinite(own) & np.isfinite(opp) & (own + opp > 0) & (mu > 0)
+        n_has = int(has.sum())
+        if not cfg.estimate_score_skew or n_has < cfg.min_records_for_skew:
+            return cfg.score_skew, cfg.hist_margin_var, 0
+        d = (own - opp)[has]
+        wh, ph, kh, muh, rh = w[has], p[has], k[has], mu[has], r[has]
+        sw = np.bincount(ph, weights=wh, minlength=n_p)
+        d_bar = np.bincount(ph, weights=wh * d, minlength=n_p) / np.where(sw > 0, sw, 1.0)
+        dc = d - d_bar[ph]
+        x = muh * dc / rh  # d mean / d gamma
+        resid = kh - muh
+        wt = wh / muh  # quasi-Poisson weights (the dispersion cancels in the point estimate)
+        sxx = float(np.sum(wt * x * x))
+        hmv = float(np.sum(wh * (dc / rh) ** 2) / wh.sum())
+        if sxx <= 1e-12 or not np.isfinite(hmv):
+            return cfg.score_skew, cfg.hist_margin_var, 0
+        gamma_hat = float(np.sum(wt * x * resid) / sxx)
+        var_hat = float(np.sum((wt * x * resid) ** 2)) / sxx**2  # HC0 sandwich
+        prior_prec = 1.0 / max(cfg.score_skew_prior_sd, 1e-9) ** 2
+        data_prec = 1.0 / max(var_hat, 1e-12)
+        gamma = (gamma_hat * data_prec + cfg.score_skew * prior_prec) / (data_prec + prior_prec)
+        lo, hi = cfg.score_skew_bounds
+        return float(min(max(gamma, lo), hi)), hmv, n_has
+
+    def score_params(self, as_of: datetime) -> tuple[float, float]:
+        """``(score_skew gamma, hist_margin_var)`` used for projections as of ``as_of`` (no look-ahead)."""
+        est = self._estimates(as_of)
+        return est.score_skew, est.hist_margin_var
 
     def _group_prior(
         self, kills: FloatArray, expo: FloatArray, c: FloatArray, members: npt.NDArray[np.bool_]
@@ -748,13 +840,14 @@ class PlayerKillModel:
             opp = np.asarray(team_rounds[1], dtype=np.int64)
             margin = own - opp
             total = own + opp
+        skew, hmv = self.score_params(as_of)
         dist = kills_distribution(
             rate,
             total,
             margin=margin,
             weights=None if isinstance(rounds_pmf, Mapping) else weights,
-            score_skew=self.config.score_skew,
-            hist_margin_var=self.config.hist_margin_var,
+            score_skew=skew,
+            hist_margin_var=hmv,
         )
         exp_rounds = _expected_rounds(rounds_pmf, weights)
         return PlayerProjection(
@@ -797,6 +890,7 @@ class PlayerKillModel:
         else:
             idx = np.arange(t1.size)
         center1 = float(np.average(t1 - t2, weights=w))
+        skew, hmv = self.score_params(as_of)
         cols = []
         for pl in players:
             own, opp = (t1[idx], t2[idx]) if pl.team is TeamSlot.TEAM1 else (t2[idx], t1[idx])
@@ -808,8 +902,8 @@ class PlayerKillModel:
                     opp,
                     gen,
                     margin_center=center,
-                    score_skew=self.config.score_skew,
-                    hist_margin_var=self.config.hist_margin_var,
+                    score_skew=skew,
+                    hist_margin_var=hmv,
                 )
             )
         return top_fragger_probs(np.stack(cols, axis=1), [pl.player_id for pl in players])
@@ -827,6 +921,9 @@ class PlayerKillModel:
             "role_kpr": {ROLE_ORDER[c].value: v for c, v in est.role_mu.items()},
             "role_size": {ROLE_ORDER[c].value: v for c, v in est.role_size.items()},
             "map_factor": {m: float(est.map_factor[i]) for m, i in self._mid.items()},
+            "score_skew": est.score_skew,
+            "hist_margin_var": est.hist_margin_var,
+            "n_skew_records": est.n_skew_records,
         }
 
     # ------------------------------------------------------------------ persistence
@@ -858,6 +955,8 @@ class PlayerKillModel:
             deaths=self._deaths,
             rounds=self._rounds,
             role=self._role,
+            own_rounds=self._own_rounds,
+            opp_rounds=self._opp_rounds,
         )
         return p
 
@@ -871,8 +970,11 @@ class PlayerKillModel:
             if meta.get("kind") != "cs2bot.PlayerKillModel":
                 raise ValueError("not a PlayerKillModel file")
             cfg_raw = dict(meta.get("config", {}))
-            if "normalisation_bounds" in cfg_raw:
-                cfg_raw["normalisation_bounds"] = tuple(cfg_raw["normalisation_bounds"])
+            for name in ("normalisation_bounds", "score_skew_bounds"):
+                if name in cfg_raw:
+                    cfg_raw[name] = tuple(cfg_raw[name])
+            known_fields = {f.name for f in fields(KillModelConfig)}
+            cfg_raw = {key: val for key, val in cfg_raw.items() if key in known_fields}
             model = cls(KillModelConfig(**cfg_raw))
             model.half_life_days = float(meta["half_life_days"])
             model._player_ids = [int(x) for x in meta["player_ids"]]
@@ -890,7 +992,47 @@ class PlayerKillModel:
             model._deaths = np.asarray(z["deaths"], dtype=np.float64)
             model._rounds = np.asarray(z["rounds"], dtype=np.float64)
             model._role = np.asarray(z["role"], dtype=np.int16)
+            nan = np.full(model._t.size, np.nan)
+            model._own_rounds = np.asarray(z["own_rounds"], dtype=np.float64) if "own_rounds" in z else nan
+            model._opp_rounds = (
+                np.asarray(z["opp_rounds"], dtype=np.float64) if "opp_rounds" in z else nan.copy()
+            )
         return model
+
+
+_N_COLS = 11
+#: A player cannot kill more than the 5 opponents per round; anything above this is a data error.
+_MAX_KILLS_PER_ROUND = 5.0
+
+
+def _record_row(rec: PlayerMapRecord) -> tuple[float, str, float, float, float, int, float, float] | None:
+    """Validated numeric row of one record, or None when the stat line is unusable.
+
+    Skips non-positive rounds, negative kills/deaths and impossible kill or death counts (more than
+    5 per round). Scorelines (``team_rounds_won`` / ``opponent_rounds_won``) are optional: negative
+    values or ones exceeding ``rounds_played`` make them unknown (NaN) without dropping the record.
+    """
+    try:
+        rounds = float(rec.rounds_played)
+        kills = float(rec.kills)
+        deaths = float(rec.deaths)
+        if not (rounds > 0 and kills >= 0 and deaths >= 0):
+            return None
+        if kills > _MAX_KILLS_PER_ROUND * rounds or deaths > rounds:
+            return None
+        t = ensure_utc(rec.played_at).timestamp() / 86400.0
+        map_name = normalize_map_name(rec.map_name)
+        if not map_name or not math.isfinite(t):
+            return None
+        role = rec.role
+        code = ROLE_CODE[role] if role is not None and role is not PlayerRole.UNKNOWN else NO_ROLE
+        own = float("nan") if rec.team_rounds_won is None else float(rec.team_rounds_won)
+        opp = float("nan") if rec.opponent_rounds_won is None else float(rec.opponent_rounds_won)
+        if not (own >= 0 and opp >= 0 and own + opp >= rounds):  # a player plays at most every round
+            own = opp = float("nan")
+        return t, map_name, kills, deaths, rounds, code, own, opp
+    except (TypeError, ValueError, OverflowError, AttributeError):
+        return None
 
 
 def _expected_rounds(rounds_pmf: Mapping[int, float] | npt.ArrayLike, weights: npt.ArrayLike | None) -> float:

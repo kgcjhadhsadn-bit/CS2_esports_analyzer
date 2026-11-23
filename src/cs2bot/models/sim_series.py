@@ -114,6 +114,55 @@ def series_sum_pmf(
     return total / s if s > 0 else np.array([1.0])
 
 
+def series_prefix_sum_pmf(
+    fmt: MatchFormat,
+    p_maps: Sequence[float],
+    pmf_if_team1_wins: Sequence[FloatArray],
+    pmf_if_team2_wins: Sequence[FloatArray],
+    upto: int,
+) -> tuple[float, FloatArray]:
+    """``(P(map upto is played), pmf of X_1 + ... + X_upto given that map upto is played)``.
+
+    ``upto`` is 1-based. Map ``upto`` is played iff the series is undecided after maps ``1..upto-1``,
+    so the condition only involves earlier maps: their contributions are carried through the series
+    programme with winner-conditional pmfs (e.g. in a BO3, "maps 1-3" given that map 3 is played means
+    each team won one of maps 1-2), and map ``upto`` itself enters with its unconditional pmf. When
+    the map can never be played the probability is 0 and the returned pmf is ``[1.0]``.
+    """
+    n = fmt.n_maps
+    if not 1 <= upto <= n:
+        raise ValueError(f"upto must be in 1..{n} for a {fmt.value}, got {upto}")
+    need = fmt.maps_to_win
+    states: dict[tuple[int, int], FloatArray] = {(0, 0): np.array([1.0])}
+    for k in range(upto - 1):
+        p = float(p_maps[k])
+        nxt: dict[tuple[int, int], FloatArray] = {}
+        for (a, b), acc in states.items():
+            for state, q, pmf in (
+                ((a + 1, b), p, pmf_if_team1_wins[k]),
+                ((a, b + 1), 1.0 - p, pmf_if_team2_wins[k]),
+            ):
+                if q <= 0.0:
+                    continue
+                contrib = q * np.convolve(acc, pmf)
+                nxt[state] = pad_add(nxt[state], contrib) if state in nxt else contrib
+        states = {state: acc for state, acc in nxt.items() if not _decided(state, need)}
+    acc_total = np.zeros(1, dtype=np.float64)
+    for acc in states.values():
+        acc_total = pad_add(acc_total, acc)
+    mass = float(acc_total.sum())
+    if mass <= 0.0:
+        return 0.0, np.array([1.0])
+    p_last = float(p_maps[upto - 1])
+    last = pad_add(
+        p_last * np.asarray(pmf_if_team1_wins[upto - 1]),
+        np.asarray(pmf_if_team2_wins[upto - 1]),
+        1.0 - p_last,
+    )
+    out = np.convolve(acc_total / mass, last)
+    return mass, out / out.sum()
+
+
 def played_mask(fmt: MatchFormat, team1_won: np.ndarray) -> np.ndarray:
     """Vectorised "slot played" mask for simulated series.
 
@@ -134,4 +183,4 @@ def played_mask(fmt: MatchFormat, team1_won: np.ndarray) -> np.ndarray:
     return out
 
 
-__all__ = ["SeriesResult", "played_mask", "series_outcome", "series_sum_pmf"]
+__all__ = ["SeriesResult", "played_mask", "series_outcome", "series_prefix_sum_pmf", "series_sum_pmf"]

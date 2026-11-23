@@ -579,3 +579,36 @@ def test_loaders_on_an_empty_database(session: Session):
     assert datasets.load_player_map_records(session) == []
     assert datasets.load_team_demo_stats(session) == []
     session.execute(delete(Kill))
+
+
+def test_decider_flag_wins_over_a_contradicting_picker(session: Session):
+    _teams(session)
+    _add_match(session, match_id=1, t1=1, t2=2, at=T0)
+    session.add_all(
+        [
+            MapPlayed(
+                match_id=1,
+                map_number=1,
+                map_name="nuke",
+                status=MatchStatus.FINISHED,
+                team1_rounds=13,
+                team2_rounds=4,
+                picked_by_team_id=1,
+            ),
+            # a source wrote the decider's "picker" (e.g. the team that chose the side): not a pick
+            MapPlayed(
+                match_id=1,
+                map_number=2,
+                map_name="ancient",
+                status=MatchStatus.FINISHED,
+                team1_rounds=13,
+                team2_rounds=9,
+                picked_by_team_id=2,
+                is_decider=True,
+            ),
+        ]
+    )
+    session.flush()
+    first, decider = datasets.load_map_results(session)
+    assert first.picked_by is TeamSlot.TEAM1
+    assert decider.picked_by is None

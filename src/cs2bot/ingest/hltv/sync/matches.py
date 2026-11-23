@@ -8,9 +8,9 @@ first created from PandaScore). Team-specific columns are written in *our* orien
 by team id (winner, picks, vetoes, lineups, player stats) are orientation-free.
 
 Round history is stored per map in ``maps_played.extra['hltv']['rounds']`` (see
-:func:`hltv_round_records`). Writing it into the ``rounds`` table as well is opt-in
-(``HLTVSyncOptions.write_round_rows``) because demo parsing owns that table and the schema has no
-source column to tell the two apart.
+:func:`hltv_round_records`) and, when complete, also in the ``rounds`` table with
+``source=DataSource.HLTV`` (``HLTVSyncOptions.write_round_rows``, default on). Rounds from demo
+parsing (``source=DEMO``) are never overwritten; the demo pipeline replaces HLTV rows.
 """
 
 from __future__ import annotations
@@ -21,7 +21,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 from typing import Any
 
-from sqlalchemy import func, select
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from cs2bot.config import Settings
@@ -69,6 +69,7 @@ from cs2bot.ingest.hltv.sync.common import (
     fetch_page,
     in_scope,
     merge_extra,
+    rank_as_of,
     record_team_rank,
     resolve_hltv_player,
     source_base_url,
@@ -238,7 +239,7 @@ def _persist_match_page(
             report.add_error(f"{what}: linked match {match.id} has different teams; not touching it")
             return None
     now = utcnow()
-    _apply_match_fields(match, page, orient, tournament, settings, team1, team2, hints, now)
+    _apply_match_fields(session, match, page, orient, tournament, settings, team1, team2, hints, now)
     session.flush()
     _sync_vetoes(session, match, page, orient)
     _sync_maps(session, match, page, orient, report)
@@ -313,6 +314,7 @@ def _merge_status(current: MatchStatus | None, new: MatchStatus) -> MatchStatus:
 
 
 def _apply_match_fields(
+    session: Session,
     match: Match,
     page: MatchPage,
     orient: _Orientation,
@@ -345,8 +347,10 @@ def _apply_match_fields(
         match.team1_score, match.team2_score = orient.ours(page.team1_score, page.team2_score)
         if page.winner is not None:
             match.winner_team_id = orient.team_id(page.winner)
-    rank1 = page.team1_rank if page.team1_rank is not None else team1.hltv_rank
-    rank2 = page.team2_rank if page.team2_rank is not None else team2.hltv_rank
+    # The page shows the ranks that applied at match time; otherwise use the ranking history.
+    when = page.scheduled_at or match.scheduled_at
+    rank1 = page.team1_rank if page.team1_rank is not None else rank_as_of(session, team1, when, now=now)
+    rank2 = page.team2_rank if page.team2_rank is not None else rank_as_of(session, team2, when, now=now)
     tier = tournament.tier if tournament is not None and tournament.tier is not Tier.UNRANKED else match.tier
     match.in_scope = bool(match.in_scope) or in_scope(tier, rank1, rank2, settings.scope)
     match.last_synced_at = now
@@ -500,8 +504,11 @@ def _sync_lineups(session: Session, match: Match, page: MatchPage, orient: _Orie
         else:
             row.team_id = team_id
             row.is_standin = standin if row.source == SOURCE else (row.is_standin or standin)
+    # Only teams whose lineup the page actually showed are reconciled: a lineup block that failed to
+    # parse (or is not published yet for one side) must not wipe that team's stored lineup.
+    shown_teams = {orient.slot_team[slot] for slot in TeamSlot if page.lineup(slot)}
     for player_id, row in existing.items():
-        if player_id not in wanted and row.source == SOURCE:
+        if player_id not in wanted and row.source == SOURCE and row.team_id in shown_teams:
             session.delete(row)  # replaced by a stand-in / roster change on HLTV
     session.flush()
 
@@ -829,26 +836,53 @@ def _persist_player_lines(
 
 def _write_round_rows(
     session: Session, row: MapPlayed, match: Match, rounds_payload: list[dict[str, Any]]
-) -> None:
-    """Opt-in: copy HLTV round history into ``rounds`` - only when that map has no rounds yet."""
-    count = session.scalar(select(func.count()).select_from(Round).where(Round.map_played_id == row.id)) or 0
-    if (
-        count
-        or not rounds_payload
-        or any(r["team1_side"] is None or r["winner_side"] is None for r in rounds_payload)
-    ):
-        return
+) -> int:
+    """Upsert the HLTV round history of one map into ``rounds`` (``source=DataSource.HLTV``).
+
+    Only complete histories with known sides are written. A map that already has rows from another
+    source (demo parsing) is left alone: demo rows are richer and the demo pipeline replaces HLTV rows,
+    never the other way round. Existing HLTV rows are updated in place (idempotent), surplus HLTV rows
+    removed. Returns the number of rows written.
+    """
+    if not rounds_payload or any(r["team1_side"] is None or r["winner_side"] is None for r in rounds_payload):
+        return 0
+    numbers = [int(r["round"]) for r in rounds_payload]
+    if len(set(numbers)) != len(numbers):
+        return 0
+    existing = list(session.scalars(select(Round).where(Round.map_played_id == row.id)))
+    if any(r.source is not SOURCE for r in existing):
+        return 0
+    by_number = {r.round_number: r for r in existing}
+    wanted = set(numbers)
+    for old in existing:
+        if old.round_number not in wanted:
+            session.delete(old)
+    session.flush()
     for r in rounds_payload:
-        session.add(
-            Round(
-                map_played_id=row.id,
-                round_number=r["round"],
-                team1_side=Side(r["team1_side"]),
-                winner_side=Side(r["winner_side"]),
-                winner_team_id=match.team1_id if r["winner"] == TeamSlot.TEAM1.value else match.team2_id,
-                end_reason=RoundEndReason(r["end_reason"]),
+        number = int(r["round"])
+        team1_side = Side(r["team1_side"])
+        winner_side = Side(r["winner_side"])
+        winner_team_id = match.team1_id if r["winner"] == TeamSlot.TEAM1.value else match.team2_id
+        end_reason = RoundEndReason(r["end_reason"])
+        target = by_number.get(number)
+        if target is None:
+            session.add(
+                Round(
+                    map_played_id=row.id,
+                    round_number=number,
+                    team1_side=team1_side,
+                    winner_side=winner_side,
+                    winner_team_id=winner_team_id,
+                    source=SOURCE,
+                    end_reason=end_reason,
+                )
             )
-        )
+        else:
+            target.team1_side = team1_side
+            target.winner_side = winner_side
+            target.winner_team_id = winner_team_id
+            target.end_reason = end_reason
+    return len(rounds_payload)
 
 
 def hltv_round_records(session: Session, map_played: MapPlayed) -> list[RoundRecord]:
@@ -922,14 +956,20 @@ def _relevant(
     existing: Match | None,
     settings: Settings,
     opts: HLTVSyncOptions,
+    now: datetime | None = None,
 ) -> bool:
-    """In scope by tier / HLTV rank (``ingest.scope``), HLTV stars, or an already in-scope match."""
+    """In scope by tier / HLTV rank (``ingest.scope``), HLTV stars, or an already in-scope match.
+
+    Ranks are the ones that applied at ``around`` (ranking history for old matches, see
+    :func:`~cs2bot.ingest.hltv.sync.common.rank_as_of`), not today's.
+    """
     if existing is not None and existing.in_scope:
         return True
     if stars >= 1:
         return True
     t1, t2 = _lookup_team(session, team1), _lookup_team(session, team2)
-    if in_scope(None, t1.hltv_rank if t1 else None, t2.hltv_rank if t2 else None, settings.scope):
+    rank1, rank2 = rank_as_of(session, t1, around, now=now), rank_as_of(session, t2, around, now=now)
+    if in_scope(None, rank1, rank2, settings.scope):
         return True
     if t1 is not None and t2 is not None and around is not None:
         candidate = find_match(session, t1.id, t2.id, around, window_hours=opts.match_link_window_hours)
@@ -1056,7 +1096,7 @@ def sync_upcoming(
             continue
         existing = session.scalar(select(Match).where(Match.hltv_id == row.hltv_match_id))
         if not _relevant(
-            session, row.team1, row.team2, row.stars, row.scheduled_at, existing, settings, opts
+            session, row.team1, row.team2, row.stars, row.scheduled_at, existing, settings, opts, current
         ):
             report.skipped += 1
             continue

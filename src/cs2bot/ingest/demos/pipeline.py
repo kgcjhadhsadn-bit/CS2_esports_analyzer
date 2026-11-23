@@ -25,6 +25,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 from demoparser2 import DemoParser
 from sqlalchemy import and_, case, or_, select
@@ -143,10 +144,30 @@ def select_pending_demo_ids(
     return list(session.scalars(statement))
 
 
-def _absolute_url(url: str, settings: Settings) -> str:
-    if url.startswith("/"):
-        return settings.hltv.base_url.rstrip("/") + url
+def _absolute_url(url: str, settings: Settings) -> str | None:
+    """Absolute ``http(s)`` download URL, or ``None`` when the stored value is not one.
+
+    Demo URLs come from scraped pages: a relative path is resolved against the HLTV base URL, a
+    protocol-relative one gets ``https:``, and every other scheme (``file:``, ``javascript:``, ...)
+    is refused so that no downloader is ever pointed at a local file.
+    """
+    url = url.strip()
+    if url.startswith("//"):
+        url = "https:" + url
+    elif url.startswith("/"):
+        url = settings.hltv.base_url.rstrip("/") + url
+    parts = urlsplit(url)
+    if parts.scheme.lower() not in ("http", "https") or not parts.netloc:
+        return None
     return url
+
+
+def _inside(path: Path, directory: Path) -> bool:
+    try:
+        path.resolve().relative_to(directory.resolve())
+    except (OSError, ValueError):
+        return False
+    return True
 
 
 def _header_reader(parser_factory: ParserFactory) -> Callable[[Path], str | None]:
@@ -170,13 +191,17 @@ def _remove_empty_dirs(*dirs: Path) -> None:
 
 
 def _cleanup(work_dir: Path, archive: Path | None, dem_paths: list[Path], settings: Settings) -> None:
-    """Delete raw files according to the keep flags (a plain ``.dem`` download is both things)."""
+    """Delete raw files according to the keep flags (a plain ``.dem`` download is both things).
+
+    Only files inside ``work_dir`` are ever deleted: an injected downloader that returns a path
+    elsewhere (a cache, a file the owner downloaded by hand) keeps that file.
+    """
     keep_archive, keep_dem = settings.demos.keep_archives, settings.demos.keep_dem_files
     for dem in dem_paths:
         is_archive = archive is not None and dem == archive
-        if not (keep_dem or (is_archive and keep_archive)):
+        if not (keep_dem or (is_archive and keep_archive)) and _inside(dem, work_dir):
             dem.unlink(missing_ok=True)
-    if archive is not None and archive not in dem_paths and not keep_archive:
+    if archive is not None and archive not in dem_paths and not keep_archive and _inside(archive, work_dir):
         archive.unlink(missing_ok=True)
     if work_dir.is_dir():
         for leftover in work_dir.rglob("*.part"):
@@ -211,12 +236,19 @@ def _process_one(
             session.commit()
             report.failed += 1
             return
-        previous_status = demo.status
+        url = _absolute_url(demo.url, settings)
+        if url is None:
+            demo.status = DemoStatus.UNAVAILABLE
+            demo.error = "download url is not an http(s) url"
+            session.commit()
+            report.unavailable += 1
+            return
+        previous_status, previous_error = demo.status, demo.error
         demo.status = DemoStatus.DOWNLOADING
         demo.attempts += 1
         demo.error = None
         session.commit()
-        url, match_id = _absolute_url(demo.url, settings), demo.match_id
+        match_id = demo.match_id
 
     work_dir = resolve_path(settings.demos.storage_dir) / f"match_{match_id}" / f"demo_{demo_id}"
     archive: Path | None = None
@@ -235,6 +267,7 @@ def _process_one(
                             previous_status if previous_status is DemoStatus.FAILED else DemoStatus.PENDING
                         )
                         demo.attempts = max(0, demo.attempts - 1)
+                        demo.error = previous_error
                         session.commit()
                 raise _Blocked(str(exc)) from exc
             raise

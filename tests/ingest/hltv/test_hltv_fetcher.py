@@ -22,11 +22,12 @@ from cs2bot.ingest.hltv import (
 )
 from cs2bot.ingest.hltv.fetcher import (
     FetchOptions,
-    InjectableRateLimiter,
+    hltv_url,
     playwright_proxy,
     wait_for_challenge_to_clear,
 )
 from cs2bot.ingest.hltv.urls import cache_key, canonical_url
+from cs2bot.utils.http import RateLimiter
 from tests.ingest.hltv.conftest import FIXTURES, FakeClock, load_fixture
 
 MATCH_HTML = load_fixture("match_bo3_finished.html")
@@ -194,8 +195,8 @@ def test_network_fetches_are_spaced_by_the_rate_limiter(
     assert fetcher.stats.slept_s == pytest.approx(sum(clock.sleeps))
 
 
-def test_injectable_rate_limiter_only_sleeps_the_remaining_gap(clock: FakeClock) -> None:
-    limiter = InjectableRateLimiter(4.0, 9.0, clock=clock.monotonic, sleep=clock.sleep, rng=random.Random(3))
+def test_rate_limiter_only_sleeps_the_remaining_gap(clock: FakeClock) -> None:
+    limiter = RateLimiter(4.0, 9.0, clock=clock.monotonic, sleep=clock.sleep, rng=random.Random(3))
     assert limiter.wait() == 0.0
     clock.advance(2.0)
     slept = limiter.wait()
@@ -439,3 +440,61 @@ def test_cache_is_compressed_reads_legacy_entries_and_prunes(
     fetcher.get("/matches/2378010/x")
     assert fetcher.prune_cache(timedelta(days=1)) == 1
     assert fetcher.cached("/matches/2378001/x") is None and fetcher.cached("/matches/2378010/x") is not None
+
+
+# ------------------------------------------------------------------------------------------- settings
+
+
+def test_fetch_options_come_from_settings(tmp_path: Path, clock: FakeClock) -> None:
+    settings = HLTVSettings(
+        cache_dir=tmp_path / "c",
+        challenge_wait_s=7.5,
+        cooldown_base_s=120.0,
+        cooldown_max_s=300.0,
+        block_resources=False,
+        browser_profile_dir=tmp_path / "profile",
+    )
+    options = FetchOptions.from_settings(settings, locale="pl-PL")
+    assert (options.challenge_wait_s, options.cooldown_base_s, options.cooldown_max_s) == (7.5, 120.0, 300.0)
+    assert options.block_resources is False and options.browser_profile_dir == tmp_path / "profile"
+    assert options.locale == "pl-PL" and options.transport_retries == FetchOptions().transport_retries
+
+    # without explicit options the fetcher uses the settings: 120 s, 240 s, then capped at 300 s
+    loader = ScriptedLoader(LoadedPage(CHALLENGE_HTML, 403))
+    fetcher = HLTVFetcher(
+        settings, page_loader=loader, sleep=clock.sleep, clock=clock.monotonic, now=clock.now
+    )
+    assert fetcher.options.cooldown_base_s == 120.0
+    for expected in (120.0, 240.0, 300.0):
+        with pytest.raises(HLTVBlockedError) as exc:
+            fetcher.get(f"/matches/{int(expected)}/x")
+        assert exc.value.retry_after_s == expected
+        clock.advance(expected + 1)
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        ("/matches/1/x", "https://www.hltv.org/matches/1/x"),
+        ("matches/1/x", "https://www.hltv.org/matches/1/x"),
+        ("https://hltv.org/matches/1/x?a=1#frag", "https://www.hltv.org/matches/1/x?a=1"),
+        ("http://WWW.HLTV.ORG/results?offset=100", "https://www.hltv.org/results?offset=100"),
+        ("//www.hltv.org/news/1/x", "https://www.hltv.org/news/1/x"),
+    ],
+)
+def test_hltv_url_normalises_same_site_urls(value: str, expected: str) -> None:
+    assert hltv_url("https://www.hltv.org/", value) == expected
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "https://evil.example.com/matches/1/x",
+        "//evil.example.com/matches/1",
+        "https://hltv.org.evil.com/matches/1",
+        "https://user@evil.com/x",
+    ],
+)
+def test_hltv_url_refuses_other_hosts(value: str) -> None:
+    with pytest.raises(ValueError, match="non-HLTV"):
+        hltv_url("https://www.hltv.org", value)

@@ -303,17 +303,25 @@ class PandaScoreClient:
                 raise PandaScoreResponseError(f"GET /{path.lstrip('/')}: expected a JSON list")
             self.stats.pages += 1
             fetched += 1
+            objects = duplicates = 0
             for item in data:
                 if not isinstance(item, dict):
                     self.stats.invalid_items += 1
                     continue
+                objects += 1
                 key = item.get("id")
-                if key is not None:
+                if isinstance(key, int | str):  # a malformed (e.g. list) id is not hashable: no dedup
                     if key in seen:
+                        duplicates += 1
                         continue
                     seen.add(key)
                 yield item
             if not data:
+                return
+            if objects and duplicates == objects:
+                # A full page of rows we already yielded: the server ignores page[number] (or the
+                # list shifted by more than a page). Following ``next`` would loop forever.
+                logger.warning("PandaScore GET /%s: page %d repeats earlier rows; stopping", path, page)
                 return
             if "link" in response.headers:
                 if "next" not in response.links:
@@ -332,11 +340,15 @@ class PandaScoreClient:
     def _typed[M: PSModel](
         self, model: type[M], items: Iterator[dict[str, Any]], on_invalid: InvalidHandler | None
     ) -> Iterator[M]:
-        """Validate items one by one; a malformed item is reported and skipped, never fatal."""
+        """Validate items one by one; a malformed item is reported and skipped, never fatal.
+
+        Besides pydantic's ``ValidationError`` (a ``ValueError``), any ``TypeError`` / ``ArithmeticError``
+        / ``OSError`` a validator lets escape on absurd input is treated the same way.
+        """
         for raw in items:
             try:
-                yield model.model_validate(raw)
-            except ValidationError as exc:
+                parsed = model.model_validate(raw)
+            except (ValueError, TypeError, ArithmeticError, OSError) as exc:
                 self.stats.invalid_items += 1
                 if on_invalid is not None:
                     on_invalid(raw, exc)
@@ -344,9 +356,11 @@ class PandaScoreClient:
                     logger.warning(
                         "PandaScore: skipping malformed %s id=%r (%d validation errors)",
                         model.__name__,
-                        raw.get("id"),
-                        exc.error_count(),
+                        str(raw.get("id"))[:40],
+                        exc.error_count() if isinstance(exc, ValidationError) else 1,
                     )
+                continue
+            yield parsed
 
     # ------------------------------------------------------------------ matches
 

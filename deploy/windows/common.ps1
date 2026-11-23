@@ -135,7 +135,8 @@ function Invoke-Checked {
         [Parameter(Mandatory = $true)][string]$FilePath,
         [string[]]$Arguments = @()
     )
-    & $FilePath @Arguments
+    # Out-Host: the program's output is shown but never becomes the return value of the caller.
+    & $FilePath @Arguments | Out-Host
     if ($LASTEXITCODE -ne 0) {
         throw "$Description failed (exit code $LASTEXITCODE)."
     }
