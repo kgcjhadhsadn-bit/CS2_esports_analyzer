@@ -1,0 +1,42 @@
+{
+  "permissions": {
+    "allow": [
+      "Workflow",
+      "Agent",
+      "WebSearch",
+      "WebFetch",
+      "Bash(.venv/bin/python -m pytest *)",
+      "Bash(.venv/bin/ruff *)",
+      "Bash(.venv/bin/mypy *)",
+      "Bash(.venv/bin/alembic *)",
+      "Bash(.venv/bin/cs2bot *)",
+      "Bash(uv sync *)",
+      "Bash(uv run pytest *)",
+      "Bash(uv run ruff *)",
+      "Bash(uv run mypy *)",
+      "Bash(uv run alembic *)",
+      "Bash(uv run cs2bot *)",
+      "Bash(npm ci *)",
+      "Bash(npm run *)",
+      "Bash(npm test *)",
+      "Bash(git status *)",
+      "Bash(git diff *)",
+      "Bash(git log *)",
+      "Bash(git show *)",
+      "Bash(git add *)",
+      "Bash(git commit *)",
+      "Bash(git push -u origin claude/*)",
+      "Bash(ls *)",
+      "Bash(cat *)",
+      "Bash(head *)",
+      "Bash(tail *)",
+      "Bash(grep *)",
+      "Bash(find *)",
+      "Bash(wc *)",
+      "Bash(mkdir -p *)",
+      "Bash(docker compose config *)",
+      "Bash(bash -n *)",
+      "Bash(pg_lsclusters *)"
+    ]
+  }
+}
