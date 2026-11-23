@@ -9,7 +9,8 @@ Flow of :meth:`BetclicBrowserSource.fetch_cs2_events` (research notes: :mod:`cs2
    and hands the first frame(s) to Python (``response.body()`` never resolves for those server
    streams), and listen to ``page.on("response")`` for JSON responses;
 3. open ``base_url + cs2_listing_path``, collect event links (``...-m<id>``; filtered with the CS2
-   pattern when the listing mixes e-sports), soonest events first;
+   pattern when the listing mixes e-sports); the soonest events are kept and visited LAST so
+   that their prices are the freshest when the crawl ends;
 4. visit each event page with polite random pauses; ask the page for every market category found
    in its state (``GetMatchWithNotification`` with each ``ca_*`` id - exactly what the site does
    when a tab is opened) and fall back to clicking category tabs;
@@ -570,7 +571,14 @@ class _CrawlRun:
         )
 
     def _plan(self, links: dict[str, str], listing_records: list[ParsedEvent]) -> list[tuple[str, str]]:
-        """Event pages to visit: CS2 events only, soonest first, within the look-ahead window."""
+        """Event pages to visit: CS2 events inside the look-ahead window, the soonest ones LAST.
+
+        When more events are listed than ``max_events_per_run`` the soonest ones are kept. They
+        are visited at the END of the crawl: a crawl takes minutes and its prices are stored when
+        it finishes, so whatever is visited first is the stalest by then - and the matches about
+        to start are the ones whose prices must still be inside ``betclic.odds_max_age_s`` when
+        the decision job runs. Events without a known start time are visited first.
+        """
         now = utcnow()
         horizon = now + timedelta(hours=self.settings.scope.max_hours_ahead)
         records = {r.external_id: r for r in listing_records}
@@ -588,7 +596,8 @@ class _CrawlRun:
             planned.append((starts, index, event_id, url))
         far_future = now + timedelta(days=3650)
         planned.sort(key=lambda p: (p[0] or far_future, p[1]))
-        return [(eid, url) for _, _, eid, url in planned[: self.cfg.max_events_per_run]]
+        soonest = planned[: self.cfg.max_events_per_run]
+        return [(eid, url) for _, _, eid, url in reversed(soonest)]
 
     async def _fetch_categories(self, page: Page, event_id: str, docs: list[Any]) -> int:
         if not event_id.isdigit():
@@ -694,12 +703,7 @@ class _CrawlRun:
         parsed = parse_captured_full(self.captured)
         allowed = set(self.link_ids) | self.visited_ok
         kept = select_cs2(parsed.records, pattern=self.source._cs2_re, allowed_ids=allowed)
-        self.info.raw_paths_by_event = {r.external_id: parsed.paths.get(r.external_id, []) for r in kept}
-        self.info.captured_at_by_event = {
-            r.external_id: parsed.captured_at[r.external_id]
-            for r in kept
-            if r.external_id in parsed.captured_at
-        }
+        parsed.fill_info(self.info, kept)
         self.info.partial_event_ids = {r.external_id for r in kept if r.external_id not in self.visited_ok}
         self.info.finished_at = utcnow()
         self.info.notes["events_found"] = len(kept)
@@ -712,7 +716,7 @@ class _CrawlRun:
                 self.info.notes["raw_days_removed"] = removed
         except OSError:
             logger.debug("raw payload cleanup failed", exc_info=True)
-        return [r.to_collected() for r in kept]
+        return parsed.collected(kept)
 
 
 # Name used in docs/ARCHITECTURE.md

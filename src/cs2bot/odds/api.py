@@ -244,6 +244,7 @@ class BetclicApiSource:
         failed: set[str] = set()
         for event_id in ids:
             if not event_id.isdigit():
+                failed.add(event_id)  # only its listing markets are known: never "disappear" the rest
                 continue
             try:
                 first = self._post_grpc(
@@ -282,12 +283,7 @@ class BetclicApiSource:
         parsed = parse_captured_full(payloads)
         wanted = set(ids)
         kept = [r for r in parsed.records if r.external_id in wanted]
-        self._info.raw_paths_by_event = {r.external_id: parsed.paths.get(r.external_id, []) for r in kept}
-        self._info.captured_at_by_event = {
-            r.external_id: parsed.captured_at[r.external_id]
-            for r in kept
-            if r.external_id in parsed.captured_at
-        }
+        parsed.fill_info(self._info, kept)
         self._info.partial_event_ids = failed
         self._info.notes |= {"protocol": self.protocol, "events_found": len(kept)}
         self._info.finished_at = utcnow()
@@ -295,7 +291,7 @@ class BetclicApiSource:
             self.store.cleanup(self._info.finished_at)
         except OSError:
             logger.debug("raw payload cleanup failed", exc_info=True)
-        return [r.to_collected() for r in kept]
+        return parsed.collected(kept)
 
     def last_fetch_info(self) -> FetchInfo:
         return self._info

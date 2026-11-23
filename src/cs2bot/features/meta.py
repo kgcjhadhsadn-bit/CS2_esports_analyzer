@@ -259,7 +259,7 @@ class BOCPDConfig:
 
     ``hazard_lambda = 80`` and ``kappa0 = 0.25`` were picked on simulated residual series (sd 0.11):
     a shift of 0.10 in round share is flagged (P >= 0.5) within 20 maps in ~70 % of the runs, while
-    a series without any change spends under 1 % of the time above 0.5. A shorter expected regime
+    a series without any change spends about 1 % of the time above 0.5. A shorter expected regime
     reacts faster but raises false alarms sharply (lambda 40: 3-4 % of the time).
     """
 
@@ -383,10 +383,20 @@ class RegimeConfig:
     bocpd: BOCPDConfig = BOCPDConfig()
     #: P(recent change) at or above this counts as a detected break.
     threshold: float = 0.5
-    #: Teams with fewer maps than this never report a break (the filter is still warming up).
+    #: A team's first maps are dropped from its series: while the strength proxy is still learning
+    #: how good a new team is, its residuals are one-sided (a strong newcomer beats expectations
+    #: every time). Left in, that transient is detected as a "regime" whose end looks like a slump
+    #: for every strong team and a surge for every weak one.
+    warmup_maps: int = 15
+    #: Teams with fewer maps than this (after the warm-up) never report a break.
     min_maps: int = 20
     #: Maps of the previous regime used as the baseline for the size of the shift.
     baseline_maps: int = 40
+    #: The current regime must be at least this many maps old before its level is compared with
+    #: the baseline. A regime of one or two maps is just the last result: the filter resets on a
+    #: surprising map, and what is surprising differs by team strength (a favourite's surprises
+    #: are losses), so very short regimes would make ``shift`` a biased, noisy inverse of strength.
+    min_regime_maps: int = 4
     #: Half-lives (in maps) of the fast and slow moving averages behind ``form_trend``.
     trend_fast_halflife: float = 6.0
     trend_slow_halflife: float = 30.0
@@ -400,7 +410,8 @@ class RegimeBreak:
     ``probability`` = P(the team's current performance regime started within the last
     ``recent_window`` maps); ``shift`` = level of the current regime minus the level of the maps
     before it, in round-share units (+0.05 = wins 5 percentage points more rounds than expected
-    against the same opponents); ``maps_in_regime`` = most probable age of the regime in maps.
+    against the same opponents; NaN while the current regime is younger than
+    ``RegimeConfig.min_regime_maps``); ``maps_in_regime`` = most probable age of the regime in maps.
     All NaN / 0 with ``detected=False`` when the team has too little history.
     """
 
@@ -445,9 +456,16 @@ class RegimeDetector:
         series: Mapping[int, tuple[np.ndarray, np.ndarray, np.ndarray]],
         config: RegimeConfig | None = None,
     ) -> None:
-        """``series``: team id -> (unix times ascending, residuals, match ids), equal lengths."""
-        self._series = dict(series)
+        """``series``: team id -> (unix times ascending, residuals, match ids), equal lengths.
+
+        Pass each team's full history: the first ``config.warmup_maps`` entries are dropped here.
+        """
         self.config = config or RegimeConfig()
+        skip = max(0, self.config.warmup_maps)
+        self._series = {
+            team: (np.asarray(t)[skip:], np.asarray(v, dtype=float)[skip:], np.asarray(m)[skip:])
+            for team, (t, v, m) in series.items()
+        }
         self._cache: dict[int, _TeamRegime] = {}
 
     @classmethod
@@ -518,7 +536,7 @@ class RegimeDetector:
         run = int(team.result.map_run_length[i])
         start = max(i - run + 1, 0)
         base_lo = max(start - self.config.baseline_maps, 0)
-        if start > base_lo:
+        if start > base_lo and i + 1 - start >= self.config.min_regime_maps:
             baseline = float(team.cum[start] - team.cum[base_lo]) / (start - base_lo)
             current = float(team.cum[i + 1] - team.cum[start]) / max(i + 1 - start, 1)
             shift = current - baseline

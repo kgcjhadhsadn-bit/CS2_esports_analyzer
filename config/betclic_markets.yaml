@@ -23,7 +23,11 @@
 #     players two names ("s1mple vs zywoo", "s1mple czy zywoo") for head-to-head markets
 # * exclude / segment_stopwords: regex lists; nested lists (from the YAML anchors below) are flattened.
 #   "Najlepszy gracz" (MVP / rating) is deliberately NOT a kills market.
-# * requires: params that must be known, else the selection stays unmapped (never bet).
+# * requires: params that must be known, else the selection stays unmapped (never bet):
+#     map, line, team, player, players, half, round, and
+#     scope   an explicit scope: a map ("mapa 1"), several maps ("mapy 1-2") or the whole match
+#             ("... - mecz", "... w meczu"). Kill lines REQUIRE it: a 19,5 line priced over a whole
+#             series instead of one map would look like a certain winner to the model.
 # * team_in_market: required | optional - look for one of the event's team names in the market name.
 # * selection kinds (how the selection text is read, always converted to OUR team1/team2 orientation):
 #     team             team name (fuzzy vs the event's teams), or "1" / "2"
@@ -38,6 +42,23 @@
 #     player           a player nickname (resolved to an internal player id via the lineups)
 #     player_draw      player, or a draw word
 #     player_over_under  "s1mple Powyżej 19,5" (player from the selection or from the market name)
+#
+# SAFETY GUARDS (section `guards:` below; defaults live in cs2bot.odds.market_mapping)
+# -----------------------------------------------------------------------------------
+# A wrongly mapped market is far worse than an unmapped one (the bot bets when the model is
+# confident, and a mis-read market often looks like a sure thing), so on top of the rules:
+#   * names stating "bez dogrywki" / "regulaminowy czas" / "regular time" (overtime EXCLUDED) or
+#     "z dogrywką" / "incl. overtime" (INCLUDED) are checked against the settlement rules the pricing
+#     engine uses (CS2BOT_BETCLIC__TOTALS_INCLUDE_OVERTIME): round totals / handicaps / odd-even are
+#     mapped only when the wording agrees with the setting; every other market type is always priced on
+#     the final result, so its "regulation only" variant stays unmapped. The qualifier is removed from
+#     the name before the rules below run.
+#   * draw-no-bet, double chance and combined markets ("Zwycięzca meczu i liczba map") are never mapped.
+#   * a two-way market type listing a draw selection ("Remis", "X") is a three-way (regulation time /
+#     European handicap) market and stays unmapped; a head-to-head kills market listing a draw is mapped
+#     only when CS2BOT_BETCLIC__H2H_TIE_RULE=lose.
+#   * over/under, yes/no and odd/even selections carrying anything else ("Powyżej 2,5 i NAVI") stay unmapped.
+#   * lines outside `guards.line_bounds` (e.g. a map handicap of 4,5) stay unmapped.
 #
 # HANDICAP CONVENTION (cs2bot.domain.markets): spec.line is TEAM1's handicap in OUR orientation.
 #   "Team2 -1.5" -> line +1.5 with selection team2;  "Team1 -1.5" -> line -1.5 with selection team1.
@@ -56,7 +77,39 @@ settings:
     "no": ["nie", "no"]
     odd: ["nieparzysta", "nieparzyste", "nieparzysty", "nieparzystych", "nieparzysta liczba", "odd"]
     even: ["parzysta", "parzyste", "parzysty", "parzystych", "parzysta liczba", "even"]
-    draw: ["x", "remis", "draw", "tie", "rowno", "zaden"]
+    draw: ["x", "remis", "draw", "tie", "rowno", "zaden", "zadna", "nikt", "neither"]
+
+# Safety guards. Every key is optional (the defaults in cs2bot.odds.market_mapping apply); a list
+# given here REPLACES the default list. Patterns are matched against the folded market name.
+guards:
+  excludes_overtime:
+    - '\(?\s*bez (?:dogrywki|dogrywek|dogrywka|ot)\b\s*\)?'
+    - '\(?\s*(?:tylko )?(?:w )?(?:regulaminow|podstawow)\w* czas\w*(?: gry)?\s*\)?'
+    - '\(?\s*(?:regular|regulation|normal) time\s*\)?'
+    - '\(?\s*\bregulation\b\s*\)?'
+    - '\(?\s*(?:excl(?:\.|uding)?|without|no|w/o) (?:overtime|ot)\b\s*\)?'
+  includes_overtime:
+    - '\(?\s*(?<![a-z])(?:z|wraz z|lacznie z|wliczajac|w tym|uwzgledniajac) (?:dogrywk\w+|ot)\b\s*\)?'
+    - '\(?\s*(?:incl(?:\.|uding)?|with) (?:overtime|ot)\b\s*\)?'
+  unsupported:
+    - 'bez remisu'
+    - '\bdraw no bet\b'
+    - '\bdnb\b'
+    - 'podwojna szansa'
+    - '\bdouble chance\b'
+    - 'zaklad laczony'
+    - '\bkombi\w*'
+    - '\bcombo\b'
+    - '(?<!\d)\s(?:i|oraz|and)\s(?!\d)'          # "Zwycięzca meczu i liczba map" (not "mapy 1 i 2")
+    - '(?<![\d\s])\s*[+&]\s*(?![\d(\s])'          # "Zwycięzca meczu + Handicap" (not "(+1,5)", "mapa 1 + 2")
+  line_bounds:                  # inclusive [low, high]; handicaps: absolute value
+    map_handicap: [0, 2.5]
+    total_maps: [1.5, 4.5]
+    round_handicap: [0, 12.5]
+    total_rounds: [13, 40]
+    team_total_rounds: [0.5, 16.5]
+    race_to_rounds: [1, 16]
+    player_kills: [0.5, 150]
 
 # Reusable exclusion lists (YAML anchors).
 excludes:
@@ -116,7 +169,11 @@ rules:
       - '\bround (?P<round>1|13) winner\b'
       - '\b(?P<round>1|13)(?:st|th) round\b'
       - '\bwinner (?:of )?round (?P<round>1|13)\b'
-    exclude: [*half, 'handicap', 'liczba', 'suma', 'zabojstw', '\bkills?\b', 'pierwsz\w* do \d']
+      - '\brund[ay] (?:nr\.? ?)?(?P<round>1|13)(?![\d.,]|\s*-\s*\d)'      # "Mapa 1 - Runda 13 - zwycięzca"
+      - '\bround (?P<round>1|13)(?![\d.,]|\s*-\s*\d)'
+    # "obie rundy pistoletowe" / "both pistol rounds" (win BOTH) is a different market
+    exclude: [*half, 'handicap', 'liczba', 'suma', 'zabojstw', '\bkills?\b', 'pierwsz\w* do \d',
+              '\bob(?:u|ie|ydwie|ydwu|a)\b', '\bboth\b', '\bkazd', '\beach\b', '\bany\b', 'ktorakolwiek']
     extract: [map]
     defaults: {round: 1}
     allowed: {round: [1, 13]}
@@ -241,8 +298,8 @@ rules:
       - 'handicap na mapy'
       - '\bmap handicap\b'
       - 'handicap \(maps\)'
-      - '^handicap$'
-      - '^handicap \(?[+-]?\d+(?:[.,]\d+)?\)?$'
+    # A bare "Handicap" is deliberately NOT here: in a BO1 (or inside a map tab) it is a ROUND
+    # handicap, and a round line read as a map handicap looks like a certain winner to the model.
     exclude: [*half, *pistol, 'rund', *players]
     requires: [line]
     selection: team_line
@@ -290,7 +347,7 @@ rules:
     extract: [map, maps, players]
     segment_stopwords: ['zabojstw', '\bkills?\b', '\bfrag', 'pojedynek', '\bh2h\b', 'head to head', 'gracz',
                         'player', 'wiecej', 'more', '^kto\b', 'zdobedzie']
-    requires: [players]
+    requires: [players, scope]
     selection: player_draw
 
   - id: top_fragger
@@ -317,7 +374,7 @@ rules:
     extract: [map, maps, player]
     segment_stopwords: ['zabojstw', '\bkills?\b', '\bfrag', '^liczba$', 'gracza', '^gracz$', '\bplayer\b', '\btotal\b',
                         '^powyzej', '^ponizej', '^over\b', '^under\b']
-    requires: [player, line]
+    requires: [player, line, scope]
     selection: player_over_under
 
 # --------------------------------------------------------------------------------------------

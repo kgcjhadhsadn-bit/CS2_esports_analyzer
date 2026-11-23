@@ -33,6 +33,7 @@ from cs2bot.engine.decision import (
     is_slot_specific,
     load_already_bet_keys,
     load_match_decision_info,
+    min_acceptable_odds,
     reason_code,
     settled_sigma,
     thresholds_for,
@@ -545,3 +546,92 @@ def test_naive_expiry_on_a_prediction_flag_is_read_as_utc(session: Session) -> N
     pred = make_prediction(match_id=m.id).model_copy(update={"context_flags": [expired, active]})
     info = load_match_decision_info(session, match_id=m.id, prediction=pred, now=NOW)
     assert info.context_veto and info.context_veto_reason == "illness: ill today"
+
+
+# ----------------------------------------------------------------------------------------------
+# minimum acceptable odds for the executor
+# ----------------------------------------------------------------------------------------------
+
+
+def test_min_acceptable_odds_is_bounded_by_the_tolerance_and_the_edge() -> None:
+    settings, betclic = DecisionSettings(), BetclicSettings()
+    # p = 0.8: EV >= 3 % needs odds >= 1.03 / 0.704 = 1.464 (rounded up)
+    generous = make_priced(p_win=0.8, odds="1.60")
+    # 2 % tolerance -> 1.568: the tolerance binds, the edge is still there at that price
+    assert min_acceptable_odds(generous, settings=settings, betclic=betclic, odds_tolerance=0.02) == Decimal(
+        "1.568"
+    )
+    # 20 % tolerance would allow 1.28, where the bet loses money: the EV floor binds instead
+    assert min_acceptable_odds(generous, settings=settings, betclic=betclic, odds_tolerance=0.20) == Decimal(
+        "1.464"
+    )
+    # no tolerance: nothing below the quote
+    assert min_acceptable_odds(generous, settings=settings, betclic=betclic, odds_tolerance=0.0) == Decimal(
+        "1.600"
+    )
+    # a thin edge: quote 1.47 passes (EV 3.5 %) but any drop beyond 1.464 does not
+    thin = make_priced(p_win=0.8, odds="1.47")
+    assert min_acceptable_odds(thin, settings=settings, betclic=betclic, odds_tolerance=0.02) == Decimal(
+        "1.464"
+    )
+    # per-market EV threshold
+    strict = DecisionSettings(market_overrides={"match_winner": MarketThresholds(min_ev=0.10)})
+    assert min_acceptable_odds(generous, settings=strict, betclic=betclic, odds_tolerance=0.2) == Decimal(
+        "1.563"
+    )  # 1.10 / 0.704 = 1.5625
+    # tax-free promo lowers the price needed
+    promo = BetclicSettings(tax_free_promo=True)
+    assert min_acceptable_odds(generous, settings=settings, betclic=promo, odds_tolerance=0.5) == Decimal(
+        "1.288"
+    )
+    # the global odds range is respected
+    floor = DecisionSettings(min_odds=Decimal("1.55"))
+    assert min_acceptable_odds(generous, settings=floor, betclic=betclic, odds_tolerance=0.2) == Decimal(
+        "1.55"
+    )
+
+
+def test_min_acceptable_odds_never_accepts_a_bet_that_fails_the_ev_rule() -> None:
+    """Whatever the tolerance, a price at or above the result still passes the EV rule, and a
+    rejected (no-edge) outcome never gets a floor below its own quote."""
+    settings, betclic = DecisionSettings(), BetclicSettings()
+    for p_win, odds in ((0.8, "1.60"), (0.9, "1.30"), (0.76, "1.55"), (0.95, "1.25")):
+        priced = make_priced(p_win=p_win, odds=odds)
+        for tolerance in (0.0, 0.02, 0.1, 0.5, 0.99):
+            floor = min_acceptable_odds(priced, settings=settings, betclic=betclic, odds_tolerance=tolerance)
+            at_floor = make_priced(p_win=p_win, odds=str(floor))
+            assert at_floor.ev >= settings.min_ev
+            assert floor >= priced.quote.odds * Decimal(str(1 - tolerance)) - Decimal("0.001")
+    no_edge = make_priced(p_win=0.5, odds="1.60")  # EV = -0.296
+    assert min_acceptable_odds(no_edge, settings=settings, betclic=betclic, odds_tolerance=0.02) > Decimal(
+        "1.60"
+    )
+    hopeless = make_priced(p_win=0.0, odds="1.60")
+    assert min_acceptable_odds(hopeless, settings=settings, betclic=betclic, odds_tolerance=0.5) == Decimal(
+        "1.60"
+    )
+    for bad in (-0.01, 1.0, 2.0, float("nan")):
+        with pytest.raises(ValueError, match="odds_tolerance"):
+            min_acceptable_odds(no_edge, settings=settings, betclic=betclic, odds_tolerance=bad)
+
+
+def test_a_live_bookmaker_event_is_never_a_pre_match_bet(session: Session) -> None:
+    """The match row can lag behind (an early start): a Betclic event that is already in-play must
+    block betting even while ``matches.status`` is still ``scheduled``."""
+    match = add_match(session, scheduled_at=T0 + timedelta(hours=3))
+    event = add_event(session, match.id)
+    info = load_match_decision_info(session, match_id=match.id, bookmaker_event_id=event.id, now=NOW)
+    assert info.match_status is MatchStatus.SCHEDULED
+    event.is_live = True
+    session.flush()
+    info = load_match_decision_info(session, match_id=match.id, bookmaker_event_id=event.id, now=NOW)
+    assert info.match_status is MatchStatus.LIVE
+    info = info.model_copy(update={"data_completeness": 0.99, "veto_known": True})
+    decision = evaluate(
+        make_priced(), match=info, settings=DecisionSettings(), betclic=BetclicSettings(), now=NOW
+    )
+    assert codes(decision) == [ReasonCode.MATCH_NOT_SCHEDULED.value]
+    # a live event linked to ANOTHER match says nothing about this one
+    other = add_match(session, scheduled_at=T0 + timedelta(hours=3))
+    info = load_match_decision_info(session, match_id=other.id, bookmaker_event_id=event.id, now=NOW)
+    assert info.match_status is MatchStatus.SCHEDULED and info.link_status is LinkStatus.UNLINKED

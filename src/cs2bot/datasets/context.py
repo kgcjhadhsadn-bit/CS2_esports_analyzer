@@ -14,7 +14,7 @@ from typing import Any
 from sqlalchemy import distinct, func, or_, select
 from sqlalchemy.orm import Session
 
-from cs2bot.config import Settings
+from cs2bot.config import DEFAULT_ACTIVE_MAP_POOL, Settings
 from cs2bot.datasets._common import map_time_expr, resolve_lan, resolve_tier
 from cs2bot.datasets.loaders import ACTIVE_DUTY_POOL_SIZE, _clean_map_name, load_map_results
 from cs2bot.db.models import (
@@ -111,6 +111,38 @@ def _infer_format(match: Match, vetoes: list[VetoStep], n_maps: int) -> MatchFor
     return MatchFormat.BO3  # by far the most common Tier 1/2 format
 
 
+def _fallback_map_pool(session: Session, settings: Settings, as_of: datetime) -> list[str]:
+    """The map pool of a match whose veto is not (fully) published yet.
+
+    1. The pool actually played: in-scope results of the last 60 days before ``as_of``
+       (``features.meta.detect_active_map_pool``), when that yields exactly seven maps.
+    2. ``settings.scope.active_map_pool`` when the owner configured it (it differs from the built-in
+       default).
+    3. The Active Duty pool on that day according to ``config/patches.yaml`` - the built-in default
+       of the settings is a constant, so it is wrong for older matches (backtests) and goes stale at
+       every pool rotation, while the patch file is the maintained calendar.
+    4. The built-in default of the settings.
+    """
+    # lazy import: cs2bot.features imports cs2bot.datasets
+    from cs2bot.features.meta import detect_active_map_pool, load_patch_timeline
+
+    recent = load_map_results(session, since=as_of - timedelta(days=POOL_WINDOW_DAYS), until=as_of)
+    detected = detect_active_map_pool(recent, as_of, window_days=POOL_WINDOW_DAYS)
+    if len(detected) == ACTIVE_DUTY_POOL_SIZE:
+        return detected
+    configured = sorted({normalize_map_name(m) for m in settings.scope.active_map_pool})
+    if configured != sorted(normalize_map_name(m) for m in DEFAULT_ACTIVE_MAP_POOL):
+        return configured
+    try:
+        calendar = load_patch_timeline().map_pool_at(as_of)
+    except (OSError, ValueError) as exc:
+        log.warning("patch timeline unavailable, using the configured map pool: %s", exc)
+        calendar = None
+    if calendar is not None and len(calendar) == ACTIVE_DUTY_POOL_SIZE:
+        return sorted(calendar)
+    return configured
+
+
 def _active_flags(session: Session, match: Match, now: datetime) -> list[ContextFlag]:
     stmt = (
         select(ContextFlagRow)
@@ -157,7 +189,9 @@ def load_match_context(
       :func:`_previous_lineup`); :func:`data_completeness` only gives full credit to confirmed ones.
     * **map_pool:** the seven maps of the published veto when it is complete; else the pool detected
       from in-scope maps of the last 60 days (``features.meta.detect_active_map_pool``) when that
-      yields exactly seven maps; else ``settings.scope.active_map_pool``.
+      yields exactly seven maps; else ``settings.scope.active_map_pool`` (see
+      :func:`_fallback_map_pool` for the role of ``config/patches.yaml`` while that setting is left
+      at its built-in default). Always sorted.
     * **known_veto / first_veto_team:** ``vetoes`` rows in team1/team2 orientation; the first-veto
       team is the team of step 1 when that step has one.
     * **start_sides:** map name -> team1's starting side for maps whose side is already stored.
@@ -188,12 +222,14 @@ def load_match_context(
         .order_by(Veto.step)
     ).all()
     known_veto: list[VetoStep] = []
-    for step, team_id, action, raw_map in veto_rows:
+    for step, veto_team_id, action, raw_map in veto_rows:
         map_name = _clean_map_name(raw_map)
         if map_name is None:
             continue
         known_veto.append(
-            VetoStep(step=step, action=action, team=_slot(team_id, team1_id, team2_id), map_name=map_name)
+            VetoStep(
+                step=step, action=action, team=_slot(veto_team_id, team1_id, team2_id), map_name=map_name
+            )
         )
     first_veto_team = known_veto[0].team if known_veto and known_veto[0].step == 1 else None
 
@@ -212,14 +248,7 @@ def load_match_context(
     if len(veto_maps) == ACTIVE_DUTY_POOL_SIZE and len(set(veto_maps)) == ACTIVE_DUTY_POOL_SIZE:
         map_pool = sorted(veto_maps)
     else:
-        from cs2bot.features.meta import detect_active_map_pool  # lazy: features imports datasets
-
-        recent = load_map_results(
-            session, since=history_end - timedelta(days=POOL_WINDOW_DAYS), until=history_end
-        )
-        map_pool = detect_active_map_pool(recent, history_end, window_days=POOL_WINDOW_DAYS)
-        if len(map_pool) != ACTIVE_DUTY_POOL_SIZE:
-            map_pool = [normalize_map_name(m) for m in settings.scope.active_map_pool]
+        map_pool = _fallback_map_pool(session, settings, history_end)
 
     return MatchContext(
         match_id=match.id,
@@ -346,21 +375,19 @@ def completeness_breakdown(
     player_ids = sorted({p.player_id for _, lineup in teams for p in lineup})
     maps_per_player: dict[int, int] = {}
     if player_ids:
-        maps_per_player = {
-            pid: n
-            for pid, n in session.execute(
-                select(PlayerMapStats.player_id, func.count(distinct(PlayerMapStats.map_played_id)))
-                .join(MapPlayed, MapPlayed.id == PlayerMapStats.map_played_id)
-                .join(Match, Match.id == MapPlayed.match_id)
-                .where(
-                    PlayerMapStats.player_id.in_(player_ids),
-                    Match.id != ctx.match_id,
-                    ts >= ref - timedelta(days=config.player_days),
-                    ts < ref,
-                )
-                .group_by(PlayerMapStats.player_id)
+        per_player_stmt = (
+            select(PlayerMapStats.player_id, func.count(distinct(PlayerMapStats.map_played_id)))
+            .join(MapPlayed, MapPlayed.id == PlayerMapStats.map_played_id)
+            .join(Match, Match.id == MapPlayed.match_id)
+            .where(
+                PlayerMapStats.player_id.in_(player_ids),
+                Match.id != ctx.match_id,
+                ts >= ref - timedelta(days=config.player_days),
+                ts < ref,
             )
-        }
+            .group_by(PlayerMapStats.player_id)
+        )
+        maps_per_player = {int(pid): int(n) for pid, n in session.execute(per_player_stmt).all()}
     player_scores: list[float] = []
     for _, lineup in teams:
         known = sum(1 for p in lineup if maps_per_player.get(p.player_id, 0) >= config.min_player_maps)

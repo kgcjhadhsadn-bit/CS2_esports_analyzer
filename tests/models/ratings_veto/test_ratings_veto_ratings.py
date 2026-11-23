@@ -19,6 +19,7 @@ from cs2bot.models.ratings import (
     MapRatingModel,
     RatingConfig,
     RatingSnapshot,
+    WalkForwardRatings,
     chronological_split,
     evaluate_walk_forward,
     tune,
@@ -461,6 +462,56 @@ def test_history_snapshots_equal_refitting_up_to_the_cut_off() -> None:
     assert full.historical_predict(1, 2, "mirage", first).p_team1_win == pytest.approx(0.5)
     with pytest.raises(RuntimeError):
         MapRatingModel().fit(recs[:50]).historical_map_advantage(1, 2, "mirage", first)
+
+
+def test_walk_forward_provider_answers_any_as_of_without_look_ahead() -> None:
+    """``WalkForwardRatings``: one fit, leakage-free answers for historical rows (ensemble training)."""
+    recs = universe(seed=3).map_results()
+    provider = WalkForwardRatings.fit(recs)
+    assert isinstance(provider, _RatingProvider)
+    assert provider.model.records_history
+    assert provider.model.n_processed == len(recs)
+    for frac in (0.1, 0.5, 0.85):
+        cut = recs[int(len(recs) * frac)].played_at
+        reference = MapRatingModel().fit_until(recs, cut)
+        for a, b, map_name in [(1, 2, "mirage"), (7, 3, "de_nuke"), (16, 11, "train")]:
+            want = reference.predict(a, b, map_name, cut, is_lan=True, picked_by=TeamSlot.TEAM2)
+            got = provider.predict(a, b, map_name, cut, is_lan=True, picked_by=TeamSlot.TEAM2)
+            assert got.map_name == want.map_name
+            assert got.picked_by is TeamSlot.TEAM2
+            assert got.p_team1_win == pytest.approx(want.p_team1_win, abs=1e-12)
+            assert got.sigma == pytest.approx(want.sigma, abs=1e-12)
+            assert got.components == pytest.approx(want.components, abs=1e-12)
+            assert provider.map_advantage(a, b, map_name, cut) == pytest.approx(
+                reference.map_advantage(a, b, map_name, cut), abs=1e-12
+            )
+            for which in (None, map_name):
+                assert provider.rating(a, which, cut) == reference.rating(a, which, cut)
+    # the future never leaks in: flipping every later result leaves the answers unchanged
+    cut = recs[len(recs) // 2].played_at
+    flipped = [
+        r.model_copy(update={"team1_rounds": r.team2_rounds, "team2_rounds": r.team1_rounds})
+        if r.played_at >= cut
+        else r
+        for r in recs
+    ]
+    other = WalkForwardRatings.fit(flipped)
+    assert other.predict(5, 9, "nuke", cut) == provider.predict(5, 9, "nuke", cut)
+    assert other.predict(5, 9, "nuke", _after(recs)) != provider.predict(5, 9, "nuke", _after(recs))
+    # after the last game it agrees with the wrapped model; the model's own method builds it too
+    as_of = _after(recs)
+    assert provider.predict(1, 2, "mirage", as_of) == provider.model.predict(1, 2, "mirage", as_of)
+    assert provider.model.walk_forward().predict(1, 2, "mirage", cut) == provider.predict(1, 2, "mirage", cut)
+    # before any game: the prior; unknown teams too
+    assert provider.predict(1, 2, "mirage", recs[0].played_at).p_team1_win == pytest.approx(0.5)
+    assert provider.rating(999, None, cut).is_prior
+    # a model without recorded history cannot serve historical queries
+    with pytest.raises(ValueError, match="record_history"):
+        WalkForwardRatings(MapRatingModel().fit(recs[:50]))
+    with pytest.raises(ValueError, match="record_history"):
+        MapRatingModel().fit(recs[:50]).walk_forward()
+    with pytest.raises(RuntimeError):
+        MapRatingModel().fit(recs[:50]).historical_rating(1, None, cut)
 
 
 def test_updates_must_be_chronological_and_are_idempotent() -> None:

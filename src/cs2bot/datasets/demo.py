@@ -47,9 +47,17 @@ POSITION_COLUMNS: Final[tuple[str, ...]] = (
     "place",
     "x",
     "y",
+    "z",
     "is_alive",
 )
-PLAYER_ROUND_COLUMNS: Final[tuple[str, ...]] = ("map_played_id", "round_number", "player_id", "side")
+PLAYER_ROUND_COLUMNS: Final[tuple[str, ...]] = (
+    "map_played_id",
+    "round_number",
+    "player_id",
+    "side",
+    "flashes_thrown",
+    "enemies_flashed",
+)
 
 
 class TeamDemoMapRecord(BaseModel):
@@ -218,11 +226,30 @@ class RoleFrames:
     * ``positions``: :data:`POSITION_COLUMNS` - one row per position sample.
     * ``player_rounds``: :data:`PLAYER_ROUND_COLUMNS` - one row per (map, round, player) played; used
       for per-round rates. Optional: when empty, rounds are counted from the position samples.
+
+    Hand-built frames (tests, notebooks) may omit the optional columns ``z``, ``flashes_thrown`` and
+    ``enemies_flashed``.
     """
 
     kills: pd.DataFrame = field(default_factory=lambda: _empty(KILL_COLUMNS))
     positions: pd.DataFrame = field(default_factory=lambda: _empty(POSITION_COLUMNS))
     player_rounds: pd.DataFrame = field(default_factory=lambda: _empty(PLAYER_ROUND_COLUMNS))
+
+
+def available_position_seconds(session: Session, *, sample_rows: int = 20_000) -> list[int]:
+    """Sample offsets (seconds after freeze time) present in the newest position samples.
+
+    The demo pipeline stores one sample per player per round for each of
+    ``settings.demos.position_sample_seconds``. Reading the newest ``sample_rows`` rows (a few maps)
+    is enough to see which offsets exist without scanning the whole table.
+    """
+    newest = (
+        select(PlayerPositionSample.seconds_into_round)
+        .order_by(PlayerPositionSample.id.desc())
+        .limit(sample_rows)
+        .subquery()
+    )
+    return sorted(int(s) for s in session.scalars(select(newest.c.seconds_into_round).distinct()))
 
 
 def load_role_frames(
@@ -274,6 +301,7 @@ def load_role_frames(
             PlayerPositionSample.place,
             PlayerPositionSample.x,
             PlayerPositionSample.y,
+            PlayerPositionSample.z,
             PlayerPositionSample.is_alive,
         )
         .join(MapPlayed, MapPlayed.id == PlayerPositionSample.map_played_id)
@@ -292,6 +320,8 @@ def load_role_frames(
             PlayerRoundStats.round_number,
             PlayerRoundStats.player_id,
             type_coerce(PlayerRoundStats.side, String),
+            PlayerRoundStats.flashes_thrown,
+            PlayerRoundStats.enemies_flashed,
         )
         .join(MapPlayed, MapPlayed.id == PlayerRoundStats.map_played_id)
         .join(Match, Match.id == MapPlayed.match_id)

@@ -94,7 +94,10 @@ def _player_kills(session: Session, map_ids: Sequence[int]) -> dict[int, dict[in
         return {}
     rows = session.execute(
         select(
-            PlayerMapStats.map_played_id, PlayerMapStats.player_id, PlayerMapStats.source, PlayerMapStats.kills
+            PlayerMapStats.map_played_id,
+            PlayerMapStats.player_id,
+            PlayerMapStats.source,
+            PlayerMapStats.kills,
         ).where(PlayerMapStats.map_played_id.in_(list(map_ids)))
     )
     for map_id, player_id, source, kills in rows:
@@ -154,7 +157,8 @@ def load_match_actuals(session: Session, match_id: int) -> MatchActuals | None:
     maps: list[MapActual] = []
     for m in played:
         name = _clean_map_name(m.map_name)
-        assert name is not None and m.team1_rounds is not None and m.team2_rounds is not None
+        if name is None or m.team1_rounds is None or m.team2_rounds is None:
+            continue  # unreachable after the filter above; keeps the types honest
         maps.append(
             MapActual(
                 map_number=m.map_number,

@@ -294,6 +294,8 @@ class ParsedMarket:
     external_id: str
     raw_name: str
     selections: dict[str, ParsedSelection] = field(default_factory=dict)
+    # when the payload this market was last seen in was captured (set by the source pipeline)
+    captured_at: datetime | None = None
 
     def add(self, sel: ParsedSelection) -> None:
         self.selections[sel.merge_key()] = sel  # later observations win (fresher)
@@ -313,6 +315,7 @@ class ParsedEvent:
     is_live: bool = False
     markets: dict[tuple[str, str], ParsedMarket] = field(default_factory=dict)
     sport_hint: str = ""
+    sport_raw: str | None = None  # the payload's own sport/discipline label, when it carries one
     category_ids: list[str] = field(default_factory=list)
 
     def market(self, raw_name: str, external_id: str) -> ParsedMarket:
@@ -334,6 +337,8 @@ class ParsedEvent:
         self.is_live = self.is_live or other.is_live
         if other.sport_hint and other.sport_hint not in self.sport_hint:
             self.sport_hint = f"{self.sport_hint} | {other.sport_hint}".strip(" |")
+        if not self.sport_raw and other.sport_raw:
+            self.sport_raw = other.sport_raw
         for cat in other.category_ids:
             if cat not in self.category_ids:
                 self.category_ids.append(cat)
@@ -341,10 +346,16 @@ class ParsedEvent:
             target = self.market(*key)
             for sel in mkt.selections.values():
                 target.add(sel)
+            if mkt.captured_at is not None and (
+                target.captured_at is None or mkt.captured_at > target.captured_at
+            ):
+                target.captured_at = mkt.captured_at
 
-    def to_collected(self) -> CollectedEvent:
+    def _collected_markets(self) -> list[tuple[CollectedMarket, datetime | None]]:
+        """Markets as handed to the collector, each with the capture time of its freshest payload."""
         markets: list[CollectedMarket] = []
-        seen_sets: dict[frozenset[str], CollectedMarket] = {}
+        times: list[datetime | None] = []
+        seen_sets: dict[frozenset[str], int] = {}
         for mkt in self.markets.values():
             sels = [
                 CollectedSelection(
@@ -357,14 +368,34 @@ class ParsedEvent:
             ids = frozenset(s.external_id for s in sels if s.external_id)
             if ids and len(ids) == len(sels) and ids in seen_sets:
                 # same bookmaker market shown twice (e.g. "Top" tab and its own category)
-                existing = seen_sets[ids]
+                index = seen_sets[ids]
+                existing = markets[index]
                 by_id = {s.external_id: s for s in sels}
                 existing.selections = [by_id.get(s.external_id, s) for s in existing.selections]
+                known = times[index]
+                if mkt.captured_at is not None and (known is None or mkt.captured_at > known):
+                    times[index] = mkt.captured_at
                 continue
             cm = CollectedMarket(external_id=mkt.external_id, raw_name=mkt.raw_name, selections=sels)
             if ids and len(ids) == len(sels):
-                seen_sets[ids] = cm
+                seen_sets[ids] = len(markets)
             markets.append(cm)
+            times.append(mkt.captured_at)
+        return list(zip(markets, times, strict=True))
+
+    def market_times(self) -> dict[tuple[str, str], datetime]:
+        """``(raw_name, external_id) -> capture time`` of the markets :meth:`to_collected` returns."""
+        return {
+            (cm.raw_name, cm.external_id): at for cm, at in self._collected_markets() if at is not None
+        }
+
+    def to_collected(self, *, captured_at: datetime | None = None) -> CollectedEvent:
+        """The event as a :class:`CollectedEvent`; ``captured_at`` = when its prices were read."""
+        collected = self._collected_markets()
+        markets = [cm for cm, _ in collected]
+        if captured_at is None:
+            known = [at for _, at in collected if at is not None]
+            captured_at = max(known) if known else None
         return CollectedEvent(
             external_id=self.external_id,
             name=self.name or f"{self.team1_raw} - {self.team2_raw}",
@@ -374,6 +405,8 @@ class ParsedEvent:
             starts_at=self.starts_at,
             url=self.url,
             is_live=self.is_live,
+            captured_at=captured_at,
+            sport_raw=self.sport_raw,
             markets=markets,
         )
 
@@ -669,6 +702,7 @@ class _Walker:
         event.is_live = bool(live)
         event.url = self._url(node, event_id)
         hints = [self._text_of(node[k]) for k in self.keys.sports if k in node]
+        event.sport_raw = next((h for h in hints if h), None)
         hints += [event.competition_raw, event.url, event.name]
         event.sport_hint = " | ".join(fold_text(h) for h in hints if h)
         for inner in nested:
@@ -821,6 +855,7 @@ class _Walker:
             event.is_live = bool(next((_flag(node[k]) for k in self.keys.live_flags if k in node), None))
             event.url = self._url(node, event_id)
             hints = [self._text_of(node[k]) for k in self.keys.sports if k in node]
+            event.sport_raw = next((h for h in hints if h), None)
             hints += [event.competition_raw, event.url, event.name]
             event.sport_hint = " | ".join(fold_text(h) for h in hints if h)
             self.flat_events[event_id] = event
@@ -897,6 +932,7 @@ def merge_parsed_events(records: Iterable[ParsedEvent]) -> list[ParsedEvent]:
                 url=rec.url,
                 is_live=rec.is_live,
                 sport_hint=rec.sport_hint,
+                sport_raw=rec.sport_raw,
                 category_ids=list(rec.category_ids),
             )
             copy.merge(rec)

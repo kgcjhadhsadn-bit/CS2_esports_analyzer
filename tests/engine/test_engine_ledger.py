@@ -13,11 +13,12 @@ from sqlalchemy.orm import Session
 from cs2bot.config import BankrollSettings, BetclicSettings, Settings
 from cs2bot.db import state
 from cs2bot.db.models import AuditLog, BankrollLedger, Bet
+from cs2bot.domain.betting import PlacementResult, PlacementStatus
 from cs2bot.domain.enums import BetStatus, LedgerKind
 from cs2bot.domain.results import SettlementOutcome
 from cs2bot.engine import ledger
 from cs2bot.engine.ev import TaxModel, net_payout
-from tests.engine.engine_factories import T0, add_bet
+from tests.engine.engine_factories import T0, add_bet, add_match
 
 
 def entries(session: Session) -> list[BankrollLedger]:
@@ -44,6 +45,21 @@ def test_ensure_initialized_honours_dashboard_override(session: Session, setting
 def test_ensure_initialized_with_bankroll_settings(session: Session) -> None:
     ledger.ensure_initialized(session, BankrollSettings(starting_bankroll=Decimal("321.456")))
     assert ledger.current_balance(session) == Decimal("321.46")
+
+
+def test_ensure_initialized_from_the_balance_observed_at_the_bookmaker(
+    session: Session, settings: Settings
+) -> None:
+    for bad in (Decimal("-1"), Decimal("NaN")):
+        with pytest.raises(ValueError, match="opening balance"):
+            ledger.ensure_initialized(session, settings, opening_balance=bad)
+    entry = ledger.ensure_initialized(session, settings, at=T0, opening_balance=Decimal("437.129"))
+    assert entry is not None and entry.amount == Decimal("437.13") and "observed" in (entry.note or "")
+    assert ledger.current_balance(session) == Decimal("437.13")
+    # the first reconciliation is clean: no flag, no pause
+    first = ledger.reconcile(session, Decimal("437.13"), tolerance=Decimal("0.05"))
+    assert not first.flagged and not first.paused and first.entry_id is None
+    assert ledger.ensure_initialized(session, settings, opening_balance=Decimal("999")) is None
 
 
 def test_stake_and_win(session: Session, settings: Settings) -> None:
@@ -372,3 +388,331 @@ def test_settle_bet_dry_run_keeps_status_and_ledger(session: Session, settings: 
     assert ledger.settle_bet(session, dry, "won", settings) == (Decimal("176.00"), Decimal("76.00"))
     with pytest.raises(ledger.LedgerConflictError):
         ledger.settle_bet(session, dry, "lost", settings)
+
+
+def test_void_and_push_are_the_same_refund_when_settling_twice(session: Session, settings: Settings) -> None:
+    """The local resolver may say "push" where the bookmaker's history only says "void"."""
+    ledger.ensure_initialized(session, settings)
+    bet = add_bet(session, stake="100", odds="2.00", placed_at=T0)
+    ledger.record_stake(session, bet)
+    ledger.settle_bet(session, bet, SettlementOutcome.PUSH, settings, at=T0)
+    assert ledger.settle_bet(session, bet, SettlementOutcome.VOID, settings) == (
+        Decimal("100.00"),
+        Decimal("0.00"),
+    )
+    assert bet.extra[ledger.SETTLED_OUTCOME_KEY] == "push"  # the first outcome is kept
+    assert [e.kind for e in entries(session)[1:]] == [LedgerKind.STAKE, LedgerKind.REFUND]
+    with pytest.raises(ledger.LedgerConflictError):
+        ledger.settle_bet(session, bet, "won", settings)
+
+
+def test_unreadable_stored_tax_rate_falls_back(session: Session, settings: Settings) -> None:
+    for bad in ("twelve", "NaN", "1.5", "-0.1"):
+        bet = add_bet(session, stake="100", odds="2.00", tax="0", extra={ledger.STAKE_TAX_RATE_KEY: bad})
+        assert ledger.bet_stake_tax(bet, settings) == Decimal("12.00")  # current settings
+        assert ledger.settle_amounts(bet, "won", settings) == (Decimal("176.00"), Decimal("76.00"))
+
+
+# ----------------------------------------------------------------------------------------------
+# apply_placement: PlacementResult -> bets row + ledger
+# ----------------------------------------------------------------------------------------------
+
+
+def placement(status: PlacementStatus, **kw: object) -> PlacementResult:
+    return PlacementResult(status=status, at=T0 + timedelta(minutes=5), **kw)
+
+
+def test_apply_placement_placed(session: Session, settings: Settings) -> None:
+    ledger.ensure_initialized(session, settings)
+    bet = add_bet(session, stake="100", odds="2.00", status=BetStatus.PENDING, tax="0")
+    bet.placed_odds = None
+    result = placement(
+        PlacementStatus.PLACED,
+        placed_odds=Decimal("1.95"),
+        external_bet_id="BC-123",
+        screenshot_path="data/screenshots/1.png",
+    )
+    assert ledger.apply_placement(session, bet, result, settings) is BetStatus.PLACED
+    assert bet.status is BetStatus.PLACED and bet.dry_run is False
+    assert (bet.placed_odds, bet.placed_at) == (Decimal("1.95"), result.at)
+    assert (bet.external_bet_id, bet.screenshot_path) == ("BC-123", "data/screenshots/1.png")
+    # money fields follow the odds the bookmaker accepted: 12 tax, 88 x 1.95 = 171.60
+    assert (bet.tax, bet.potential_payout) == (Decimal("12.00"), Decimal("171.60"))
+    assert bet.extra[ledger.STAKE_TAX_RATE_KEY] == "0.12"
+    assert bet.extra[ledger.PLACEMENT_STATUS_KEY] == "placed"
+    stake_entry = entries(session)[-1]
+    assert (stake_entry.kind, stake_entry.amount, stake_entry.ts) == (
+        LedgerKind.STAKE,
+        Decimal("-100.00"),
+        result.at,
+    )
+    assert ledger.current_balance(session) == Decimal("900.00")
+    # replaying the same result changes nothing
+    assert ledger.apply_placement(session, bet, result, settings) is BetStatus.PLACED
+    assert len(entries(session)) == 2
+    # the stored rate is what settlement uses, whatever the settings say later
+    promo = TaxModel(Decimal("0"), Decimal("2280"), Decimal("0.10"))
+    assert ledger.settle_bet(session, bet, "won", promo, at=T0 + timedelta(hours=2)) == (
+        Decimal("171.60"),
+        Decimal("71.60"),
+    )
+
+
+def test_apply_placement_without_reported_odds_uses_the_requested_odds(
+    session: Session, settings: Settings
+) -> None:
+    ledger.ensure_initialized(session, settings)
+    for reported in (None, Decimal("0.5"), Decimal("0")):
+        bet = add_bet(session, stake="10", odds="2.00", status=BetStatus.PENDING)
+        result = placement(PlacementStatus.PLACED, placed_odds=reported)
+        assert ledger.apply_placement(session, bet, result, settings) is BetStatus.PLACED
+        assert bet.placed_odds == Decimal("2.00") and bet.potential_payout == Decimal("17.60")
+    assert ledger.current_balance(session) == Decimal("970.00")  # every real placement was debited
+
+
+def test_apply_placement_tax_free_promo(session: Session) -> None:
+    promo = TaxModel(Decimal("0"), Decimal("2280"), Decimal("0.10"))
+    ledger.ensure_initialized(session, BankrollSettings())
+    bet = add_bet(session, stake="100", odds="2.00", status=BetStatus.PENDING)
+    ledger.apply_placement(session, bet, placement(PlacementStatus.PLACED), promo)
+    assert (bet.tax, bet.potential_payout) == (Decimal("0.00"), Decimal("200.00"))
+    assert bet.extra[ledger.STAKE_TAX_RATE_KEY] == "0"
+    # settled later with the normal 12 % settings: the promo rate recorded at placement wins
+    normal = TaxModel(Decimal("0.12"), Decimal("2280"), Decimal("0.10"))
+    assert ledger.settle_amounts(bet, "won", normal) == (Decimal("200.00"), Decimal("100.00"))
+
+
+def test_apply_placement_dry_run_never_touches_the_ledger(session: Session, settings: Settings) -> None:
+    ledger.ensure_initialized(session, settings)
+    # the row was created as a real bet but the executor ran in DRY_RUN mode
+    bet = add_bet(session, stake="100", odds="2.00", status=BetStatus.PENDING, dry_run=False)
+    result = placement(PlacementStatus.DRY_RUN_OK, placed_odds=Decimal("2.05"))
+    assert ledger.apply_placement(session, bet, result, settings) is BetStatus.DRY_RUN
+    assert bet.status is BetStatus.DRY_RUN and bet.dry_run is True and ledger.is_dry_run(bet)
+    assert bet.placed_odds == Decimal("2.05") and bet.potential_payout == Decimal("180.40")
+    assert len(entries(session)) == 1 and ledger.current_balance(session) == Decimal("1000.00")
+    assert ledger.record_stake(session, bet) is None
+    # paper settlement still works and still writes nothing
+    assert ledger.settle_bet(session, bet, "won", settings, at=T0)[1] == Decimal("80.40")
+    assert len(entries(session)) == 1
+
+
+def test_apply_placement_uncertain_keeps_the_stake_reserved_until_reconciled(
+    session: Session, settings: Settings
+) -> None:
+    from cs2bot.engine import bankroll
+
+    ledger.ensure_initialized(session, settings, at=T0)
+    add_match(session, match_id=5)
+    bet = add_bet(session, stake="20", odds="2.00", status=BetStatus.PENDING, match_id=5, created_at=T0)
+    uncertain = placement(PlacementStatus.UNCERTAIN, message="no receipt after 45 s")
+    assert ledger.apply_placement(session, bet, uncertain, settings) is BetStatus.PLACING
+    assert bet.status is BetStatus.PLACING and bet.error == "no receipt after 45 s"
+    assert bet.placed_at is None and bet.extra[ledger.PLACEMENT_ATTEMPTED_AT_KEY] == uncertain.at.isoformat()
+    assert len(entries(session)) == 1  # nothing debited ...
+    state_now = bankroll.compute_state(session, settings, now=T0 + timedelta(minutes=10))
+    assert state_now.reserved_stakes == Decimal("20.00")  # ... but the money is not free either
+    assert state_now.balance == Decimal("980.00") and state_now.bankroll_reference == Decimal("1000.00")
+    assert state_now.exposure_by_match == {5: Decimal("20.00")}
+    # a second uncertain answer keeps the first attempt time
+    again = PlacementResult(status=PlacementStatus.UNCERTAIN, at=T0 + timedelta(hours=1))
+    ledger.apply_placement(session, bet, again, settings)
+    assert bet.extra[ledger.PLACEMENT_ATTEMPTED_AT_KEY] == uncertain.at.isoformat()
+    # reconciliation found the bet in the bookmaker's history: it becomes a normal placed bet
+    found = placement(PlacementStatus.PLACED, external_bet_id="BC-9", placed_odds=Decimal("2.00"))
+    assert ledger.apply_placement(session, bet, found, settings) is BetStatus.PLACED
+    assert bet.error is None and ledger.PLACEMENT_ATTEMPTED_AT_KEY not in bet.extra
+    assert ledger.current_balance(session) == Decimal("980.00")
+    state_now = bankroll.compute_state(session, settings, now=T0 + timedelta(minutes=10))
+    assert state_now.reserved_stakes == Decimal("0.00") and state_now.balance == Decimal("980.00")
+
+
+def test_apply_placement_uncertain_then_absent_releases_the_exposure(
+    session: Session, settings: Settings
+) -> None:
+    from cs2bot.engine import bankroll
+
+    ledger.ensure_initialized(session, settings, at=T0)
+    bet = add_bet(session, stake="20", status=BetStatus.PENDING, created_at=T0)
+    ledger.apply_placement(session, bet, placement(PlacementStatus.UNCERTAIN), settings)
+    assert "did not confirm" in (bet.error or "")
+    failed = placement(PlacementStatus.FAILED, message="not in the bet history after the grace period")
+    assert ledger.apply_placement(session, bet, failed, settings) is BetStatus.FAILED
+    state_now = bankroll.compute_state(session, settings, now=T0 + timedelta(minutes=10))
+    assert state_now.balance == state_now.bankroll_reference == Decimal("1000.00")
+    assert state_now.reserved_stakes == Decimal("0.00") and len(entries(session)) == 1
+
+
+@pytest.mark.parametrize(
+    "status",
+    [
+        PlacementStatus.ODDS_MOVED,
+        PlacementStatus.MARKET_UNAVAILABLE,
+        PlacementStatus.INSUFFICIENT_BALANCE,
+        PlacementStatus.LOGIN_REQUIRED,
+        PlacementStatus.SELECTOR_ERROR,
+        PlacementStatus.KILL_SWITCH,
+        PlacementStatus.REJECTED_BY_BOOKMAKER,
+        PlacementStatus.FAILED,
+    ],
+)
+def test_apply_placement_failures_put_no_money_at_risk(
+    session: Session, settings: Settings, status: PlacementStatus
+) -> None:
+    ledger.ensure_initialized(session, settings)
+    bet = add_bet(session, stake="100", status=BetStatus.PENDING)
+    assert ledger.apply_placement(session, bet, placement(status), settings) is BetStatus.FAILED
+    assert bet.status is BetStatus.FAILED and status.value in (bet.error or "")
+    assert bet.placed_at is None and len(entries(session)) == 1
+    # a stake that was (wrongly) debited before the attempt is given back
+    debited = add_bet(session, stake="40", status=BetStatus.PENDING)
+    ledger.record_stake(session, debited)
+    ledger.apply_placement(session, debited, placement(status, message="boom"), settings)
+    assert debited.error == "boom" and ledger.current_balance(session) == Decimal("1000.00")
+    assert [e.kind for e in entries(session)[1:]] == [LedgerKind.STAKE, LedgerKind.REFUND]
+
+
+def test_apply_placement_real_placement_of_a_dry_run_row_is_booked_as_real(
+    session: Session, settings: Settings, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Money left the account: the ledger and the limits must see it, whatever the row said."""
+    ledger.ensure_initialized(session, settings)
+    bet = add_bet(session, stake="50", status=BetStatus.PENDING, dry_run=True)
+    with caplog.at_level("ERROR"):
+        ledger.apply_placement(session, bet, placement(PlacementStatus.PLACED), settings)
+    assert bet.dry_run is False and bet.status is BetStatus.PLACED
+    assert ledger.current_balance(session) == Decimal("950.00")
+    assert "REAL placement" in caplog.text
+
+
+def test_apply_placement_refuses_impossible_transitions(session: Session, settings: Settings) -> None:
+    ledger.ensure_initialized(session, settings)
+    placed = add_bet(session, stake="10", status=BetStatus.PLACED)
+    ledger.record_stake(session, placed)
+    for status in (PlacementStatus.FAILED, PlacementStatus.UNCERTAIN, PlacementStatus.DRY_RUN_OK):
+        with pytest.raises(ledger.LedgerConflictError, match="cannot be applied"):
+            ledger.apply_placement(session, placed, placement(status), settings)
+    won = add_bet(session, stake="10", status=BetStatus.WON)
+    with pytest.raises(ledger.LedgerConflictError):
+        ledger.apply_placement(session, won, placement(PlacementStatus.PLACED), settings)
+    failed = add_bet(session, stake="10", status=BetStatus.FAILED)
+    with pytest.raises(ledger.LedgerConflictError):  # a failed bet is never resurrected
+        ledger.apply_placement(session, failed, placement(PlacementStatus.PLACED), settings)
+    assert ledger.apply_placement(session, failed, placement(PlacementStatus.FAILED), settings) is (
+        BetStatus.FAILED
+    )
+    pending = add_bet(session, stake="10", status=BetStatus.PENDING)
+    naive = PlacementResult(status=PlacementStatus.PLACED, at=T0.replace(tzinfo=None))
+    with pytest.raises(ValueError, match="timezone"):
+        ledger.apply_placement(session, pending, naive, settings)
+    assert placed.status is BetStatus.PLACED and ledger.current_balance(session) == Decimal("990.00")
+
+
+# ----------------------------------------------------------------------------------------------
+# reconciliation as a safety control
+# ----------------------------------------------------------------------------------------------
+
+
+def test_reconcile_mismatch_pauses_trading_until_the_owner_confirms(
+    session: Session, settings: Settings
+) -> None:
+    """Stakes and limits are fractions of the ledger: money the bot cannot explain (here a balance
+    read ten times too high) must be confirmed by the owner before it is used for sizing."""
+    ledger.ensure_initialized(session, settings)
+    tol = Decimal("0.05")
+    drift = ledger.reconcile(session, Decimal("1000.04"), tolerance=tol)
+    assert not drift.flagged and not drift.paused and state.is_trading_halted(session) == (False, None)
+
+    phantom = ledger.reconcile(session, Decimal("10000.40"), tolerance=tol, actor="executor")
+    assert phantom.flagged and phantom.paused and phantom.difference == Decimal("9000.36")
+    halted, reason = state.is_trading_halted(session)
+    assert halted and reason is not None
+    assert "10000.40" in reason and "1000.04" in reason and "+9000.36" in reason
+    assert state.get_state(session, state.LAST_RECONCILIATION)["paused"] is True
+    assert ledger.current_balance(session) == Decimal("10000.40")  # the ledger follows the bookmaker
+
+    # a further mismatch while paused keeps the first reason (and does not claim to have paused)
+    again = ledger.reconcile(session, Decimal("1000.04"), tolerance=tol)
+    assert again.flagged and not again.paused
+    assert "+9000.36" in (state.get_pause(session)[1] or "")
+
+    # opting out (e.g. a manual `cs2bot executor balance` right after a known deposit)
+    state.set_paused(session, False, actor="owner")
+    quiet = ledger.reconcile(session, Decimal("1500.04"), tolerance=tol, pause_on_flag=False)
+    assert quiet.flagged and not quiet.paused and state.is_trading_halted(session) == (False, None)
+
+
+def test_reconcile_does_not_overwrite_another_pause_reason(session: Session, settings: Settings) -> None:
+    ledger.ensure_initialized(session, settings)
+    state.set_paused(session, True, actor="system", reason="daily loss limit reached")
+    result = ledger.reconcile(session, Decimal("900.00"), tolerance=Decimal("0.05"))
+    assert result.flagged and not result.paused
+    assert state.get_pause(session) == (True, "daily loss limit reached")
+
+
+def test_reconcile_defers_while_an_unconfirmed_placement_can_explain_the_shortfall(
+    session: Session, settings: Settings
+) -> None:
+    ledger.ensure_initialized(session, settings)
+    tol = Decimal("0.05")
+    bet = add_bet(session, stake="20", odds="2.00", status=BetStatus.PENDING)
+    ledger.apply_placement(session, bet, placement(PlacementStatus.UNCERTAIN), settings)
+    # Betclic shows 980: exactly what an accepted bet looks like. Nothing is written or flagged.
+    deferred = ledger.reconcile(session, Decimal("980.00"), tolerance=tol)
+    assert deferred.deferred and not deferred.flagged and not deferred.paused
+    assert deferred.entry_id is None and deferred.difference == Decimal("-20.00")
+    assert ledger.current_balance(session) == Decimal("1000.00") and len(entries(session)) == 1
+    last = state.get_state(session, state.LAST_RECONCILIATION)
+    assert last["deferred"] is True and last["unconfirmed_stakes"] == "20.00"
+    assert state.is_trading_halted(session) == (False, None)
+    # the bet history confirms the bet: it is debited once, and the books agree
+    ledger.apply_placement(session, bet, placement(PlacementStatus.PLACED), settings)
+    clean = ledger.reconcile(session, Decimal("980.00"), tolerance=tol)
+    assert not clean.deferred and not clean.flagged and clean.entry_id is None
+    assert [e.kind for e in entries(session)[1:]] == [LedgerKind.STAKE]
+
+
+def test_reconcile_deferral_is_limited_to_the_unconfirmed_stakes(
+    session: Session, settings: Settings
+) -> None:
+    ledger.ensure_initialized(session, settings)
+    tol = Decimal("0.05")
+    bet = add_bet(session, stake="20", status=BetStatus.PENDING)
+    ledger.apply_placement(session, bet, placement(PlacementStatus.UNCERTAIN), settings)
+    # a surplus is never explained by an unconfirmed bet
+    surplus = ledger.reconcile(session, Decimal("1030.00"), tolerance=tol, pause_on_flag=False)
+    assert surplus.flagged and not surplus.deferred and surplus.entry_id is not None
+    # a shortfall larger than the unconfirmed stake (+ tolerance) is a real mismatch
+    short = ledger.reconcile(session, Decimal("1009.94"), tolerance=tol)  # 20.06 missing
+    assert short.flagged and not short.deferred and short.paused
+    assert ledger.current_balance(session) == Decimal("1009.94")
+    state.set_paused(session, False, actor="owner")
+    # within the stake + tolerance it is deferred again (20.05 missing)
+    edge = ledger.reconcile(session, Decimal("989.89"), tolerance=tol)
+    assert edge.deferred and not edge.flagged
+    # the attempt turns out to have failed: now the same shortfall is unexplained
+    ledger.apply_placement(session, bet, placement(PlacementStatus.FAILED), settings)
+    unexplained = ledger.reconcile(session, Decimal("989.89"), tolerance=tol)
+    assert unexplained.flagged and unexplained.paused and not unexplained.deferred
+    # a PENDING row (committed, no result recorded - e.g. a crash right after the click) counts too
+    state.set_paused(session, False, actor="owner")
+    pending = add_bet(session, stake="15", status=BetStatus.PENDING)
+    maybe_sent = ledger.reconcile(session, Decimal("974.89"), tolerance=tol)  # 15.00 missing
+    assert maybe_sent.deferred and not maybe_sent.flagged
+    pending.status = BetStatus.CANCELLED
+    session.flush()
+    # dry-run and already debited bets never defer anything
+    add_bet(session, stake="50", status=BetStatus.PLACING, dry_run=True)
+    debited = add_bet(session, stake="50", status=BetStatus.PLACING)
+    ledger.record_stake(session, debited)
+    result = ledger.reconcile(session, Decimal("900.00"), tolerance=tol)
+    assert result.flagged and not result.deferred
+
+
+def test_reconcile_rejects_a_balance_that_is_not_a_number(session: Session, settings: Settings) -> None:
+    ledger.ensure_initialized(session, settings)
+    for bad in (Decimal("NaN"), Decimal("Infinity"), Decimal("-Infinity")):
+        with pytest.raises(ValueError, match="finite"):
+            ledger.reconcile(session, bad, tolerance=Decimal("0.05"))
+    assert ledger.current_balance(session) == Decimal("1000.00") and len(entries(session)) == 1
+    assert state.is_trading_halted(session) == (False, None)

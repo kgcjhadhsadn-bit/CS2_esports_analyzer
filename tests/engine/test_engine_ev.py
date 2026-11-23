@@ -20,6 +20,7 @@ from cs2bot.engine.ev import (
     expected_value,
     kelly_for_net_odds,
     kelly_fraction,
+    min_odds_for_ev,
     net_payout,
     payout_breakdown,
     price,
@@ -418,3 +419,45 @@ def test_property_refund_cost_never_helps(pw: tuple[float, float], odds: Decimal
         assert f_net <= f_full + 1e-9
     if o.p_push + o.p_void == 0:
         assert f_net == pytest.approx(f_full, abs=1e-12)
+
+
+# ------------------------------------------------------------------ minimum odds for an EV target
+
+
+def test_min_odds_for_ev_hand_examples() -> None:
+    # p = 0.8, 12 % stake tax: EV = 0.8 x 0.88 x o - 1 -> break-even at 1 / 0.704 = 1.42045...
+    assert min_odds_for_ev(outcome(0.8), TAXED) == Decimal("1.421")
+    # EV >= 3 %: o >= 1.03 / 0.704 = 1.46306...
+    assert min_odds_for_ev(outcome(0.8), TAXED, min_ev=0.03) == Decimal("1.464")
+    # tax-free promo: 1.03 / 0.8 = 1.2875 exactly
+    assert min_odds_for_ev(outcome(0.8), PROMO, min_ev=0.03) == Decimal("1.288")
+    # refunds: p_w 0.4, p_l 0.1, void 0.5 -> EV = 0.4 (0.88 o - 1) - 0.1 >= 0 -> o >= 0.5 / 0.352
+    assert min_odds_for_ev(outcome(0.4, p_void=0.5), TAXED) == Decimal("1.421")
+    # ...and when a refund keeps the stake tax (0.5 x 0.12 more to recover): 0.56 / 0.352 = 1.5909...
+    assert min_odds_for_ev(outcome(0.4, p_void=0.5), NET_REFUND) == Decimal("1.591")
+    # a sure thing still needs odds that beat the tax: 1 / 0.88 = 1.13636...
+    assert min_odds_for_ev(outcome(1.0), TAXED) == Decimal("1.137")
+    assert min_odds_for_ev(outcome(1.0), PROMO) == Decimal("1.000")
+    assert min_odds_for_ev(outcome(0.0), TAXED) is None
+    assert min_odds_for_ev(outcome(1e-30), TAXED) is None  # no price pays for this
+    assert min_odds_for_ev(outcome(1e-4), TAXED) == Decimal("11363.637")
+    assert min_odds_for_ev(outcome(0.8), TAXED, min_ev=float("nan")) is None
+
+
+@settings(max_examples=300, deadline=None)
+@given(
+    st.floats(min_value=0.02, max_value=1.0),
+    st.floats(min_value=0.0, max_value=1.0),
+    st.floats(min_value=-0.2, max_value=0.5),
+    all_models,
+)
+def test_property_min_odds_is_the_tightest_price_that_clears_the_ev_bar(
+    p_win: float, refund_share: float, min_ev: float, model: TaxModel
+) -> None:
+    o = _outcome_from((p_win, refund_share))
+    odds = min_odds_for_ev(o, model, min_ev=min_ev)
+    assert odds is not None and odds >= 1
+    assert odds == odds.quantize(Decimal("0.001"))  # a quotable price
+    assert expected_value(o, odds, model) >= min_ev
+    if odds > Decimal("1.001"):  # one tick lower no longer clears the bar
+        assert expected_value(o, odds - Decimal("0.001"), model) < min_ev + 1e-9

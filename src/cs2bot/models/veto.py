@@ -68,6 +68,10 @@ every played-map sequence with its pickers. Known steps condition the distributi
 and maps known to be chosen later stay available); ``first_veto=None`` is a 50/50 prior over which
 team starts, updated by the likelihood of any known steps. A complete published veto yields a
 single sequence with probability 1 without needing the model or the pool.
+
+The list is cut to ``top_k`` sequences (default 50) and renormalised. Because 50 sequences hold only
+about half of a BO3's probability (and a fifth of a BO5's), the cut preserves the per-slot map
+marginals exactly instead of just rescaling the survivors - see :mod:`cs2bot.models.veto_truncation`.
 """
 
 from __future__ import annotations
@@ -90,6 +94,7 @@ from cs2bot.config import DEFAULT_ACTIVE_MAP_POOL
 from cs2bot.domain.enums import MatchFormat, TeamSlot, VetoAction
 from cs2bot.domain.predictions import MapSequenceProbability
 from cs2bot.domain.records import VetoRecord, VetoStep
+from cs2bot.models.veto_truncation import truncate_sequences
 from cs2bot.utils.logging import get_logger
 from cs2bot.utils.names import normalize_map_name
 from cs2bot.utils.time import ensure_utc, utcnow
@@ -860,7 +865,8 @@ class VetoModel:
             raise ValueError("team1 and team2 must differ")
         t_pref = self._check_as_of(as_of)
         known, known_maps = self._normalise_known(known_steps)
-        pool = _unique(map_pool)
+        # An empty pool (e.g. a MatchContext whose pool is not filled yet) means the default pool.
+        pool = _unique(map_pool) or _unique(self._config.default_map_pool)
         for m in known_maps:
             if m not in pool:
                 pool.append(m)
@@ -880,27 +886,39 @@ class VetoModel:
         *,
         first_veto: TeamSlot | None = TeamSlot.TEAM1,
         known_steps: Sequence[VetoStep] = (),
-        top_k: int = 50,
+        top_k: int | None = 50,
         as_of: datetime | None = None,
         map_advantage: MapAdvantageFn | None = None,
         template: Sequence[VetoTemplateStep] | None = None,
+        preserve_marginals: bool = True,
     ) -> list[MapSequenceProbability]:
         """Distribution over the played-map sequences (with pickers), most likely first.
 
+        * ``map_pool``: the maps available to the veto; an empty pool means
+          ``config.default_map_pool`` (the Active Duty pool).
         * ``first_veto``: the team with the first veto; ``None`` = 50/50 over both orders (the
           known steps, when they name teams, override it).
         * ``known_steps``: already published steps (any subset); they condition the paths. A
           complete veto returns one sequence with probability 1.
-        * ``top_k``: only the ``top_k`` most likely sequences are returned and their probabilities
-          are **renormalised to sum to 1** after the truncation (also after pruning of paths below
-          ``config.prune_probability``).
+        * ``top_k``: at most ``top_k`` sequences are returned and their probabilities are
+          **renormalised to sum to 1** after the truncation (also after pruning of paths below
+          ``config.prune_probability``). ``None`` returns every sequence (exact; 210-420 for a BO3
+          and 2520-5040 for a BO5 on seven maps).
+        * ``preserve_marginals`` (default): the truncation keeps the per-slot map marginals
+          ``P(slot k is map m)`` of the full distribution exact - the most likely sequences are
+          kept and the probability of the truncated tail is re-assigned to the few sequences that
+          reproduce its marginals (:mod:`cs2bot.models.veto_truncation`). This needs ``top_k`` >=
+          19 (BO3) / 31 (BO5) on a 7-map pool; below that, or with ``preserve_marginals=False``,
+          the ``top_k`` most likely sequences are simply rescaled (which can move a map's
+          probability of being played by 0.2-0.5 when the list is much shorter than the
+          distribution).
         * ``as_of``: preference time (recency weighting); must be after the last fitted veto.
           ``None`` = as of the last fitted veto.
         * ``map_advantage``: optional ``(team, opponent, map, as_of) -> logit`` callable (e.g.
           ``MapRatingModel.map_advantage``); called with ``as_of`` (or now when ``as_of`` is None).
         * ``template``: custom veto order for unusual tournament formats.
         """
-        if top_k < 1:
+        if top_k is not None and top_k < 1:
             raise ValueError("top_k must be at least 1")
         pool, known, orders, t_pref = self._prepare(
             team1_id, team2_id, fmt, map_pool, first_veto, known_steps, as_of, template
@@ -918,12 +936,9 @@ class VetoModel:
         mass = sum(totals.values())
         if mass <= 0.0:
             raise ValueError("the known veto steps are inconsistent with the map pool / format")
-        ranked = sorted(totals.items(), key=lambda kv: (-kv[1], kv[0]))[:top_k]
-        kept = sum(p for _, p in ranked)
+        ranked = truncate_sequences(totals, top_k, preserve_marginals=preserve_marginals)
         return [
-            MapSequenceProbability(
-                maps=[m for m, _ in played], pickers=[t for _, t in played], probability=p / kept
-            )
+            MapSequenceProbability(maps=[m for m, _ in played], pickers=[t for _, t in played], probability=p)
             for played, p in ranked
         ]
 
@@ -942,7 +957,8 @@ class VetoModel:
     ) -> StepForecast:
         """Distribution of the first veto step that is not in ``known_steps``.
 
-        Raises ``ValueError`` when the veto is already complete.
+        Maps that ``known_steps`` assign to a later step are excluded. Raises ``ValueError`` when
+        the veto is already complete.
         """
         pool, known, orders, t_pref = self._prepare(
             team1_id, team2_id, fmt, map_pool, first_veto, known_steps, as_of, template
@@ -962,16 +978,20 @@ class VetoModel:
             action, actor = plan[idx]
             action_seen = action
             actors.add(actor)
+            # Maps published for a later step cannot be chosen now (the forecast conditions on
+            # them being available later, not on the likelihood of those later choices).
+            reserved = {m for j, (_, _, m) in known.items() if j > idx}
             for (rem, _), p in self._run(plan, pool, expu, known, fmt, stop=idx).items():
-                if not rem:
+                cands = [m for m in rem if m not in reserved]
+                if not cands:
                     continue
                 if action is VetoAction.LEFTOVER or actor is None:
-                    for m in rem:
-                        probs[m] += weight * p / len(rem)
+                    for m in cands:
+                        probs[m] += weight * p / len(cands)
                     continue
                 w = expu[(actor, action)]
-                denom = sum(w[m] for m in rem)
-                for m in rem:
+                denom = sum(w[m] for m in cands)
+                for m in cands:
                     probs[m] += weight * p * w[m] / denom
         if step_idx is None or action_seen is None:
             raise ValueError("the veto is already complete")

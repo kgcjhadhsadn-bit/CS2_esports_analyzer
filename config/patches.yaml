@@ -171,12 +171,13 @@ patches:
     date: 2026-07-08
     kind: map_pool
     impact: major
-    date_verified: true
+    date_verified: false
     title: "Premier Season 5: Cache replaces Overpass in Active Duty"
     map_pool: [ancient, anubis, cache, dust2, inferno, mirage, nuke]
     notes: >
-      Cache (added to other modes on 2026-04-29) enters Active Duty, Overpass leaves (sources quote
-      07-08 or 07-09). Same update: C4 explosion damage reworked.
+      Cache (added to other modes on 2026-04-29) enters Active Duty, Overpass leaves. The month is
+      confirmed by several sources but the day is UNVERIFIED: sources quote 07-06, 07-08 or 07-09.
+      Same update: C4 explosion damage reworked.
 
   - id: 2026-07-21-bomb-clears-utility
     date: 2026-07-21

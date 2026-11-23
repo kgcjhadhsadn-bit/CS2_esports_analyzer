@@ -59,7 +59,7 @@ from collections import defaultdict
 from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from decimal import Decimal
+from decimal import ROUND_DOWN, Decimal
 from zoneinfo import ZoneInfo
 
 from sqlalchemy import and_, or_, select
@@ -275,10 +275,18 @@ def compute_state(
 # ----------------------------------------------------------------------------------------------
 
 
+def _floor_money(amount: Decimal) -> Decimal:
+    return amount.quantize(CENT, rounding=ROUND_DOWN)
+
+
 def loss_limit_status(state: BankrollState, settings: BankrollSettings) -> LossLimitStatus:
-    """Daily / weekly loss limits, realized losses and the remaining guard allowance."""
-    daily_limit = quantize_money(D(settings.daily_loss_limit_fraction) * state.day_start_bankroll)
-    weekly_limit = quantize_money(D(settings.weekly_loss_limit_fraction) * state.week_start_bankroll)
+    """Daily / weekly loss limits, realized losses and the remaining guard allowance.
+
+    The limits are rounded DOWN to the grosz, so a loss never exceeds the configured fraction of the
+    period-start bankroll by even a fraction of a grosz.
+    """
+    daily_limit = _floor_money(D(settings.daily_loss_limit_fraction) * state.day_start_bankroll)
+    weekly_limit = _floor_money(D(settings.weekly_loss_limit_fraction) * state.week_start_bankroll)
     loss_today = max(_ZERO, -state.realized_pnl_today)
     loss_week = max(_ZERO, -state.realized_pnl_week)
     at_risk = total_open_stakes(state)

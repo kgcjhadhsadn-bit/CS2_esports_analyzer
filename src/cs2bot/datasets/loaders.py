@@ -20,14 +20,16 @@ import logging
 from collections import defaultdict
 from collections.abc import Collection, Iterable, Sequence
 from datetime import datetime
+from enum import Enum
 from typing import Any, Final
 
 import pandas as pd
 from pydantic import BaseModel, ValidationError
-from sqlalchemy import Select, case, func, or_, select
+from sqlalchemy import case, func, or_, select
 from sqlalchemy.orm import Session
 
 from cs2bot.datasets._common import (
+    AnySelect,
     apply_match_filters,
     fetch_in_chunks,
     map_time_expr,
@@ -99,7 +101,7 @@ def _lineups_by_match(session: Session, match_ids: Iterable[int]) -> dict[int, d
     """match id -> team id -> sorted player ids, from ``match_lineups``."""
     out: dict[int, dict[int, list[int]]] = defaultdict(lambda: defaultdict(list))
 
-    def stmt(chunk: Sequence[int]) -> Select[Any]:
+    def stmt(chunk: Sequence[int]) -> AnySelect:
         return select(MatchLineup.match_id, MatchLineup.team_id, MatchLineup.player_id).where(
             MatchLineup.match_id.in_(chunk)
         )
@@ -113,7 +115,7 @@ def _players_by_map(session: Session, map_ids: Iterable[int]) -> dict[int, dict[
     """map_played id -> team id -> player ids that have a stat line on that map."""
     out: dict[int, dict[int, set[int]]] = defaultdict(lambda: defaultdict(set))
 
-    def stmt(chunk: Sequence[int]) -> Select[Any]:
+    def stmt(chunk: Sequence[int]) -> AnySelect:
         return select(PlayerMapStats.map_played_id, PlayerMapStats.team_id, PlayerMapStats.player_id).where(
             PlayerMapStats.map_played_id.in_(chunk)
         )
@@ -320,9 +322,7 @@ def load_veto_records(
         if not ok or not steps:
             skipped += 1
             continue
-        fmt = head.format or _infer_format(
-            sum(1 for s in steps if s.action is VetoAction.PICK), len(steps)
-        )
+        fmt = head.format or _infer_format(sum(1 for s in steps if s.action is VetoAction.PICK), len(steps))
         if fmt is None:
             skipped += 1
             continue
@@ -494,7 +494,7 @@ def _awp_kills_by_map(session: Session, map_ids: Iterable[int]) -> dict[int, dic
     out: dict[int, dict[int, int]] = {}
     awp = case((func.lower(Kill.weapon).in_(sorted(AWP_WEAPON_NAMES)), 1), else_=0)
 
-    def stmt(chunk: Sequence[int]) -> Select[Any]:
+    def stmt(chunk: Sequence[int]) -> AnySelect:
         return (
             select(Kill.map_played_id, Kill.attacker_player_id, func.sum(awp))
             .where(
@@ -519,7 +519,7 @@ def _awp_kills_by_map(session: Session, map_ids: Iterable[int]) -> dict[int, dic
 def _standins(session: Session, match_ids: Iterable[int]) -> set[tuple[int, int]]:
     """(match id, player id) pairs flagged as stand-ins in ``match_lineups``."""
 
-    def stmt(chunk: Sequence[int]) -> Select[Any]:
+    def stmt(chunk: Sequence[int]) -> AnySelect:
         return select(MatchLineup.match_id, MatchLineup.player_id).where(
             MatchLineup.match_id.in_(chunk), MatchLineup.is_standin.is_(True)
         )
@@ -679,6 +679,5 @@ def to_frame(records: Iterable[BaseModel], *, columns: Sequence[str] | None = No
     cols = list(columns) if columns is not None else list(type(rows[0]).model_fields)
     data: dict[str, list[Any]] = {}
     for col in cols:
-        values = [getattr(r, col) for r in rows]
-        data[col] = [v.value if hasattr(v, "value") and isinstance(v, str) else v for v in values]
+        data[col] = [v.value if isinstance(v, Enum) else v for v in (getattr(r, col) for r in rows)]
     return pd.DataFrame(data, columns=cols)

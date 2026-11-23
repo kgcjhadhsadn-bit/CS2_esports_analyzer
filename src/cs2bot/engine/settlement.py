@@ -149,6 +149,11 @@ def explain_outcome(
     handler = _HANDLERS.get(spec.market_type)
     if handler is None:
         return Resolution(UNKNOWN, f"market type {spec.market_type.value!r} is never settled locally")
+    if player_teams is None:
+        # forward compatible: used as soon as MatchActuals carries the lineups (see the report's
+        # foundation change requests); today the caller has to pass player_teams
+        carried = getattr(actuals, "player_teams", None)
+        player_teams = carried if isinstance(carried, Mapping) and carried else None
     try:
         series = _series(actuals)
         return handler(spec, selection, series, _Rules(include_ot, tie, player_teams))

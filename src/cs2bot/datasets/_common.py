@@ -4,16 +4,17 @@ from __future__ import annotations
 
 from collections.abc import Callable, Iterable, Iterator, Sequence
 from datetime import datetime
-from typing import Any, Final, TypeVar
+from typing import Any, Final
 
-from sqlalchemy import ColumnElement, Select, func
+from sqlalchemy import ColumnElement, Select, SQLColumnExpression, func
 from sqlalchemy.orm import Session
 
 from cs2bot.db.models import MapPlayed, Match
 from cs2bot.domain.enums import DataSource, MatchStatus, Tier
 from cs2bot.utils.time import ensure_utc
 
-T = TypeVar("T")
+#: A ``select()`` of any column tuple (SQLAlchemy 2.1 types ``Select`` variadically).
+AnySelect = Select[*tuple[Any, ...]]
 
 #: Preferred source first. Demo data is measured from the game itself, HLTV is a curated scoreboard,
 #: PandaScore is an API feed, synthetic rows only exist in tests and demos.
@@ -39,19 +40,19 @@ def source_rank(source: DataSource | str | None) -> int:
         return len(SOURCE_PRIORITY)
 
 
-def map_time_expr() -> ColumnElement[datetime]:
+def map_time_expr() -> ColumnElement[Any]:
     """When a map was played: ``maps_played.played_at``, else the match's scheduled start."""
     return func.coalesce(MapPlayed.played_at, Match.scheduled_at)
 
 
-def apply_match_filters(
-    stmt: Select[Any],
+def apply_match_filters[S: AnySelect](
+    stmt: S,
     *,
-    time_expr: ColumnElement[datetime],
+    time_expr: SQLColumnExpression[Any],
     since: datetime | None,
     until: datetime | None,
     in_scope_only: bool,
-) -> Select[Any]:
+) -> S:
     """Common WHERE clause: both teams known, not cancelled, ``since <= time < until``, scope."""
     stmt = stmt.where(
         Match.team1_id.is_not(None),
@@ -85,14 +86,14 @@ def resolve_lan(match_is_lan: bool | None, tournament_is_lan: bool | None) -> bo
     return bool(tournament_is_lan)
 
 
-def chunks(items: Sequence[T], size: int = IN_CHUNK) -> Iterator[Sequence[T]]:
+def chunks[T](items: Sequence[T], size: int = IN_CHUNK) -> Iterator[Sequence[T]]:
     for i in range(0, len(items), size):
         yield items[i : i + size]
 
 
 def fetch_in_chunks(
     session: Session,
-    make_stmt: Callable[[Sequence[int]], Select[Any]],
+    make_stmt: Callable[[Sequence[int]], AnySelect],
     ids: Iterable[int],
     *,
     size: int = IN_CHUNK,

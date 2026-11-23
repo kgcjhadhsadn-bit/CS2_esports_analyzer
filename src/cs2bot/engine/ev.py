@@ -63,7 +63,7 @@ from __future__ import annotations
 import math
 from collections.abc import Iterable
 from dataclasses import dataclass
-from decimal import ROUND_DOWN, ROUND_HALF_UP, Decimal
+from decimal import ROUND_DOWN, ROUND_HALF_UP, ROUND_UP, Decimal
 from typing import Literal
 
 from cs2bot.config import BetclicSettings, Settings
@@ -279,6 +279,38 @@ def expected_value(
     win_return = float(breakdown.net_payout / breakdown.stake) - 1.0
     refund_return = float(refund_amount(breakdown.stake, model) / breakdown.stake) - 1.0
     return p_win * win_return - p_lose + p_refund * refund_return
+
+
+#: Odds are quoted (and stored) with at most three decimals.
+ODDS_STEP = Decimal("0.001")
+_MAX_MEANINGFUL_ODDS = 1e6
+
+
+def min_odds_for_ev(
+    outcome: OutcomeProbability, settings: TaxSource, *, min_ev: float = 0.0
+) -> Decimal | None:
+    """Lowest decimal odds at which the per-unit EV (no stake, see :func:`expected_value`) is still
+    ``>= min_ev``, rounded UP to three decimals. ``None`` when the outcome cannot win (or would need
+    odds above one million).
+
+    From ``EV = p_w ((1 - t) o - 1) - p_l - p_r c >= m``:  ``o >= (m + p_w + p_l + p_r c) / (p_w (1 - t))``.
+    Used for ``BetOrder.min_acceptable_odds``: if the price drops below it between the decision and the
+    placement, the edge the decision relied on is gone and the bet must not be placed.
+    """
+    model = TaxModel.from_settings(settings)
+    p_win, p_lose, p_refund = _probabilities(outcome)
+    if not (math.isfinite(min_ev) and math.isfinite(p_win) and math.isfinite(p_lose)) or p_win <= 0:
+        return None
+    keep = 1.0 - float(model.stake_tax_rate)
+    exact = (min_ev + p_win + p_lose + p_refund * float(model.refund_loss_rate)) / (p_win * keep)
+    if not math.isfinite(exact) or exact > _MAX_MEANINGFUL_ODDS:
+        return None  # a win so unlikely that no real price can pay for it
+    odds = max(D(exact).quantize(ODDS_STEP, rounding=ROUND_UP), Decimal("1.000"))
+    for _ in range(3):  # float noise in ``exact``: make sure the rounded odds really clear the bar
+        if expected_value(outcome, odds, model) >= min_ev:
+            break
+        odds += ODDS_STEP
+    return odds
 
 
 def kelly_for_net_odds(

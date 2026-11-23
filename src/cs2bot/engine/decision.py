@@ -38,7 +38,7 @@ import math
 from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from decimal import Decimal
+from decimal import ROUND_UP, Decimal
 from enum import StrEnum
 
 from pydantic import BaseModel, Field
@@ -51,6 +51,7 @@ from cs2bot.domain.betting import BetDecision, PricedOutcome
 from cs2bot.domain.enums import BetStatus, LinkStatus, MatchStatus
 from cs2bot.domain.markets import MarketSpec, MarketType
 from cs2bot.domain.predictions import MatchPrediction, OutcomeProbability
+from cs2bot.engine.ev import ODDS_STEP, min_odds_for_ev
 from cs2bot.utils.time import ensure_utc, utcnow
 
 #: Link statuses that allow automatic betting.
@@ -340,6 +341,38 @@ def evaluate(
     )
 
 
+def min_acceptable_odds(
+    priced: PricedOutcome,
+    *,
+    settings: DecisionSettings,
+    betclic: BetclicSettings,
+    odds_tolerance: float,
+) -> Decimal:
+    """Lowest odds at which an accepted bet may still be placed (``BetOrder.min_acceptable_odds``).
+
+    The executor re-reads the live price right before confirming. It may accept a small drop
+    (``ExecutorSettings.odds_tolerance``, relative), but never a price at which the bet would no
+    longer pass the decision rules: the result is the highest of
+
+    * ``quote odds x (1 - odds_tolerance)``,
+    * the odds at which the EV equals the market's ``min_ev`` (:func:`cs2bot.engine.ev.min_odds_for_ev`),
+    * ``settings.min_odds``,
+
+    rounded UP to three decimals. For an outcome that should not be bet at all (no chance to win, or
+    an EV already below the threshold) the result is not below the quoted odds, so nothing worse than
+    the quote is ever accepted. Raises ``ValueError`` for a tolerance outside [0, 1).
+    """
+    if not 0.0 <= odds_tolerance < 1.0:
+        raise ValueError(f"odds_tolerance must be in [0, 1), got {odds_tolerance!r}")
+    quoted = priced.quote.odds
+    floor = (quoted * (Decimal(1) - Decimal(repr(odds_tolerance)))).quantize(ODDS_STEP, rounding=ROUND_UP)
+    th = thresholds_for(priced.quote.spec.market_type, settings)
+    edge_floor = min_odds_for_ev(priced.outcome, betclic, min_ev=th.min_ev)
+    if edge_floor is None:
+        return max(quoted, settings.min_odds)
+    return max(floor, edge_floor, settings.min_odds.quantize(ODDS_STEP, rounding=ROUND_UP))
+
+
 def evaluate_all(
     priced: Iterable[PricedOutcome],
     *,
@@ -389,7 +422,8 @@ def load_match_decision_info(
 
     * start time: the earlier of ``matches.scheduled_at`` and the linked bookmaker event's
       ``starts_at`` (the bookmaker closes its pre-match market at its own kick-off time);
-    * match status from ``matches.status``;
+    * match status from ``matches.status`` - LIVE as soon as the linked bookmaker event is flagged
+      in-play, even if the match row still says scheduled (pre-match bets only);
     * data completeness: ``prediction.data_completeness`` if a prediction is given, else
       ``matches.data_completeness``;
     * link confidence / status from the bookmaker event (it must be linked to this match);
@@ -406,12 +440,17 @@ def load_match_decision_info(
     link_conf: float | None = None
     link_status = LinkStatus.UNLINKED
     scheduled_at = match.scheduled_at
+    match_status = match.status
     if bookmaker_event_id is not None:
         event = session.get(BookmakerEvent, bookmaker_event_id)
         if event is not None and event.match_id == match_id:
             link_conf, link_status = event.link_confidence, event.link_status
             if event.starts_at is not None and (scheduled_at is None or event.starts_at < scheduled_at):
                 scheduled_at = event.starts_at
+            if event.is_live and match_status in BETTABLE_MATCH_STATUSES:
+                # the bookmaker already trades the event in-play: its prices are live odds, whatever
+                # our (possibly stale) match row says
+                match_status = MatchStatus.LIVE
     veto_reasons: list[str] = []
     flag_rows = session.scalars(
         select(ContextFlagRow).where(
@@ -432,7 +471,7 @@ def load_match_decision_info(
     return MatchDecisionInfo(
         match_id=match_id,
         scheduled_at=scheduled_at,
-        match_status=match.status,
+        match_status=match_status,
         data_completeness=completeness,
         link_confidence=link_conf,
         link_status=link_status,

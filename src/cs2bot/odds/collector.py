@@ -12,17 +12,35 @@
    * live events are stored and flagged (``is_live``) but their prices are not processed - the
      system is pre-match only and the last pre-match snapshot stays the closing line;
    * upsert ``bookmaker_markets`` by (event_id, raw_name, external_id) and ``bookmaker_selections``
-     by (market_id, raw_name, external_id), re-mapping every market on every pass (so link / swap
-     changes and edited YAML rules apply immediately);
+     by (market_id, raw_name, external_id), re-mapping every market seen on every pass (so edited
+     YAML rules apply immediately);
+   * when the link or the swap flag changed, or the dashboard's link review left
+     ``event.extra["remap_required"]`` (docs/dev/reports/api.md), re-map **every stored market**
+     of the event - also the ones this pass did not see (a listing-only sighting shows just the
+     match winner): a selection keyed for the old orientation must never survive a relink. Flagged
+     events that are no longer listed are re-mapped at the end of the pass;
    * write an ``odds_snapshots`` row only when the odds or the availability differ from
-     ``selection.last_odds`` / ``is_available``; ``last_odds_at`` is refreshed on every sighting
-     (it is the "price confirmed at" timestamp the quote freshness check uses). Timestamps are
-     the source's per-event capture times (``FetchInfo.captured_at_by_event``) because a browser
-     crawl can take minutes - stamping with the run start would make fresh prices look stale and
-     could put a pre-kick-off price on the wrong side of the closing-line cut-off;
+     ``selection.last_odds`` / ``is_available``. ``last_seen_at`` is refreshed on every sighting;
+     ``last_odds_at`` ("price last confirmed at", what the quote freshness check uses) on every
+     sighting of the selection as *available*. Timestamps are the source's capture times -
+     per market when the source reports them (``FetchInfo.captured_at_by_market``), else per
+     event (``CollectedEvent.captured_at`` / ``FetchInfo.captured_at_by_event``) - because a
+     browser crawl takes minutes: stamping with the run start would make fresh prices look stale
+     and could put a pre-kick-off price on the wrong side of the closing-line cut-off, and
+     stamping a market with a later payload that did not contain it would make a stale price look
+     fresh. An observation older than what is already stored for a selection (a replayed
+     archive) is ignored, so the price history only moves forward;
    * selections that vanished from a refreshed event (whole market gone, or a single selection
      gone) are marked unavailable with a snapshot - unless the source reported the event as
      partial (e.g. only seen on the listing page).
+
+The mapper is re-bound to the live settlement assumptions on every pass
+(``settings.betclic.totals_include_overtime`` / ``h2h_tie_rule``, see
+:meth:`MarketMapper.with_settlement`), so the mapping can never disagree with the pricing engine.
+
+``bookmaker_markets.extra`` records ``betclic_market_id`` (Betclic's own id), ``rule`` (the id of
+the YAML rule that recognised the name, for ``cs2bot odds unmapped`` diagnostics) and, for split
+rows, ``split_signature``.
 
 Multi-line markets: a market row has ONE spec, so when the selections of one bookmaker market map
 to different specs (a card listing several lines without per-line market ids), the market is
@@ -37,7 +55,7 @@ import logging
 from collections import Counter
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from decimal import Decimal
 from typing import Any
 
@@ -49,15 +67,16 @@ from cs2bot.config import Settings
 from cs2bot.db.models import BookmakerEvent, BookmakerMarket, BookmakerSelection, OddsSnapshot
 from cs2bot.domain.enums import Bookmaker, LinkStatus
 from cs2bot.domain.odds import CollectedEvent, CollectedMarket, CollectedSelection, MappedSelection
-from cs2bot.odds.event_matching import LinkConfig, link_event
+from cs2bot.odds.event_matching import MANUAL_STATUSES, LinkConfig, link_event
 from cs2bot.odds.market_mapping import MarketMapper, PlayerResolver, lineup_player_resolver
 from cs2bot.odds.sources import FetchInfo, OddsSource, SupportsFetchInfo
 from cs2bot.odds.text import quantize_odds, truncate
-from cs2bot.utils.time import utcnow
+from cs2bot.utils.time import ensure_utc, utcnow
 
 logger = logging.getLogger(__name__)
 
 SPLIT_SEPARATOR = "~"
+REMAP_REQUIRED_KEY = "remap_required"  # set by the API's link review (cs2bot.api.routes.review)
 PlayerResolverFactory = Callable[[Session, int], PlayerResolver | None]
 
 
@@ -72,6 +91,8 @@ class CollectorConfig:
     max_raw_paths_per_event: int = 20
     max_unmapped_in_report: int = 30
     link: LinkConfig = field(default_factory=LinkConfig)
+    # how far back unlisted events flagged ``remap_required`` are still looked for
+    remap_lookback_days: int = 14
 
 
 class CollectReport(BaseModel):
@@ -83,6 +104,7 @@ class CollectReport(BaseModel):
     events_live: int = 0
     events_partial: int = 0
     events_relinked: int = 0
+    events_remapped: int = 0  # every stored market re-mapped (link / swap change or manual review)
     link_status_counts: dict[str, int] = Field(default_factory=dict)
     markets_seen: int = 0
     markets_new: int = 0
@@ -92,6 +114,7 @@ class CollectReport(BaseModel):
     selections_new: int = 0
     selections_mapped: int = 0
     selections_marked_unavailable: int = 0
+    selections_stale_ignored: int = 0  # observations older than the stored one (replayed archives)
     snapshots_written: int = 0
     unmapped_markets: list[str] = Field(default_factory=list)
     errors: list[str] = Field(default_factory=list)
@@ -116,14 +139,31 @@ class _Run:
     resolvers: dict[int, PlayerResolver | None] = field(default_factory=dict)
     unmapped: dict[str, None] = field(default_factory=dict)
     fallback_now: datetime | None = None
+    processed_event_ids: set[int] = field(default_factory=set)
 
     def event_time(self, ce: CollectedEvent) -> datetime:
-        """Observation time of one event: explicit ``now`` > the source's capture time > post-fetch clock."""
+        """Observation time of one event: explicit ``now`` > the source's capture time > post-fetch clock.
+
+        Capture times are clamped to the post-fetch clock: a price can never be stamped in the future.
+        """
         if self.explicit_now is not None:
             return self.explicit_now
         fallback = self.fallback_now or self.now
-        captured = self.info.captured_at_by_event.get(ce.external_id) if self.info is not None else None
-        return min(captured, fallback) if captured is not None else fallback
+        captured = ce.captured_at
+        if captured is None and self.info is not None:
+            captured = self.info.captured_at_by_event.get(ce.external_id)
+        return min(ensure_utc(captured), fallback) if captured is not None else fallback
+
+    def market_time(self, ce: CollectedEvent, market: CollectedMarket) -> datetime:
+        """Observation time of one market: its own freshest payload when the source reports it."""
+        if self.explicit_now is not None:
+            return self.explicit_now
+        captured = None
+        if self.info is not None:
+            captured = self.info.captured_at_by_market.get(ce.external_id, {}).get(
+                (market.raw_name, market.external_id)
+            )
+        return min(ensure_utc(captured), self.now) if captured is not None else self.now
 
     def resolver_for(self, match_id: int | None) -> PlayerResolver | None:
         if match_id is None:
@@ -162,7 +202,12 @@ def _short_hash(text: str) -> str:
 def split_market(
     market: CollectedMarket, event: CollectedEvent, mapper: MarketMapper
 ) -> list[tuple[str, str, list[CollectedSelection]]]:
-    """``[(raw_name, external_id, selections)]`` - one entry per distinct spec signature."""
+    """``[(raw_name, external_id, selections)]`` - one entry per distinct spec signature.
+
+    The selections of every entry are mapped with the names of ALL selections of the original
+    market as siblings (three-way detection must see the "Remis" row even when it lands in
+    another entry).
+    """
     names = [s.raw_name for s in market.selections]
     groups: dict[str | None, list[CollectedSelection]] = {}
     for sel in market.selections:
@@ -180,28 +225,60 @@ def split_market(
     return out
 
 
-def _snapshot(run: _Run, row: BookmakerSelection, odds: Decimal, available: bool) -> None:
-    run.session.add(OddsSnapshot(selection_id=row.id, odds=odds, is_available=available, captured_at=run.now))
+def _snapshot(run: _Run, row: BookmakerSelection, odds: Decimal, available: bool, at: datetime) -> None:
+    run.session.add(OddsSnapshot(selection_id=row.id, odds=odds, is_available=available, captured_at=at))
     run.report.snapshots_written += 1
 
 
-def _observe(run: _Run, row: BookmakerSelection, odds: Decimal, available: bool) -> None:
+def _last_observed_at(row: BookmakerSelection) -> datetime | None:
+    """Latest time anything was recorded for a selection (rows written before ``last_seen_at``
+    existed only carry ``last_odds_at``)."""
+    known = [t for t in (row.last_seen_at, row.last_odds_at) if t is not None]
+    return max(known) if known else None
+
+
+def _observe(run: _Run, row: BookmakerSelection, odds: Decimal, available: bool, at: datetime) -> None:
+    """Record one sighting of a selection at ``at`` (snapshot only when price/availability changed)."""
+    previous = _last_observed_at(row)
+    if previous is not None and at < previous:
+        run.report.selections_stale_ignored += 1  # older than what we have: history only moves forward
+        return
     price = quantize_odds(odds)
     last = quantize_odds(Decimal(row.last_odds)) if row.last_odds is not None else None
     if last is None or last != price or bool(row.is_available) != available:
-        _snapshot(run, row, price, available)
+        _snapshot(run, row, price, available, at)
     row.last_odds = price
-    row.last_odds_at = run.now
+    row.last_seen_at = at
+    if available:
+        row.last_odds_at = at  # "price last confirmed at": only an available sighting confirms it
     row.is_available = available
 
 
-def _mark_unavailable(run: _Run, row: BookmakerSelection) -> None:
+def _mark_unavailable(run: _Run, row: BookmakerSelection, at: datetime) -> None:
     if not row.is_available:
         return
+    previous = _last_observed_at(row)
+    if previous is not None and at < previous:
+        return  # the sighting that misses this selection is older than the one that saw it
     if row.last_odds is not None:
-        _snapshot(run, row, quantize_odds(Decimal(row.last_odds)), False)
+        _snapshot(run, row, quantize_odds(Decimal(row.last_odds)), False, at)
     row.is_available = False
     run.report.selections_marked_unavailable += 1
+
+
+def _set_market_extra(market_row: BookmakerMarket, mapper: MarketMapper, signature: str | None) -> None:
+    """Keep ``bookmaker_markets.extra`` in sync (written only when something changed)."""
+    wanted: dict[str, Any] = dict(market_row.extra or {})
+    wanted["betclic_market_id"] = original_market_external_id(market_row.external_id)
+    rule = mapper.match_rule(market_row.raw_name)
+    if rule is not None:
+        wanted["rule"] = rule
+    else:
+        wanted.pop("rule", None)
+    if signature is not None and SPLIT_SEPARATOR in market_row.external_id:
+        wanted["split_signature"] = signature
+    if wanted != (market_row.extra or {}):
+        market_row.extra = wanted
 
 
 def _apply_mapping(
@@ -282,9 +359,11 @@ def _sync_market(
     swapped: bool,
     resolver: PlayerResolver | None,
     partial: bool,
+    at: datetime,
+    siblings: Sequence[str] | None = None,
 ) -> None:
     session = run.session
-    names = [s.raw_name for s in selections]
+    names = list(siblings) if siblings is not None else [s.raw_name for s in selections]
     mapped = [
         run.mapper.map(
             market_row.raw_name,
@@ -326,11 +405,11 @@ def _sync_market(
         if id(row) in seen_rows:
             continue  # duplicate selection in the payload: first observation wins
         seen_rows.add(id(row))
-        _observe(run, row, sel.odds, sel.is_available)
+        _observe(run, row, sel.odds, sel.is_available, at)
     if not partial:
         for row in market_row.selections:
             if id(row) not in seen_rows:
-                _mark_unavailable(run, row)
+                _mark_unavailable(run, row, at)
 
 
 def _process_event(run: _Run, ce: CollectedEvent) -> None:
@@ -342,45 +421,78 @@ def _process_event(run: _Run, ce: CollectedEvent) -> None:
         run.report.events_new += 1
     if partial:
         run.report.events_partial += 1
+    run.processed_event_ids.add(row.id)
     link = link_event(session, row, settings=run.settings, now=run.now, config=run.config.link)
     status_key = row.link_status.value
     run.report.link_status_counts[status_key] = run.report.link_status_counts.get(status_key, 0) + 1
     if link.changed and not is_new:
         run.report.events_relinked += 1
+    swapped = bool(row.teams_swapped) if row.match_id is not None else False
+    resolver = run.resolver_for(row.match_id)
+    if not is_new and (link.changed or (row.extra or {}).get(REMAP_REQUIRED_KEY)):
+        # The match / orientation changed (or a manual review cleared the mappings): every STORED
+        # market is re-keyed now, including those this pass does not see.
+        _remap_rows(session, row, run.mapper, resolver)
+        _clear_remap_flag(row)
+        run.report.events_remapped += 1
     if ce.is_live and not run.config.store_live_odds:
         run.report.events_live += 1
         return
-    swapped = bool(row.teams_swapped) if row.match_id is not None else False
-    resolver = run.resolver_for(row.match_id)
 
     # group the incoming markets by natural key (duplicates are merged, later selections win)
     incoming: dict[tuple[str, str], dict[tuple[str, str], CollectedSelection]] = {}
+    observed_at: dict[tuple[str, str], datetime] = {}
+    signatures: dict[tuple[str, str], str | None] = {}
+    sibling_names: dict[tuple[str, str], dict[str, None]] = {}
     for market in ce.markets:
+        at = run.market_time(ce, market)
+        all_names = [s.raw_name for s in market.selections]
         for raw_name, ext_id, sels in split_market(market, ce, run.mapper):
-            bucket = incoming.setdefault((raw_name, ext_id), {})
+            key = (raw_name, ext_id)
+            bucket = incoming.setdefault(key, {})
             for sel in sels:
                 bucket[(sel.raw_name, sel.external_id)] = sel
+            observed_at[key] = max(at, observed_at[key]) if key in observed_at else at
+            sibling_names.setdefault(key, {}).update(dict.fromkeys(all_names))
+            if key not in signatures and sels:
+                signatures[key] = run.mapper.group_key(
+                    market.raw_name, sels[0].raw_name, event=ce, sibling_selections=all_names
+                )
 
     existing = {(m.raw_name, m.external_id): m for m in row.markets}
     seen_markets: set[int] = set()
     for (raw_name, ext_id), sel_map in incoming.items():
+        at = observed_at[(raw_name, ext_id)]
         market_row = existing.get((raw_name, ext_id))
         if market_row is None:
             market_row = BookmakerMarket(
                 raw_name=raw_name,
                 external_id=ext_id,
-                first_seen_at=run.now,
-                last_seen_at=run.now,
+                first_seen_at=at,
+                last_seen_at=at,
                 is_mapped=False,
+                extra={},
             )
             row.markets.append(market_row)
             existing[(raw_name, ext_id)] = market_row
             session.flush()
             run.report.markets_new += 1
-        market_row.last_seen_at = run.now
+        if market_row.last_seen_at is None or at > market_row.last_seen_at:
+            market_row.last_seen_at = at
         seen_markets.add(id(market_row))
         run.report.markets_seen += 1
-        _sync_market(run, ce, market_row, list(sel_map.values()), swapped, resolver, partial)
+        _set_market_extra(market_row, run.mapper, signatures.get((raw_name, ext_id)))
+        _sync_market(
+            run,
+            ce,
+            market_row,
+            list(sel_map.values()),
+            swapped,
+            resolver,
+            partial,
+            at,
+            siblings=list(sibling_names[(raw_name, ext_id)]),
+        )
 
     if not partial:
         for market_row in row.markets:
@@ -389,7 +501,7 @@ def _process_event(run: _Run, ce: CollectedEvent) -> None:
             if any(s.is_available for s in market_row.selections):
                 run.report.markets_disappeared += 1
             for sel_row in market_row.selections:
-                _mark_unavailable(run, sel_row)
+                _mark_unavailable(run, sel_row, run.now)
     session.flush()
 
 
@@ -413,6 +525,7 @@ def collect_once(
     crawl. An explicit ``now`` stamps everything with that instant (tests, replays).
     """
     report = CollectReport(started_at=now or utcnow())
+    mapper = _bind_settlement(mapper, settings)
     events = source.fetch_cs2_events()
     info = source.last_fetch_info() if isinstance(source, SupportsFetchInfo) else None
     after_fetch = now or utcnow()
@@ -439,6 +552,7 @@ def collect_once(
             report.events_failed += 1
             report.errors.append(f"event {ce.external_id}: {type(exc).__name__}: {exc}")
             logger.warning("failed to store Betclic event %s", ce.external_id, exc_info=True)
+    _remap_flagged_events(run, after_fetch)
     session.flush()
     report.unmapped_markets = list(run.unmapped)[: run.config.max_unmapped_in_report]
     report.finished_at = utcnow()
@@ -457,18 +571,24 @@ def collect_once(
     return report
 
 
-def remap_event(
-    session: Session,
-    event_row: BookmakerEvent,
-    mapper: MarketMapper,
-    *,
-    player_resolver: PlayerResolver | None = None,
-) -> int:
-    """Re-map an event's stored markets from their raw names (e.g. after a manual link change).
+def _bind_settlement(mapper: MarketMapper, settings: Settings) -> MarketMapper:
+    """The mapper bound to the settlement assumptions the pricing engine reads from ``settings``."""
+    return mapper.with_settlement(
+        totals_include_overtime=settings.betclic.totals_include_overtime,
+        h2h_tie_rule=settings.betclic.h2h_tie_rule,
+    )
 
-    No prices are touched. Returns the number of selections whose mapping changed. When
-    ``player_resolver`` is omitted the match lineups are used.
-    """
+
+def _clear_remap_flag(event_row: BookmakerEvent) -> None:
+    extra = dict(event_row.extra or {})
+    if extra.pop(REMAP_REQUIRED_KEY, None) is not None:
+        event_row.extra = extra  # reassigned so the JSON change is persisted
+
+
+def _remap_rows(
+    session: Session, event_row: BookmakerEvent, mapper: MarketMapper, resolver: PlayerResolver | None
+) -> int:
+    """Re-map every stored market of an event from its raw names; returns changed selections."""
     event = CollectedEvent(
         external_id=event_row.external_id,
         name=event_row.name,
@@ -476,13 +596,15 @@ def remap_event(
         team2_raw=event_row.team2_raw,
     )
     swapped = bool(event_row.teams_swapped) if event_row.match_id is not None else False
-    resolver = player_resolver
-    if resolver is None and event_row.match_id is not None:
-        resolver = lineup_player_resolver(session, event_row.match_id)
+    # rows split off one bookmaker market share their siblings (three-way detection)
+    siblings: dict[tuple[str, str], list[str]] = {}
+    for market_row in event_row.markets:
+        key = (market_row.raw_name, original_market_external_id(market_row.external_id))
+        siblings.setdefault(key, []).extend(s.raw_name for s in market_row.selections)
     changed = 0
     for market_row in event_row.markets:
         sels = list(market_row.selections)
-        names = [s.raw_name for s in sels]
+        names = siblings[(market_row.raw_name, original_market_external_id(market_row.external_id))]
         mapped = [
             mapper.map(
                 market_row.raw_name,
@@ -501,5 +623,58 @@ def remap_event(
                 changed += 1
             sel_row.selection_key = new_key
             sel_row.is_mapped = new_key is not None
+    session.flush()
+    return changed
+
+
+def _remap_flagged_events(run: _Run, now: datetime) -> None:
+    """Re-map events the link review flagged (``remap_required``) that this pass did not see."""
+    cutoff = now - timedelta(days=run.config.remap_lookback_days)
+    query = (
+        select(BookmakerEvent)
+        .options(selectinload(BookmakerEvent.markets).selectinload(BookmakerMarket.selections))
+        .where(
+            BookmakerEvent.bookmaker == Bookmaker.BETCLIC,
+            BookmakerEvent.link_status.in_(tuple(MANUAL_STATUSES)),
+            BookmakerEvent.last_seen_at >= cutoff,
+        )
+    )
+    if run.processed_event_ids:
+        query = query.where(BookmakerEvent.id.not_in(run.processed_event_ids))
+    for event_row in run.session.scalars(query):
+        if not (event_row.extra or {}).get(REMAP_REQUIRED_KEY):
+            continue
+        try:
+            with run.session.begin_nested():
+                _remap_rows(run.session, event_row, run.mapper, run.resolver_for(event_row.match_id))
+                _clear_remap_flag(event_row)
+                run.report.events_remapped += 1
+        except Exception as exc:
+            run.report.errors.append(f"remap of event {event_row.external_id}: {type(exc).__name__}: {exc}")
+            logger.warning("failed to re-map Betclic event %s", event_row.external_id, exc_info=True)
+
+
+def remap_event(
+    session: Session,
+    event_row: BookmakerEvent,
+    mapper: MarketMapper,
+    *,
+    player_resolver: PlayerResolver | None = None,
+    settings: Settings | None = None,
+) -> int:
+    """Re-map an event's stored markets from their raw names (e.g. after a manual link change).
+
+    No prices are touched and ``extra["remap_required"]`` is cleared. Returns the number of
+    selections whose mapping changed. When ``player_resolver`` is omitted the match lineups are
+    used. Pass ``settings`` so the mapper is bound to the live settlement assumptions
+    (``betclic.totals_include_overtime`` / ``h2h_tie_rule``); without it the mapper's own apply.
+    """
+    if settings is not None:
+        mapper = _bind_settlement(mapper, settings)
+    resolver = player_resolver
+    if resolver is None and event_row.match_id is not None:
+        resolver = lineup_player_resolver(session, event_row.match_id)
+    changed = _remap_rows(session, event_row, mapper, resolver)
+    _clear_remap_flag(event_row)
     session.flush()
     return changed

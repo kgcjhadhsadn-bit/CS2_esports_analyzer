@@ -175,16 +175,26 @@ def test_top_k_truncation_renormalises(
 ) -> None:
     model, uni, _, _ = fitted
     full = model.predict_sequences(1, 2, MatchFormat.BO3, uni.map_pool, top_k=100_000)
-    top = model.predict_sequences(1, 2, MatchFormat.BO3, uni.map_pool, top_k=10)
+    assert _as_dict(model.predict_sequences(1, 2, MatchFormat.BO3, uni.map_pool, top_k=None)) == _as_dict(
+        full
+    )
     default = model.predict_sequences(1, 2, MatchFormat.BO3, uni.map_pool)
-    assert len(full) > 50 == len(default)
-    assert len(top) == 10
-    assert sum(s.probability for s in top) == pytest.approx(1.0)
+    assert len(full) == 210 and 40 <= len(default) <= 50
     assert sum(s.probability for s in default) == pytest.approx(1.0)
-    kept = sum(s.probability for s in full[:10])
-    for a, b in zip(top, full[:10], strict=True):
-        assert a.maps == b.maps and a.pickers == b.pickers
-        assert a.probability == pytest.approx(b.probability / kept)
+    assert [s.probability for s in default] == sorted((s.probability for s in default), reverse=True)
+    # plain truncation: a short list (below the 19 sequences needed to keep a BO3's slot marginals)
+    # or preserve_marginals=False keeps the most likely sequences and rescales them
+    for top in (
+        model.predict_sequences(1, 2, MatchFormat.BO3, uni.map_pool, top_k=10),
+        model.predict_sequences(1, 2, MatchFormat.BO3, uni.map_pool, top_k=30, preserve_marginals=False),
+    ):
+        k = len(top)
+        assert k in (10, 30)
+        assert sum(s.probability for s in top) == pytest.approx(1.0)
+        kept = sum(s.probability for s in full[:k])
+        for a, b in zip(top, full[:k], strict=True):
+            assert a.maps == b.maps and a.pickers == b.pickers
+            assert a.probability == pytest.approx(b.probability / kept)
     with pytest.raises(ValueError):
         model.predict_sequences(1, 2, MatchFormat.BO3, uni.map_pool, top_k=0)
 
@@ -545,7 +555,11 @@ def test_enumeration_matches_brute_force(
     for key, p in want.items():
         assert got[key] == pytest.approx(p, rel=1e-9, abs=1e-15)
     # default pruning changes nothing visible
-    pruned = _as_dict(model.predict_sequences(3, 11, fmt, uni.map_pool, first_veto=first, top_k=20))
+    pruned = _as_dict(
+        model.predict_sequences(
+            3, 11, fmt, uni.map_pool, first_veto=first, top_k=20, preserve_marginals=False
+        )
+    )
     top = sorted(want.items(), key=lambda kv: -kv[1])[:20]
     kept = sum(p for _, p in top)
     for key, p in top:
@@ -726,6 +740,34 @@ def test_known_later_steps_condition_earlier_unknown_ones(
     # the first unknown step cannot remove a map that is known to be picked later
     first = model.next_step(4, 13, MatchFormat.BO3, pool, known_steps=picks)
     assert first.step == 1 and first.action is BAN
+
+
+def test_next_step_excludes_maps_published_for_later_steps(
+    fitted: tuple[VetoModel, SynthUniverse, list[VetoRecord], datetime],
+) -> None:
+    model, uni, _, _ = fitted
+    # steps 1 and 4 are known (a gap at steps 2-3): step 2 cannot remove the map picked at step 4
+    known = [
+        VetoStep(step=1, action=BAN, team=T1, map_name="nuke"),
+        VetoStep(step=4, action=PICK, team=T2, map_name="mirage"),
+    ]
+    forecast = model.next_step(3, 11, MatchFormat.BO3, uni.map_pool, known_steps=known)
+    assert forecast.step == 2 and forecast.action is BAN and forecast.team is T2
+    assert set(forecast.probabilities) == set(uni.map_pool) - {"nuke", "mirage"}
+    assert sum(forecast.probabilities.values()) == pytest.approx(1.0)
+    full = veto_steps(
+        [
+            ("ban", 1, "nuke"),
+            ("ban", 2, "train"),
+            ("pick", 1, "mirage"),
+            ("pick", 2, "dust2"),
+            ("ban", 1, "anubis"),
+            ("ban", 2, "ancient"),
+            ("leftover", None, "inferno"),
+        ]
+    )
+    with pytest.raises(ValueError, match="already complete"):
+        model.next_step(3, 11, MatchFormat.BO3, uni.map_pool, known_steps=full)
 
 
 def test_known_steps_that_deviate_from_the_template() -> None:
@@ -910,3 +952,13 @@ def test_default_pool_comes_from_the_active_duty_list() -> None:
     )
     model = VetoModel().fit([rec])
     assert model.preference(1, "nuke", BAN) > 0 > model.preference(1, "mirage", BAN)
+    # an empty pool at prediction time (a MatchContext that has none yet) means the default pool too
+    seqs = model.predict_sequences(1, 2, MatchFormat.BO1, [])
+    assert {s.maps[0] for s in seqs} == set(POOL7)
+    assert sum(s.probability for s in seqs) == pytest.approx(1.0)
+    custom = VetoModel(VetoConfig(default_map_pool=("mirage", "nuke", "dust2")))
+    assert {s.maps[0] for s in custom.predict_sequences(1, 2, MatchFormat.BO1, [])} == {
+        "mirage",
+        "nuke",
+        "dust2",
+    }

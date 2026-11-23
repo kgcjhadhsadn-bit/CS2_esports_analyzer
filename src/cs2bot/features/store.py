@@ -22,10 +22,10 @@ import bisect
 import logging
 import math
 from collections import defaultdict
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import TYPE_CHECKING, Final
+from typing import TYPE_CHECKING, Final, Literal
 
 import numpy as np
 
@@ -66,9 +66,14 @@ class FeatureConfig:
     demo_window_days: int = 180
     veto_window_days: int = 180
     h2h_window_days: int = 730
+    map_meta_window_days: int = 180  # all-teams statistics of a map (CT-sidedness)
     roster_last_maps: int = 20
     player_last_maps: int = 20
     player_window_days: int = 180
+    #: Use team1's starting side as a feature for picked maps (the side is chosen during the veto).
+    #: Off by default: most pre-match predictions are made before the veto is published, so the
+    #: feature would be present in training and missing at prediction time.
+    use_start_side: bool = False
     strength: StrengthConfig = field(default_factory=StrengthConfig)
     regime: RegimeConfig = field(default_factory=RegimeConfig)
 
@@ -88,7 +93,10 @@ class _Series:
         }
 
     def end(self, ts: float, exclude_match_id: int | None = None) -> int:
-        """Number of leading records usable at ``ts`` (strictly earlier, not of the excluded match)."""
+        """Number of leading records usable at ``ts``: strictly earlier than ``ts``, minus trailing
+        records of the excluded match (records of that match followed by other records are not
+        removed - callers therefore never pass a ``ts`` after the start of the excluded match).
+        """
         i = bisect.bisect_left(self.t, ts)
         if exclude_match_id is not None:
             while i > 0 and self.match_id[i - 1] == exclude_match_id:
@@ -181,7 +189,6 @@ _ROUND_KEYS: Final[tuple[str, ...]] = (
     "rt_n",
 )
 _LOW_BUYS: Final[frozenset[BuyType]] = frozenset({BuyType.ECO, BuyType.FORCE})
-_USE_DEFAULT_TIMELINE: Final[object] = object()
 
 
 @dataclass
@@ -215,7 +222,9 @@ def _same_roster(a: frozenset[int], b: frozenset[int]) -> bool:
     return a <= b or b <= a
 
 
-def _round_aggregates(rounds: Iterable[RoundRecord]) -> dict[tuple[int, int], tuple[list[float], list[float]]]:
+def _round_aggregates(
+    rounds: Iterable[RoundRecord],
+) -> dict[tuple[int, int], tuple[list[float], list[float]]]:
     """(match id, map number) -> per-team counters in :data:`_ROUND_KEYS` order (team1, team2).
 
     Definitions, from the point of view of one team in one round:
@@ -238,17 +247,12 @@ def _round_aggregates(rounds: Iterable[RoundRecord]) -> dict[tuple[int, int], tu
             agg = ([0.0] * len(_ROUND_KEYS), [0.0] * len(_ROUND_KEYS))
             out[key] = agg
         t1_won = r.winner is TeamSlot.TEAM1
-        for idx, (counters, won, own_buy, opp_buy, side) in enumerate(
-            (
-                (agg[0], t1_won, r.team1_buy, r.team2_buy, r.team1_side),
-                (agg[1], not t1_won, r.team2_buy, r.team1_buy, r.team1_side.other),
-            )
+        for counters, won, own_buy, opp_buy, side in (
+            (agg[0], t1_won, r.team1_buy, r.team2_buy, r.team1_side),
+            (agg[1], not t1_won, r.team2_buy, r.team1_buy, r.team1_side.other),
         ):
-            del idx
             w = 1.0 if won else 0.0
-            is_pistol = (
-                own_buy is BuyType.PISTOL if own_buy is not None else r.round_number in (1, 13)
-            )
+            is_pistol = own_buy is BuyType.PISTOL if own_buy is not None else r.round_number in (1, 13)
             if is_pistol:
                 counters[0] += w
                 counters[1] += 1.0
@@ -288,6 +292,7 @@ class FeatureStore:
         self._team_maps: dict[tuple[int, str], _TeamMapIndex] = {}
         self._maps_of_team: dict[int, list[str]] = {}
         self._h2h: dict[tuple[int, int], _H2HIndex] = {}
+        self._maps: dict[str, _Series] = {}
         self._players: dict[int, _Series] = {}
         self._standins: dict[tuple[int, int], int] = {}
         self._veto_team: dict[int, _Series] = {}
@@ -311,7 +316,7 @@ class FeatureStore:
         vetoes: Iterable[VetoRecord] = (),
         team_demo_stats: Iterable[TeamDemoMapRecord] = (),
         config: FeatureConfig | None = None,
-        patch_timeline: PatchTimeline | None | object = _USE_DEFAULT_TIMELINE,
+        patch_timeline: PatchTimeline | Literal["default"] | None = "default",
     ) -> FeatureStore:
         """Index the given records (any order; they are sorted here).
 
@@ -322,14 +327,13 @@ class FeatureStore:
         """
         store = cls()
         store.config = config or FeatureConfig()
-        if patch_timeline is _USE_DEFAULT_TIMELINE:
+        if isinstance(patch_timeline, PatchTimeline):
+            store.patch_timeline = patch_timeline
+        elif patch_timeline == "default":
             try:
                 store.patch_timeline = load_patch_timeline()
             except (OSError, ValueError) as exc:
                 log.warning("patch timeline unavailable, patch features will be NaN: %s", exc)
-                store.patch_timeline = None
-        else:
-            store.patch_timeline = patch_timeline if isinstance(patch_timeline, PatchTimeline) else None
 
         records = sorted(map_results, key=lambda r: (ensure_utc(r.played_at), r.match_id, r.map_number))
         store._records = tuple(records)
@@ -338,13 +342,13 @@ class FeatureStore:
         demo = {(d.match_id, d.map_number, d.team_id): d for d in team_demo_stats}
         store.has_demo_data = bool(demo)
         trace = walk_strength(records, store.config.strength)
-        win_scale = store.config.strength.win_scale
 
         team_rows: dict[int, list[tuple[float, int, list[float], float, frozenset[int]]]] = defaultdict(list)
         team_map_rows: dict[tuple[int, str], list[tuple[float, int, list[float], float]]] = defaultdict(list)
         h2h_rows: dict[tuple[int, int], list[tuple[float, int, str, float, float]]] = defaultdict(list)
         last_match_of_team: dict[int, int] = {}
         regime_rows: dict[int, list[tuple[float, float, int]]] = defaultdict(list)
+        global_map_rows: dict[str, list[tuple[float, int, float, float]]] = defaultdict(list)
 
         for i, rec in enumerate(records):
             t = ensure_utc(rec.played_at)
@@ -359,8 +363,6 @@ class FeatureStore:
             share1 = rec.team1_rounds / total
             exp1 = float(trace.exp_share1[i])
             expw1 = float(trace.exp_win1[i])
-            del win_scale  # (documented in StrengthConfig; exp_win1 already applies it)
-            win_scale = store.config.strength.win_scale
             rounds_pair = round_agg.get((rec.match_id, rec.map_number))
             has_sides = None not in (
                 rec.team1_ct_rounds,
@@ -462,6 +464,10 @@ class FeatureStore:
                     (ts, rec.match_id, [win, float(rf - ra), resid, ct_w, ct_n, t_w, t_n, own_pick], post_off)
                 )
                 regime_rows[team].append((ts, resid, rec.match_id))
+            ct_rounds = float((rec.team1_ct_rounds or 0) + (rec.team2_ct_rounds or 0)) if has_sides else 0.0
+            global_map_rows[map_name].append(
+                (ts, rec.match_id, ct_rounds, float(total) if has_sides else 0.0)
+            )
             lo, hi = sorted((rec.team1_id, rec.team2_id))
             lo_is_team1 = lo == rec.team1_id
             lo_rf, lo_ra = (
@@ -478,14 +484,14 @@ class FeatureStore:
             starts: list[int] = []
             ref: frozenset[int] = frozenset()
             start_idx = 0
-            for k, lineup in enumerate(lineups):
-                if lineup:
+            for k, fielded in enumerate(lineups):
+                if fielded:
                     if not ref:
-                        ref = lineup
-                    elif _same_roster(lineup, ref):
-                        ref = lineup if len(lineup) > len(ref) else ref
+                        ref = fielded
+                    elif _same_roster(fielded, ref):
+                        ref = fielded if len(fielded) > len(ref) else ref
                     else:
-                        ref = lineup
+                        ref = fielded
                         start_idx = k
                 refs.append(ref)
                 starts.append(start_idx)
@@ -509,6 +515,12 @@ class FeatureStore:
                 maps=[r[2] for r in pair_rows],
                 win_lo=[r[3] for r in pair_rows],
                 rd_lo=[r[4] for r in pair_rows],
+            )
+        for map_name, global_rows in global_map_rows.items():
+            store._maps[map_name] = _Series(
+                [r[0] for r in global_rows],
+                [r[1] for r in global_rows],
+                {"ct_w": [r[2] for r in global_rows], "side_n": [r[3] for r in global_rows]},
             )
         store._regimes = RegimeDetector(
             {
@@ -601,6 +613,7 @@ class FeatureStore:
         with_rounds: bool = True,
         with_demo: bool = True,
         config: FeatureConfig | None = None,
+        patch_timeline: PatchTimeline | Literal["default"] | None = "default",
     ) -> FeatureStore:
         """Load everything from the database (``cs2bot.datasets``) and build the store.
 
@@ -609,14 +622,17 @@ class FeatureStore:
         """
         from cs2bot import datasets  # local import: datasets.context imports features.meta lazily
 
-        window = {"since": since, "until": until, "in_scope_only": in_scope_only}
+        def window[R](loader: Callable[..., list[R]]) -> list[R]:
+            return loader(session, since=since, until=until, in_scope_only=in_scope_only)
+
         return cls.build(
-            datasets.load_map_results(session, **window),
-            player_maps=datasets.load_player_map_records(session, **window),
-            rounds=datasets.load_round_records(session, **window) if with_rounds else (),
-            vetoes=datasets.load_veto_records(session, **window),
-            team_demo_stats=datasets.load_team_demo_stats(session, **window) if with_demo else (),
+            window(datasets.load_map_results),
+            player_maps=window(datasets.load_player_map_records),
+            rounds=window(datasets.load_round_records) if with_rounds else (),
+            vetoes=window(datasets.load_veto_records),
+            team_demo_stats=window(datasets.load_team_demo_stats) if with_demo else (),
             config=config,
+            patch_timeline=patch_timeline,
         )
 
     # ---------------------------------------------------------------------------------- lookups
@@ -740,7 +756,9 @@ class FeatureStore:
         out[f"opp_strength_{d}d"] = _rate(s.total("opp_elo", lo, hi), n) if s is not None else NAN
         d = cfg.map_adjusted_window_days
         lo = ms.start(ts - d * _DAY) if ms is not None else 0
-        out[f"map_adj_round_share_{d}d"] = _rate(ms.total("resid", lo, me), me - lo) if ms is not None else NAN
+        out[f"map_adj_round_share_{d}d"] = (
+            _rate(ms.total("resid", lo, me), me - lo) if ms is not None else NAN
+        )
         elo, offset = self._strength(team_id, map_name, ts, exclude_match_id)
         out["elo"] = elo
         out["map_elo_offset"] = offset
@@ -771,8 +789,12 @@ class FeatureStore:
         lo, hi = window(cfg.pick_window_days)
         d = cfg.pick_window_days
         if s is not None:
-            out[f"own_pick_win_rate_{d}d"] = _rate(s.total("pick_own_win", lo, hi), s.total("pick_own", lo, hi))
-            out[f"opp_pick_win_rate_{d}d"] = _rate(s.total("pick_opp_win", lo, hi), s.total("pick_opp", lo, hi))
+            out[f"own_pick_win_rate_{d}d"] = _rate(
+                s.total("pick_own_win", lo, hi), s.total("pick_own", lo, hi)
+            )
+            out[f"opp_pick_win_rate_{d}d"] = _rate(
+                s.total("pick_opp_win", lo, hi), s.total("pick_opp", lo, hi)
+            )
         else:
             out[f"own_pick_win_rate_{d}d"] = out[f"opp_pick_win_rate_{d}d"] = NAN
         out.update(self._pool_features(team_id, map_name, ts, exclude_match_id, s, e))
@@ -780,8 +802,12 @@ class FeatureStore:
         # -- side strength
         lo, hi = window(cfg.side_window_days)
         d = cfg.side_window_days
-        out[f"ct_win_pct_{d}d"] = _rate(s.total("ct_w", lo, hi), s.total("ct_n", lo, hi)) if s is not None else NAN
-        out[f"t_win_pct_{d}d"] = _rate(s.total("t_w", lo, hi), s.total("t_n", lo, hi)) if s is not None else NAN
+        out[f"ct_win_pct_{d}d"] = (
+            _rate(s.total("ct_w", lo, hi), s.total("ct_n", lo, hi)) if s is not None else NAN
+        )
+        out[f"t_win_pct_{d}d"] = (
+            _rate(s.total("t_w", lo, hi), s.total("t_n", lo, hi)) if s is not None else NAN
+        )
         d = cfg.map_side_window_days
         lo = ms.start(ts - d * _DAY) if ms is not None else 0
         out[f"map_ct_win_pct_{d}d"] = (
@@ -802,12 +828,16 @@ class FeatureStore:
             ("post_plant_win_pct", "pp_w", "pp_n"),
             ("retake_win_pct", "rt_w", "rt_n"),
         ):
-            out[f"{name}_{d}d"] = _rate(s.total(won, lo, hi), s.total(played, lo, hi)) if s is not None else NAN
+            out[f"{name}_{d}d"] = (
+                _rate(s.total(won, lo, hi), s.total(played, lo, hi)) if s is not None else NAN
+            )
         lo, hi = window(cfg.demo_window_days)
         d = cfg.demo_window_days
         if s is not None:
             out[f"trade_kill_share_{d}d"] = _rate(s.total("trade_kills", lo, hi), s.total("kills", lo, hi))
-            out[f"traded_death_share_{d}d"] = _rate(s.total("traded_deaths", lo, hi), s.total("deaths", lo, hi))
+            out[f"traded_death_share_{d}d"] = _rate(
+                s.total("traded_deaths", lo, hi), s.total("deaths", lo, hi)
+            )
             util_rounds = s.total("util_rounds", lo, hi)
             out[f"util_dmg_per_round_{d}d"] = _rate(s.total("util_dmg", lo, hi), util_rounds)
             out[f"flashed_per_round_{d}d"] = _rate(s.total("flashed", lo, hi), util_rounds)
@@ -819,7 +849,9 @@ class FeatureStore:
         out.update(self._veto_features(team_id, map_name, ts, exclude_match_id))
 
         # -- players of the expected lineup
-        players = tuple(lineup) or (tuple(sorted(team.ref_lineup[e - 1])) if team is not None and e > 0 else ())
+        players = tuple(lineup) or (
+            tuple(sorted(team.ref_lineup[e - 1])) if team is not None and e > 0 else ()
+        )
         out.update(self._player_features(players, ts, exclude_match_id))
 
         # -- regime break / trend (change-point filter on the residual series)
@@ -1088,6 +1120,26 @@ class FeatureStore:
         out["strength_p_win"] = sigmoid(self.config.strength.win_scale * diff)
         return out
 
+    def map_features(
+        self, map_name: str, as_of: datetime, *, exclude_match_id: int | None = None
+    ) -> dict[str, float]:
+        """All-teams statistics of a map in the ``map_meta_window_days`` before ``as_of``.
+
+        ``map_ct_round_share``: share of rounds won by the CT side on this map (how CT-sided the map
+        currently plays); ``map_global_maps``: how many times it was played (popularity / sample).
+        """
+        d = self.config.map_meta_window_days
+        ts = ensure_utc(as_of).timestamp()
+        ms = self._maps.get(normalize_map_name(map_name))
+        if ms is None:
+            return {f"map_ct_round_share_{d}d": NAN, f"map_global_maps_{d}d": 0.0}
+        hi = ms.end(ts, exclude_match_id)
+        lo = ms.start(ts - d * _DAY)
+        return {
+            f"map_ct_round_share_{d}d": _rate(ms.total("ct_w", lo, hi), ms.total("side_n", lo, hi)),
+            f"map_global_maps_{d}d": float(max(hi - lo, 0)),
+        }
+
     def meta_features(self, as_of: datetime) -> dict[str, float]:
         """Patch calendar features (NaN when no timeline is loaded).
 
@@ -1100,6 +1152,8 @@ class FeatureStore:
         index = tl.patch_index(as_of)
         return {
             "days_since_patch": tl.days_since_last_patch(as_of, min_impact="moderate"),
-            "days_since_pool_change": tl.days_since_last_patch(as_of, min_impact="minor", kinds=("map_pool",)),
+            "days_since_pool_change": tl.days_since_last_patch(
+                as_of, min_impact="minor", kinds=("map_pool",)
+            ),
             "patch_index": float(index) if index >= 0 else NAN,
         }

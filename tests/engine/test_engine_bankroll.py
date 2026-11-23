@@ -7,6 +7,9 @@ from decimal import Decimal
 from typing import Any
 
 import pytest
+from hypothesis import given
+from hypothesis import settings as hyp_settings
+from hypothesis import strategies as st
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
@@ -669,3 +672,144 @@ def test_non_finite_kelly_is_no_edge() -> None:
     )
     stake, reasons = size_stake(broken, base_state(), BANKROLL, BETCLIC)
     assert stake == 0 and reasons[0].startswith("no_edge")
+
+
+# ------------------------------------------------------------------ property: no cap is ever exceeded
+
+
+@hyp_settings(max_examples=400, deadline=None)
+@given(
+    bankroll=st.decimals(min_value=Decimal("1"), max_value=Decimal("300000"), places=2),
+    open_share=st.floats(min_value=0.0, max_value=0.2),
+    match_share=st.floats(min_value=0.0, max_value=1.0),
+    pnl_today=st.decimals(min_value=Decimal("-400"), max_value=Decimal("400"), places=2),
+    pnl_week_extra=st.decimals(min_value=Decimal("-800"), max_value=Decimal("800"), places=2),
+    kelly_full=st.floats(min_value=-0.5, max_value=1.0),
+    p_win=st.floats(min_value=0.05, max_value=0.99),
+    odds=st.decimals(min_value=Decimal("1.01"), max_value=Decimal("15"), places=2),
+    step=st.sampled_from([Decimal("0.01"), Decimal("0.10"), Decimal("0.50"), Decimal("1"), Decimal("5")]),
+    kelly_fraction_=st.sampled_from([0.1, 0.25, 0.5, 1.0]),
+    bets_today=st.integers(min_value=0, max_value=12),
+    halted=st.sampled_from(["no", "no", "no", "kill", "pause"]),
+)
+def test_property_stake_never_exceeds_any_cap(
+    bankroll: Decimal,
+    open_share: float,
+    match_share: float,
+    pnl_today: Decimal,
+    pnl_week_extra: Decimal,
+    kelly_full: float,
+    p_win: float,
+    odds: Decimal,
+    step: Decimal,
+    kelly_fraction_: float,
+    bets_today: int,
+    halted: str,
+) -> None:
+    """Whatever the state: the stake is a multiple of the step, at or above the minimum (or zero with a
+    reason), never above the fractional-Kelly stake, the per-bet cap, the match cap, the free balance
+    or what the daily / weekly loss guards leave - and a halted bot stakes nothing."""
+    open_total = (bankroll * Decimal(repr(open_share))).quantize(Decimal("0.01"))
+    on_match = (open_total * Decimal(repr(match_share))).quantize(Decimal("0.01"))
+    pnl_week = pnl_today + pnl_week_extra
+    state = BankrollState(
+        balance=bankroll - open_total,
+        bankroll_reference=bankroll,
+        day_start_bankroll=bankroll - pnl_today,
+        week_start_bankroll=bankroll - pnl_week,
+        realized_pnl_today=pnl_today,
+        realized_pnl_week=pnl_week,
+        open_stakes_today=on_match,
+        open_stakes_week=on_match,
+        exposure_by_match={1: on_match, 2: open_total - on_match},
+        bets_placed_today=bets_today,
+        kill_switch=halted == "kill",
+        paused=halted == "pause",
+    )
+    cfg = BankrollSettings(kelly_fraction=kelly_fraction_, stake_step=step)
+    decision = make_decision(match_id=1, kelly_full=kelly_full, odds=str(odds), p_win=p_win)
+    stake, messages = size_stake(decision, state, cfg, BETCLIC)
+
+    assert stake >= 0
+    if stake == 0:
+        assert messages, "a zero stake always says why"
+        return
+    assert halted == "no" and kelly_full > 0 and bets_today < cfg.max_bets_per_day
+    assert stake >= BETCLIC.min_stake
+    assert (stake / step) == (stake / step).to_integral_value()  # a multiple of the stake step
+    assert stake <= Decimal(repr(kelly_fraction_)) * Decimal(repr(kelly_full)) * bankroll
+    assert stake <= Decimal(repr(cfg.max_stake_fraction)) * bankroll
+    assert on_match + stake <= Decimal(repr(cfg.max_match_exposure_fraction)) * bankroll
+    assert stake <= state.balance
+    # worst case: every open stake and this one lose, on top of the losses already realized
+    loss_today = max(Decimal(0), -pnl_today)
+    loss_week = max(Decimal(0), -pnl_week)
+    daily_limit = Decimal(repr(cfg.daily_loss_limit_fraction)) * state.day_start_bankroll
+    weekly_limit = Decimal(repr(cfg.weekly_loss_limit_fraction)) * state.week_start_bankroll
+    assert loss_today + open_total + stake <= daily_limit + Decimal("0.005")
+    assert loss_week + open_total + stake <= weekly_limit + Decimal("0.005")
+    # reserving the stake reproduces the caps for the next bet
+    after = reserve_stake(state, 1, stake)
+    assert total_open_stakes(after) == open_total + stake
+    assert after.balance == state.balance - stake and after.bankroll_reference == bankroll
+
+
+def test_crossing_the_winnings_tax_threshold_is_never_worse_than_staying_below_it() -> None:
+    """Random large-bankroll cases, judged with the EXACT payout (stake tax, zloty-rounded 10 % PIT):
+    whenever the sized stake differs from the plain capped Kelly stake because of the 2,280 PLN
+    threshold, its expected log-growth is positive and at least that of the tax-free limit."""
+    import math
+    import random
+
+    from cs2bot.engine.ev import big_win_stake_limit, net_payout
+
+    def growth(p: float, stake: Decimal, odds: Decimal, bankroll: Decimal) -> float:
+        win = float((net_payout(stake, odds, BETCLIC) - stake) / bankroll)
+        return p * math.log1p(win) + (1.0 - p) * math.log1p(-float(stake / bankroll))
+
+    rng = random.Random(5)
+    crossed = held = 0
+    for _ in range(600):
+        bankroll = Decimal(rng.choice([9000, 20000, 60000, 150000, 400000, 1000000]))
+        odds = Decimal(str(round(rng.uniform(1.2, 15.0), 2)))
+        p = rng.uniform(0.3, 0.97)
+        kelly = kelly_fraction(make_outcome(p_win=p), odds, TaxModel.from_settings(BETCLIC))
+        if kelly <= 0:
+            continue
+        cfg = BankrollSettings(
+            kelly_fraction=rng.choice([0.25, 0.5, 1.0]),
+            max_stake_fraction=rng.choice([0.02, 0.05, 0.2]),
+            max_match_exposure_fraction=1.0,
+            daily_loss_limit_fraction=1.0,
+            weekly_loss_limit_fraction=1.0,
+        )
+        st = base_state(
+            balance=bankroll,
+            bankroll_reference=bankroll,
+            day_start_bankroll=bankroll,
+            week_start_bankroll=bankroll,
+        )
+        stake, notes = size_stake(make_decision(odds=str(odds), p_win=p, kelly_full=kelly), st, cfg, BETCLIC)
+        limit = big_win_stake_limit(odds, BETCLIC)
+        assert limit is not None
+        cap = (
+            min(
+                Decimal(repr(cfg.kelly_fraction)) * Decimal(repr(kelly)),
+                Decimal(repr(cfg.max_stake_fraction)),
+            )
+            * bankroll
+        )
+        assert stake <= cap
+        if cap <= limit or stake == 0:
+            assert not any("winnings tax" in n for n in notes)
+            continue
+        assert any("winnings tax" in n for n in notes)
+        at_limit = (limit / cfg.stake_step).to_integral_value(rounding="ROUND_DOWN") * cfg.stake_step
+        assert growth(p, stake, odds, bankroll) > 0
+        assert growth(p, stake, odds, bankroll) >= growth(p, at_limit, odds, bankroll) - 1e-12
+        if stake > limit:
+            crossed += 1
+        else:
+            held += 1
+            assert stake == at_limit
+    assert crossed > 50 and held > 5  # both branches are exercised

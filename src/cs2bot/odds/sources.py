@@ -45,7 +45,7 @@ import re
 import shutil
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
-from datetime import date, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Any, ClassVar, Literal, Protocol, runtime_checkable
 
@@ -62,7 +62,7 @@ from cs2bot.odds.payload_parser import (
     sport_matches,
 )
 from cs2bot.utils.paths import resolve_path
-from cs2bot.utils.time import utcnow
+from cs2bot.utils.time import ensure_utc, utcnow
 
 logger = logging.getLogger(__name__)
 
@@ -88,8 +88,15 @@ class FetchInfo:
     payloads_captured: int = 0
     raw_paths_by_event: dict[str, list[str]] = field(default_factory=dict)
     # when each event's prices were captured (latest payload) - a crawl can take minutes, so the
-    # collector stamps prices with these instead of the time the run started
+    # collector stamps prices with these instead of the time the run started. Sources also set
+    # ``CollectedEvent.captured_at`` (same value), which the collector prefers.
     captured_at_by_event: dict[str, datetime] = field(default_factory=dict)
+    # event id -> {(market raw_name, market external_id) -> capture time of the freshest payload
+    # showing that market}. One event is usually assembled from several payloads captured minutes
+    # apart (its own page, plus "recommended matches" widgets on later pages that only repeat the
+    # match winner); stamping every market with the event's latest payload would make the markets
+    # that were NOT refreshed look fresher than they are.
+    captured_at_by_market: dict[str, dict[tuple[str, str], datetime]] = field(default_factory=dict)
     # events whose market list is known to be incomplete (e.g. seen on the listing only): the
     # collector must not mark their missing markets unavailable
     partial_event_ids: set[str] = field(default_factory=set)
@@ -224,6 +231,22 @@ class CapturedParse:
     records: list[ParsedEvent]
     paths: dict[str, list[str]]  # event id -> archived payload files it was found in
     captured_at: dict[str, datetime]  # event id -> capture time of its latest payload
+    # event id -> {(market raw_name, external_id) -> capture time of the market's freshest payload}
+    market_times: dict[str, dict[tuple[str, str], datetime]] = field(default_factory=dict)
+
+    def collected(self, records: Iterable[ParsedEvent] | None = None) -> list[CollectedEvent]:
+        """``records`` (default: all) as :class:`CollectedEvent` with ``captured_at`` filled in."""
+        chosen = self.records if records is None else records
+        return [r.to_collected(captured_at=self.captured_at.get(r.external_id)) for r in chosen]
+
+    def fill_info(self, info: FetchInfo, records: Iterable[ParsedEvent]) -> None:
+        """Copy archive paths and capture times of ``records`` into a :class:`FetchInfo`."""
+        ids = [r.external_id for r in records]
+        info.raw_paths_by_event = {eid: self.paths.get(eid, []) for eid in ids}
+        info.captured_at_by_event = {eid: self.captured_at[eid] for eid in ids if eid in self.captured_at}
+        info.captured_at_by_market = {
+            eid: self.market_times[eid] for eid in ids if self.market_times.get(eid)
+        }
 
 
 def parse_captured_full(
@@ -242,6 +265,8 @@ def parse_captured_full(
             continue
         found = extract_event_records(docs, source_url=payload.page_url or payload.url, keys=keys)
         for rec in found:
+            for parsed_market in rec.markets.values():
+                parsed_market.captured_at = payload.captured_at
             if payload.path is not None:
                 paths.setdefault(rec.external_id, [])
                 if str(payload.path) not in paths[rec.external_id]:
@@ -249,7 +274,13 @@ def parse_captured_full(
             if rec.markets and (rec.external_id not in times or payload.captured_at > times[rec.external_id]):
                 times[rec.external_id] = payload.captured_at
         records.extend(found)
-    return CapturedParse(records=merge_parsed_events(records), paths=paths, captured_at=times)
+    merged = merge_parsed_events(records)
+    return CapturedParse(
+        records=merged,
+        paths=paths,
+        captured_at=times,
+        market_times={r.external_id: r.market_times() for r in merged},
+    )
 
 
 def parse_captured(
@@ -325,6 +356,12 @@ class RawPayloadReplaySource:
     ``paths`` may contain files or directories (searched recursively). Events are filtered with
     the CS2 pattern unless ``cs2_pattern`` is ``None``. Replayed events are treated as partial
     (a replay must never mark live markets unavailable).
+
+    Prices keep the time they were ORIGINALLY captured (``captured_at`` from the archive's
+    ``index.jsonl``, else the file's modification time) - never "now": replaying yesterday's
+    archive into the live database must not make stale prices look fresh to
+    :func:`cs2bot.odds.quotes.latest_quotes`. The collector additionally ignores observations
+    older than what it already stored for a selection.
     """
 
     _KIND_BY_EXT: ClassVar[dict[str, PayloadKind]] = {
@@ -361,32 +398,62 @@ class RawPayloadReplaySource:
             f for f in files if f.suffix.lower() in self._KIND_BY_EXT and not f.name.endswith(".request.bin")
         ]
 
+    @staticmethod
+    def _index_times(directory: Path, cache: dict[Path, dict[str, tuple[datetime, str | None]]]) -> dict[
+        str, tuple[datetime, str | None]
+    ]:
+        """``file name -> (captured_at, page url)`` from the directory's ``index.jsonl`` (if any)."""
+        if directory not in cache:
+            entries: dict[str, tuple[datetime, str | None]] = {}
+            try:
+                lines = (directory / "index.jsonl").read_text(encoding="utf-8").splitlines()
+            except OSError:
+                lines = []
+            for line in lines:
+                try:
+                    meta = json.loads(line)
+                    stamp = ensure_utc(datetime.fromisoformat(str(meta["captured_at"])))
+                    page_url = meta.get("page_url") or meta.get("url")
+                    entries[str(meta["file"])] = (stamp, page_url if isinstance(page_url, str) else None)
+                except (ValueError, KeyError, TypeError):
+                    continue  # one damaged index line must not hide the others
+            cache[directory] = entries
+        return cache[directory]
+
     def fetch_cs2_events(self) -> list[CollectedEvent]:
         info = FetchInfo(started_at=utcnow())
         payloads: list[CapturedPayload] = []
+        index_cache: dict[Path, dict[str, tuple[datetime, str | None]]] = {}
         for file in self._files():
             try:
+                indexed = self._index_times(file.parent, index_cache).get(file.name)
+                if indexed is not None:
+                    captured_at, page_url = indexed
+                else:
+                    captured_at = datetime.fromtimestamp(file.stat().st_mtime, tz=UTC)
+                    page_url = None
                 payloads.append(
                     CapturedPayload(
                         kind=self._KIND_BY_EXT[file.suffix.lower()],
                         data=file.read_bytes(),
-                        captured_at=utcnow(),
-                        url=file.name,
+                        captured_at=captured_at,
+                        url=page_url or file.name,
                         path=file,
                     )
                 )
             except OSError as exc:
                 info.errors.append(f"{file}: {exc}")
+        payloads.sort(key=lambda payload: payload.captured_at)  # later prices must win the merge
         parsed = parse_captured_full(payloads, keys=self.keys, schema=self.schema)
-        records, paths = parsed.records, parsed.paths
+        records = parsed.records
         if self.cs2_pattern:
             records = select_cs2(records, pattern=self.cs2_pattern, keep_unknown=self.keep_unknown_sport)
         info.payloads_captured = len(payloads)
-        info.raw_paths_by_event = {r.external_id: paths.get(r.external_id, []) for r in records}
+        parsed.fill_info(info, records)
         info.partial_event_ids = {r.external_id for r in records}
         info.finished_at = utcnow()
         self._info = info
-        return [r.to_collected() for r in records]
+        return parsed.collected(records)
 
     def last_fetch_info(self) -> FetchInfo:
         return self._info

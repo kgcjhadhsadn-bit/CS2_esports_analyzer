@@ -82,6 +82,37 @@ def test_veto_distribution_and_map_estimates_feed_the_match_engine(
     assert prediction.low.p_team1_win <= prediction.central.p_team1_win <= prediction.high.p_team1_win
 
 
+@pytest.mark.parametrize("fmt", [MatchFormat.BO3, MatchFormat.BO5])
+def test_default_truncation_gives_the_engine_the_exact_map_distribution(
+    trained: tuple[SynthUniverse, MapRatingModel, VetoModel], fmt: MatchFormat
+) -> None:
+    """The default 50-sequence list prices map markets from the same slot distributions as the full one."""
+    uni, ratings, veto = trained
+    as_of = max(r.played_at for r in uni.map_results()) + timedelta(days=1)
+    kwargs = {"first_veto": None, "as_of": as_of, "map_advantage": ratings.map_advantage}
+    exact = veto.predict_sequences(3, 12, fmt, uni.map_pool, top_k=None, **kwargs)
+    sequences = veto.predict_sequences(3, 12, fmt, uni.map_pool, **kwargs)
+    assert len(exact) > 400 and len(sequences) <= 50
+    want = map_slot_distribution(exact)
+    prediction = build_match_prediction(
+        match_id=2,
+        fmt=fmt,
+        team1_id=3,
+        team2_id=12,
+        veto_distribution=sequences,
+        map_estimates=ratings.predict_for_sequences(3, 12, sequences, as_of),
+        round_model=RoundModel.default(),
+        n_sims=300,
+        seed=5,
+        model_version="ratings_veto-test",
+        created_at=as_of,
+        simulator=MapSimulator(),
+    )
+    for slot in prediction.central.slots:
+        if slot.map_number <= fmt.min_maps:
+            assert slot.map_distribution == pytest.approx(want[slot.map_number], abs=1e-9)
+
+
 def test_known_veto_gives_the_engine_a_single_sequence(
     trained: tuple[SynthUniverse, MapRatingModel, VetoModel],
 ) -> None:

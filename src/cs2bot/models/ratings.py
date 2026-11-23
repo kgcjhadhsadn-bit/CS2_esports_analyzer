@@ -79,6 +79,8 @@ processed game. Fit up to a cut-off with :meth:`~MapRatingModel.fit_until`, keep
 :meth:`~MapRatingModel.copy`, or fit once with ``record_history=True`` and use
 :meth:`~MapRatingModel.snapshot_before` / :meth:`~MapRatingModel.historical_map_advantage` for
 leakage-free historical queries (veto-model training, walk-forward backtests).
+:class:`WalkForwardRatings` packages the latter as a provider with the ``predict`` signature that
+accepts any ``as_of`` (training rows of the ensemble).
 
 Default parameters were chosen by walk-forward log-loss on synthetic universes with known ground
 truth (several seeds, with and without strength drift); re-tune on real data with :func:`tune`.
@@ -121,6 +123,7 @@ __all__ = [
     "RatingSnapshot",
     "ReliabilityBin",
     "WalkForwardPrediction",
+    "WalkForwardRatings",
     "WalkForwardResult",
     "chronological_split",
     "evaluate_walk_forward",
@@ -283,7 +286,9 @@ class OffsetState:
 class VolatilityPeriod:
     """Glicko-2 evidence accumulated over the team's current (open) rating period.
 
-    ``phi2`` is the pre-period rating variance, ``inv_v`` = ``sum_j w_j g_j^2 E_j (1 - E_j)`` and
+    ``phi2`` is the pre-period rating variance (overall deviation before the time inflation, plus
+    the variance of the map / LAN offsets of the period's first game), ``inv_v`` =
+    ``sum_j w_j g_j^2 E_j (1 - E_j)`` and
     ``score`` = ``sum_j w_j g_j (s_j - E_j)`` over the period's games, so that ``v = 1 / inv_v`` and
     ``Delta = score / inv_v`` exactly as in Steps 3-4 of the paper.
     """
@@ -647,7 +652,10 @@ class MapRatingModel:
         )
         acc = team.vol
         if acc is None:
-            acc = VolatilityPeriod(start=t, phi2=total, inv_v=info, score=score, n=1)
+            # Pre-period variance as in the paper: the deviation *before* the volatility inflation
+            # (the likelihood of Step 5 adds the new sigma'^2 itself), plus the offsets in play.
+            pre_phi2 = min(ov.phi * ov.phi, cfg.initial_phi * cfg.initial_phi) + offset_var
+            acc = VolatilityPeriod(start=t, phi2=pre_phi2, inv_v=info, score=score, n=1)
         else:
             acc = replace(acc, inv_v=acc.inv_v + info, score=acc.score + score, n=acc.n + 1)
         maps = team.maps
@@ -994,6 +1002,15 @@ class MapRatingModel:
             picked_by,
         )
 
+    def historical_rating(self, team_id: int, map_name: str | None, as_of: datetime) -> RatingSnapshot:
+        """Leakage-free :meth:`rating` for any ``as_of`` (requires ``record_history=True``)."""
+        t = ensure_utc(as_of)
+        return self._snapshot(self._teams_before(t, (team_id,)), team_id, map_name, t)
+
+    def walk_forward(self) -> WalkForwardRatings:
+        """A provider that answers for *any* ``as_of`` without look-ahead (needs recorded history)."""
+        return WalkForwardRatings(self)
+
     # ------------------------------------------------------------------------------ persistence
 
     def to_dict(self) -> dict[str, Any]:
@@ -1094,6 +1111,78 @@ class MapRatingModel:
     ) -> tuple[RatingConfig, dict[str, Any]]:
         """Alias of :func:`cs2bot.models.ratings.tune`."""
         return tune(records, grid, holdout_fraction=holdout_fraction, base_config=base_config)
+
+
+class WalkForwardRatings:
+    """Leakage-free rating provider for historical timestamps (training rows, backtests).
+
+    :meth:`MapRatingModel.predict` refuses an ``as_of`` that is not after its last processed game.
+    This adapter wraps a model fitted with ``record_history=True`` and answers for **any**
+    ``as_of`` using only the games played strictly before it, so one fit serves every historical
+    row. It has the same ``predict`` signature as the model and therefore satisfies the
+    ``RatingProvider`` protocol of :mod:`cs2bot.features`::
+
+        provider = WalkForwardRatings.fit(map_results)         # one pass over the history
+        est = provider.predict(t1, t2, "mirage", row_as_of)    # no look-ahead, O(log n)
+        veto = VetoModel().fit(veto_records, map_advantage=provider.map_advantage)
+
+    For an ``as_of`` after the last processed game the answers equal the wrapped model's.
+    The history lives in memory only (it is not part of ``save``/``load``).
+    """
+
+    def __init__(self, model: MapRatingModel) -> None:
+        if not model.records_history:
+            raise ValueError(
+                "WalkForwardRatings needs a model fitted with record_history=True "
+                "(use WalkForwardRatings.fit(records) or MapRatingModel().fit(records, record_history=True))"
+            )
+        self._model = model
+
+    @classmethod
+    def fit(
+        cls, records: Iterable[MapResultRecord], config: RatingConfig | None = None
+    ) -> WalkForwardRatings:
+        """Fit a history-recording :class:`MapRatingModel` on ``records`` and wrap it."""
+        return cls(MapRatingModel(config).fit(records, record_history=True))
+
+    @property
+    def model(self) -> MapRatingModel:
+        """The wrapped model (its own ``predict`` only accepts times after the last game)."""
+        return self._model
+
+    def predict(
+        self,
+        team1_id: int,
+        team2_id: int,
+        map_name: str,
+        as_of: datetime,
+        *,
+        is_lan: bool = False,
+        team1_lineup: Sequence[int] = (),
+        team2_lineup: Sequence[int] = (),
+        picked_by: TeamSlot | None = None,
+    ) -> MapWinEstimate:
+        """P(team1 wins the map) from the games strictly before ``as_of`` (any ``as_of``)."""
+        return self._model.historical_predict(
+            team1_id,
+            team2_id,
+            map_name,
+            as_of,
+            is_lan=is_lan,
+            team1_lineup=team1_lineup,
+            team2_lineup=team2_lineup,
+            picked_by=picked_by,
+        )
+
+    def map_advantage(
+        self, team_id: int, opponent_id: int, map_name: str, as_of: datetime, *, is_lan: bool = False
+    ) -> float:
+        """Logit advantage of ``team_id`` over ``opponent_id`` on the map, as of any ``as_of``."""
+        return self._model.historical_map_advantage(team_id, opponent_id, map_name, as_of, is_lan=is_lan)
+
+    def rating(self, team_id: int, map_name: str | None, as_of: datetime) -> RatingSnapshot:
+        """Overall (``map_name=None``) or map rating from the games strictly before ``as_of``."""
+        return self._model.historical_rating(team_id, map_name, as_of)
 
 
 # ------------------------------------------------------------------------- walk-forward evaluation
