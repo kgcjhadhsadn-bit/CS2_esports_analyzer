@@ -23,3 +23,11 @@ Test counts are the package's own suite as reported in `docs/dev/reports/<packag
 | integration (services, jobs, `cs2bot up`, CLI, end-to-end test) | done | 58 | round 1 | whole suite 2973 passed |
 | final cross-cutting review (Lens A: money / safety path) | done | 15 | - | 6 bugs fixed (1 critical: confirmed link + Betclic team-order flip); migration 0002; see reports/final_review.md |
 | final cross-cutting review (Lens B: data / model correctness, docs) | done | 12 | - | 6 issues fixed (high: ensemble predictions depended on which team is team1; stale context flags after a participant change; backtest != live economy / model config / post-match start sides; doctor shows uncalibrated bundles); docs aligned; see reports/final_review.md |
+
+## Verification on the build machine (2026-11-24)
+
+- Whole suite: all tests pass (SQLite), plus the `postgres`-marked tests against PostgreSQL 16.
+- Alembic: `downgrade base` -> `upgrade head` (0002) -> `alembic check` clean on PostgreSQL 16.
+- `cs2bot db seed-synthetic` + `cs2bot models train` on PostgreSQL: bundle trained incl. ensemble.
+- ruff, ruff format, mypy (190 files): clean. Dashboard: `npm run build` OK.
+- Not verifiable here: live Betclic.pl, HLTV, PandaScore, the Anthropic API, and the PowerShell scripts on Windows.
