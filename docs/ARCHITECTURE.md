@@ -47,8 +47,9 @@ Non-negotiable conventions:
 
 ### P1 · `cs2bot.ingest.pandascore` + `cs2bot.ingest.scope`
 * `PandaScoreClient(settings: PandaScoreSettings)`: paginated, rate-limited REST client. `upcoming_matches()`, `running_matches()`, `past_matches(since: datetime)`, `match(id)`, `team(id)`, `tournament(id)`, all returning typed pydantic models of the API payload.
-* `sync_upcoming(session, client, settings) -> SyncReport`, `sync_past(session, client, settings, since) -> SyncReport`: upsert tournaments/teams/players/matches/lineups/maps via `db.repo`, set `Match.in_scope` with `scope.is_in_scope(...)`.
-* `scope.is_in_scope(tier: Tier, team1_rank: int | None, team2_rank: int | None, settings: ScopeSettings) -> bool`.
+* `team(id)` / `tournament(id)` use the generic `/teams/{id}` / `/tournaments/{id}` endpoints.
+* `sync_upcoming(session, client, settings, *, options=None, now=None) -> SyncReport`, `sync_past(session, client, settings, since, until=None, *, options=None, now=None) -> SyncReport`, `sync_match(session, client, settings, pandascore_match_id)`, `sync_modified(...)`; knobs in `PandaScoreSyncOptions` (`commit_every` for the backfill). Upsert tournaments/teams/players/matches/lineups/maps via `db.repo`, set `Match.in_scope` with `scope.is_in_scope(...)`.
+* `scope.is_in_scope(tier: Tier, team1_rank: int | None, team2_rank: int | None, settings: ScopeSettings) -> bool`, `scope.refresh_match_scope(session, match, settings)`, `scope.refresh_upcoming_scope(session, settings) -> int` (run after a ranking sync).
 
 ### P2 · `cs2bot.ingest.hltv`
 * `HLTVFetcher(settings: HLTVSettings)`: `get(path) -> str` HTML via Playwright (default) or httpx, disk cache with TTL, polite jittered rate limit, optional proxy. Raises `HLTVBlockedError` on challenge pages instead of retrying aggressively. No challenge-solving or fingerprint-spoofing tooling.
@@ -56,13 +57,13 @@ Non-negotiable conventions:
 * Sync into DB: `sync_results(session, fetcher, since) `, `sync_upcoming(...)`, `sync_match(session, fetcher, hltv_match_id)`, `sync_mapstats(...)`, `sync_rankings(...)`, `sync_news(...)`. Uses `db.repo.resolve_team/resolve_player/resolve_tournament`.
 
 ### P3 · `cs2bot.ingest.demos`
-* `download_demo(fetcher_or_client, url, dest_dir) -> Path`, `extract_archive(path, dest) -> list[Path]` (.rar/.zip/.dem/.zst).
+* `download_demo(url, dest_dir, *, downloader=None, timeout_s=...) -> Path` (`BrowserDownloader.from_settings(settings)` reuses the HLTV browser profile), `extract_archive(path, dest) -> list[Path]` (.rar/.zip/.dem/.zst), `find_rar_tools()`.
 * `parse_demo(dem_path, settings: DemoSettings) -> ParsedDemo` using `demoparser2` (rounds, kills, player-round stats, utility, economy/buy types, position samples, trade detection).
-* `persist_parsed_demo(session, map_played_id, parsed, steamid_to_player_id)`; `process_pending_demos(session_factory, ..., limit)`.
-* `aggregates.rebuild_position_aggregates(session, window_days)`, `aggregates.rebuild_duel_aggregates(session, window_days)`.
+* `persist_parsed_demo(session, map_played_id, parsed, steamid_to_player_id)`; `process_pending_demos(session_factory, settings, *, downloader=None, limit=5) -> ProcessReport`.
+* `rebuild_position_aggregates(session, *, window_days=120, as_of=None)`, `rebuild_duel_aggregates(session, *, window_days=120, as_of=None)` (keyword arguments).
 
 ### P4 · `cs2bot.odds`
-* `OddsSource` protocol: `fetch_cs2_events() -> list[CollectedEvent]`. `BetclicSource(settings)`: browser-based (loads the Betclic CS2 pages, captures the site's own JSON responses) with a tolerant parser; raw payloads saved for parser fitting.
+* `OddsSource` protocol: `fetch_cs2_events() -> list[CollectedEvent]`. `BetclicBrowserSource(settings)` (alias `BetclicSource`): browser-based (loads the Betclic CS2 pages, captures the site's own JSON responses) with a tolerant parser; raw payloads saved for parser fitting. `BetclicApiSource(settings)` is used instead when `betclic.offering_api_base` is set. `collect_once(session, source, mapper, *, settings, now=None)`, `remap_event(session, event, mapper, *, settings)` (the API's `event_remapper`), `list_unmapped(session)`; the mapping functions take the keyword-only arguments documented in docs/dev/reports/odds.md.
 * `market_mapping.MarketMapper.from_yaml(path)` + `map(market_raw, selection_raw, event: CollectedEvent, swapped: bool) -> MappedSelection | None` (Polish market names, rules in `config/betclic_markets.yaml`).
 * `event_matching.link_event(session, event_row) -> LinkResult` (teams + start time + competition, decides `teams_swapped`, confidence, `LinkStatus`).
 * `collector.collect_once(session, source, mapper) -> CollectReport` (upsert events/markets/selections; write `odds_snapshots` only on change).
@@ -70,7 +71,8 @@ Non-negotiable conventions:
 
 ### P5 · `cs2bot.models.ratings`, `cs2bot.models.veto`
 * `MapRatingModel(config)`: Glicko-2 style per team **and per map** with hierarchical shrinkage to the team's overall rating, time decay, roster-continuity decay, LAN effect. `fit(records: Iterable[MapResultRecord])`, `update(record)`, `predict(team1_id, team2_id, map_name, as_of, *, is_lan=False) -> MapWinEstimate`, `rating(team_id, map_name | None, as_of)`, `save/load`.
-* `VetoModel`: per-team ban/pick propensities with recency weighting. `fit(records: Iterable[VetoRecord])`, `predict_sequences(team1_id, team2_id, fmt, map_pool, *, first_veto=TeamSlot.TEAM1, known_steps=(), top_k=50) -> list[MapSequenceProbability]` (deterministic once the veto is known).
+* `VetoModel`: per-team ban/pick propensities with recency weighting. `fit(records: Iterable[VetoRecord], *, map_advantage=None)`, `predict_sequences(team1_id, team2_id, fmt, map_pool, *, first_veto=TeamSlot.TEAM1, known_steps=(), top_k: int | None = 50, as_of=None, map_advantage=None, template=None, preserve_marginals=True) -> list[MapSequenceProbability]` (deterministic once the veto is known).
+* `MapRatingModel.fit(records, record_history=True)` + `WalkForwardRatings` are the leakage-free providers for historical rows; `ratings.tune(records, grid, *, holdout_fraction=0.25)` backs `cs2bot models tune`.
 
 ### P6 · `cs2bot.models.round_model`, `map_sim`, `player_props`, `match_engine`
 * `EconomyParams` (CS2 constants: MR12, MR3 OT, loss bonus, rewards, OT money; all configurable).
@@ -80,37 +82,49 @@ Non-negotiable conventions:
 * `build_match_prediction(...) -> MatchPrediction` combining veto distribution × per-map estimates × simulations, with `low/high` ±1σ scenarios.
 
 ### P7 · `cs2bot.datasets`, `cs2bot.features`, `cs2bot.models.ensemble`, `cs2bot.models.calibration`, `cs2bot.backtest`
-* `datasets`: DB -> `MapResultRecord` / `VetoRecord` / `RoundRecord` / `PlayerMapRecord` (time-filtered, in-scope only).
-* `features`: leakage-safe features per (match, map) as of a timestamp; player roles from demo data; meta (active pool detection, patch timeline, change-point detection on form).
-* `MapWinEnsemble`: LightGBM + rating model stacking, `fit(...)`, `predict(...) -> MapWinEstimate` with sigma.
+* `datasets`: DB -> `MapResultRecord` / `VetoRecord` / `RoundRecord` / `PlayerMapRecord` (time-filtered, in-scope only); `load_match_context(session, match_id, *, settings, now, include_context_flags=True) -> MatchContext`, `data_completeness(session, ctx, *, now) -> float`, `load_match_actuals(session, match_id) -> MatchActuals | None`.
+* `features`: leakage-safe features per (match, map) as of a timestamp (`FeatureStore.build/from_session`, `build_training_rows`, `features_for_match_map`, `RatingProvider`); player roles from demo data (`infer_roles`, `update_player_roles(session)`); meta (active pool detection, patch timeline, change-point detection on form).
+* `MapWinEnsemble`: LightGBM + rating model stacking, `fit(map_results, *, store, rating_provider, as_of=None) -> FitReport`, `predict(...)` / `predict_for_sequences(ctx, sequences, *, as_of, store, rating_provider) -> dict[str, MapWinEstimate]` with sigma.
 * `calibration`: isotonic / Platt on time-ordered holdout; reliability metrics.
-* `backtest`: walk-forward runner over historical odds; Brier, log-loss, ECE, ROI, CLV, drawdown, per-market breakdown.
+* `backtest`: walk-forward runner over historical odds (`run_backtest`, `run_db_backtest(session, *, settings, since, until, ...)`, `run_synthetic_backtest`, `PipelineTrainer`, `OddsHistory`, `LeakageError`); Brier, log-loss, ECE, ROI, CLV, drawdown, per-market breakdown.
 
 ### P8 · `cs2bot.engine`, `cs2bot.llm`
 * `engine.pricing.price_outcome(spec, selection, prediction: MatchPrediction, *, sigma_floor) -> OutcomeProbability` for every `MarketType` (void/push aware).
 * `engine.ev`: `effective_odds`, `expected_value`, `kelly_fraction` (Polish 12% stake tax, 10% tax on wins above 2280 PLN, refunds).
-* `engine.decision.evaluate(...) -> BetDecision` (all PLAN.md section 6 checks, every rejection reason recorded).
-* `engine.bankroll`: `compute_state(session, settings, now) -> BankrollState`, `size_stake(...)` (1/4 Kelly, caps, exposure, loss limits, bets/day); `engine.ledger`: stake/payout/refund/reconciliation entries and balance.
-* `llm.context.ContextAnalyzer`: Claude Haiku news triage, Claude Opus match context flags (structured output) and bet rationale; `combine_flags(flags, settings) -> (logit_shift, veto)` with hard bounds.
+* `engine.decision.evaluate(...) -> BetDecision` (all PLAN.md section 6 checks, every rejection reason recorded), `decision.min_acceptable_odds(...)` (value for `BetOrder.min_acceptable_odds`), `decision.load_match_decision_info(...)`.
+* `engine.bankroll`: `compute_state(session, settings, now) -> BankrollState`, `size_stake(...)` / `size_decision(...)` (1/4 Kelly, caps, exposure, loss limits, bets/day), `check_loss_limits(...)` (pauses); `engine.ledger`: stake/payout/refund/reconciliation entries and balance, `apply_placement(session, bet, result, settings)` (maps a `PlacementResult` onto the bet + ledger), `settle_bet(...)`, `reconcile(...)` (a mismatch beyond the tolerance pauses trading; a shortfall explained by unconfirmed placements is deferred), `pause_trading(...)`.
+* `engine.settlement`: `resolve_outcome(spec, selection, actuals, ...) -> SettlementOutcome`, `resolve_bet(bet, actuals, ...) -> Resolution` (UNKNOWN, never a guess).
+* `llm.context.ContextAnalyzer`: Claude Haiku news triage, Claude Opus match context flags (structured output) and bet rationale; `combine_flags(flags, settings.llm, *, now) -> (logit_shift, veto)` with hard bounds; `refresh_match_context(session, analyzer, ctx, *, now)` and `triage_pending_news(session, analyzer)` are what the services call.
 
 ### P9 · `cs2bot.executor`
-* `BetExecutor` protocol: `place(order: BetOrder) -> PlacementResult`, `get_balance()`, `health_check()`.
+* `BetExecutor` protocol: `place(order: BetOrder) -> PlacementResult`, `get_balance()`, `health_check()`, `close()`; `AccountExecutor` adds `is_logged_in()`, `open_login_window(timeout_s)`, `fetch_bet_history(since)`. `create_betclic_executor(settings, session_factory) -> ThreadBoundExecutor` (all calls on one worker thread, browser started lazily, halt check reads the DB). A bet is real only when BOTH `order.dry_run` and `settings.executor.dry_run` are false. The executor keeps a placement journal (`cs2bot-placements.jsonl` in the browser-profile directory) and never clicks a key twice. `BetOrder.event_starts_at` makes it refuse orders whose match has started.
 * `BetclicExecutor`: Playwright, **visible** browser with a dedicated persistent profile on the owner's PC (the owner logs in by hand once, incl. 2FA; when the session expires the bot pauses and the dashboard asks for a new login), selectors from `config/betclic_selectors.yaml`, odds re-check, stake entry, confirmation, bet-id + screenshot capture, `DRY_RUN`. `open_login_window()` for the manual login. `FakeExecutor` for tests.
 
 ### P10 · `cs2bot.api` and `dashboard/`
-* `create_app(settings, session_factory) -> FastAPI`: binds to `127.0.0.1` (local only); optional session-cookie auth (required only if bound to a non-loopback address); serves the built dashboard from `dashboard/dist`; endpoints for matches, analyses, markets/predictions vs odds, decisions, bets, bankroll, calibration, health/jobs, kill switch, pause/resume, config overrides, link review queue.
+* `create_app(settings=None, session_factory=None, *, login_launcher=None, executor_health_provider=None, event_remapper=None, scheduler_status_provider=None, options=None) -> FastAPI`, `make_server(...)` (uvicorn, runs in a thread), `run(...)`. Binds to `127.0.0.1` (local only); a link review that changes match/orientation clears the event's mappings and sets `extra.remap_required` (the collector or the injected `event_remapper` re-maps). Executor health comes from the provider, else `system_state["executor_health"]` (written by `services.health`). optional session-cookie auth (required only if bound to a non-loopback address); serves the built dashboard from `dashboard/dist`; endpoints for matches, analyses, markets/predictions vs odds, decisions, bets, bankroll, calibration, health/jobs, kill switch, pause/resume, config overrides, link review queue.
 * `dashboard/`: React + Vite + TypeScript + Recharts SPA consuming the API.
 
-### P11 · local install on the owner's Windows PC (`deploy/`, `docker-compose.yml`, `.github/workflows/`, `docs/WINDOWS_SETUP.md`)
+### P11 · local install on the owner's Windows PC (`deploy/windows/*.ps1` + `.cmd`, `scripts/dev.sh`, `scripts/test.sh`, `docker-compose.yml`, `.github/workflows/`, `docs/WINDOWS_SETUP.md`, `docs/OPERATIONS.md`, `CLAUDE.md`)
 Docker Desktop runs **only PostgreSQL**; the Python app runs natively via `uv` (so Playwright can show a real
 browser for the Betclic login). PowerShell helpers to install, start (`cs2bot up`), back up the database and
 register a Task Scheduler entry at login; power settings guidance (PC must be awake before matches); CI
 (ruff, mypy, pytest on Linux + Windows runners).
 
+Contract with the scripts: `cs2bot up` runs in the foreground, logs to stdout/stderr, stops cleanly on Ctrl+C
+within 90 s (exit 0 = normal stop, non-zero = crash/could not start); `cs2bot executor login` exits 0 only after
+a completed login; `cs2bot doctor` exits non-zero on problems; `cs2bot db upgrade` is idempotent.
+
 ### P12 · `cs2bot.services`, `cs2bot.flows`, `cs2bot.cli` (integration, built last)
 Wires everything: sync → train → predict → price → decide → stake → execute → settle, plus CLI commands.
-`flows.scheduler`: built-in job scheduler (interval + daily jobs, catch-up of runs missed while the PC was off,
-based on `job_runs`). `cs2bot up`: starts the API/dashboard on `127.0.0.1` and the scheduler in one command.
+* `services.registry`: `train_models(session, settings, *, as_of=None) -> TrainReport` (never sees data after `as_of`; artifacts in `settings.models.artifacts_dir/<version>/`, a `model_runs` row), `load_latest(settings) -> ModelBundle | None`, `ModelRegistry` (thread-safe swap after the nightly retrain).
+* `services.prediction`: `predict_match(session, match_id, bundle, settings, *, analyzer=None, now=None)`, `predict_upcoming(session_factory, settings, bundle, *, analyzer=None, now=None, force=False) -> PredictReport` (re-simulates only when veto, lineups, flags, completeness or model version changed).
+* `services.betting`: `run_betting_cycle(session_factory, settings, executor, bundle, *, now=None, dry_run=None) -> BettingReport` (bet row committed PENDING → halt re-read → PLACING committed → `executor.place`; crash-safe, idempotent).
+* `services.settlement`: `settle_bets(session_factory, settings, executor=None, *, now=None) -> SettlementReport` (bet history first, then results; closing odds/CLV; balance reconciliation).
+* `services.ingestion` (job functions per source), `services.health` (executor health cache + `system_state`), `services.dbops` (Alembic in code), `services.doctor`.
+* `flows.scheduler`: built-in job scheduler (interval + daily jobs, catch-up of runs missed while the PC was off,
+  based on `job_runs`). `flows.jobs.build_jobs(Runtime) -> list[Job]` (lanes `fast`, `sync`, `hltv`, `train`).
+  `flows.supervisor.run_up(settings) -> int` = `cs2bot up`: starts the API/dashboard on `127.0.0.1`, the executor
+  and the scheduler in one command.
 
 ## CLI (implemented by P12; names are fixed so docs and scripts can reference them)
 
@@ -118,18 +132,18 @@ based on `job_runs`). `cs2bot up`: starts the API/dashboard on `127.0.0.1` and t
 |---|---|
 | `cs2bot up` | Start the API + dashboard on 127.0.0.1 and the built-in scheduler (one command) |
 | `cs2bot doctor` | Check environment: DB reachable, migrations applied, Chromium present, API keys set, disk space |
-| `cs2bot db upgrade` / `db seed-synthetic` | Migrations / demo data |
-| `cs2bot ingest upcoming` / `results` / `backfill --since 2023-09-27` / `rankings` / `news` / `match <hltv_id>` | Data ingestion |
+| `cs2bot db upgrade` / `db status` / `db seed-synthetic` | Migrations / demo data |
+| `cs2bot ingest upcoming` / `results` / `backfill --since 2023-09-27` / `rankings` / `news` / `match <hltv_id>` / `scope` | Data ingestion (`--source all|pandascore|hltv`) |
 | `cs2bot ingest hltv-browser` | Open HLTV in a visible window with the bot's browser profile (pass a challenge by hand) |
-| `cs2bot demos process --limit N` | Download + parse pending demos |
+| `cs2bot demos process --limit N` / `demos aggregates` | Download + parse pending demos / rebuild aggregates and roles |
 | `cs2bot odds collect [--once]` / `odds unmapped` | Betclic odds collection / list unmapped market names |
-| `cs2bot models train` / `models tune` | Fit ratings, veto, round, kill, ensemble models |
+| `cs2bot models train` / `models tune` / `models list` | Fit ratings, veto, round, kill, ensemble models |
 | `cs2bot predict upcoming` / `predict match <id>` | Produce MatchPredictions + priced outcomes |
-| `cs2bot bet run [--dry-run]` | Decide + stake + execute for upcoming matches |
-| `cs2bot settle` | Settle finished bets, closing odds, CLV, ledger |
+| `cs2bot bet run [--dry-run] [--no-executor]` | Decide + stake + execute for upcoming matches |
+| `cs2bot settle [--no-executor]` | Settle finished bets, closing odds, CLV, ledger |
 | `cs2bot backtest --from YYYY-MM-DD --to YYYY-MM-DD` | Walk-forward backtest |
 | `cs2bot executor login` / `executor health` / `executor balance` | Open the Betclic login window / checks |
-| `cs2bot control kill-switch on|off` / `control pause` / `control resume` | Safety controls |
+| `cs2bot control kill-switch on|off` / `control pause` / `control resume` / `control status` | Safety controls |
 
 ## Data flow for one upcoming match
 

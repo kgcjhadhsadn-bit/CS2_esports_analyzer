@@ -67,7 +67,9 @@ def prepare_market(world: World, match_id: int, *, ev: float = 0.15) -> dict[str
     base |= {(CMS, s): "3.50" for s in ("2-0", "2-1", "1-2", "0-2")}
     base |= {(MAP1, "team1"): "1.90", (MAP1, "team2"): "1.90"}
     world.set_odds(match_id, base, at=at)
-    report = predict_upcoming(world.factory, world.settings, world.bundle, now=world.now, match_ids=[match_id])
+    report = predict_upcoming(
+        world.factory, world.settings, world.bundle, now=world.now, match_ids=[match_id]
+    )
     assert report.predicted == 1, report.as_dict()
     fav: dict[str, str] = {}
     odds: dict[tuple[str, str], Decimal] = {}
@@ -127,18 +129,26 @@ def ledger_balance(world: World) -> Decimal:
         return ledger.current_balance(s)
 
 
-def bookmaker_settles_like_reality(world: World, ex: FakeExecutor, match_id: int) -> dict[int, SettlementOutcome]:
+def bookmaker_settles_like_reality(
+    world: World, ex: FakeExecutor, match_id: int
+) -> dict[int, SettlementOutcome]:
     """Settle the fake bookmaker's open bets from the stored match result (what Betclic would do)."""
     out: dict[int, SettlementOutcome] = {}
     with world.factory() as s:
         actuals = datasets.load_match_actuals(s, match_id)
         assert actuals is not None and actuals.complete
-        for bet in s.scalars(select(M.Bet).where(M.Bet.match_id == match_id, M.Bet.status == BetStatus.PLACED)):
+        for bet in s.scalars(
+            select(M.Bet).where(M.Bet.match_id == match_id, M.Bet.status == BetStatus.PLACED)
+        ):
             res = settlement.resolve_bet(bet, actuals, betclic=world.settings.betclic)
             out[bet.id] = res.outcome
             assert bet.external_bet_id
             if res.outcome is SettlementOutcome.WON:
-                ex.settle(bet.external_bet_id, BookmakerBetStatus.WON, net_payout(bet.stake, bet.placed_odds, world.settings))
+                ex.settle(
+                    bet.external_bet_id,
+                    BookmakerBetStatus.WON,
+                    net_payout(bet.stake, bet.placed_odds, world.settings),
+                )
             elif res.outcome is SettlementOutcome.LOST:
                 ex.settle(bet.external_bet_id, BookmakerBetStatus.LOST, Decimal("0"))
             else:
@@ -168,7 +178,9 @@ def test_dry_run_cycle_records_paper_bets_and_settles_on_paper(world: World) -> 
         assert sum(b.stake for b in rows) <= Decimal("40.00")
 
     # a second dry-run cycle does not repeat the paper bets
-    rep2 = run_betting_cycle(world.factory, world.settings, ex, world.bundle, now=world.now + timedelta(minutes=1))
+    rep2 = run_betting_cycle(
+        world.factory, world.settings, ex, world.bundle, now=world.now + timedelta(minutes=1)
+    )
     assert rep2.bets_created == 0 and len(bets(world)) == len(rows)
 
     finish_match(world, mid, [("mirage", 13, 7), ("inferno", 13, 10)])
@@ -211,7 +223,9 @@ def test_live_cycle_full_lifecycle_ledger_clv_and_reconcile(world: World) -> Non
 
     # idempotency: the next cycles place nothing new
     for k in (1, 2):
-        again = run_betting_cycle(world.factory, world.settings, ex, world.bundle, now=world.now + timedelta(minutes=k))
+        again = run_betting_cycle(
+            world.factory, world.settings, ex, world.bundle, now=world.now + timedelta(minutes=k)
+        )
         assert again.bets_created == 0, again.as_dict()
     assert len(bets(world)) == len(placed) and len(ex.orders) == len(placed)
 
@@ -265,7 +279,11 @@ def test_bookmaker_settlement_wins_over_local_result_and_is_flagged(world: World
     first = placed[0]
     real = outcomes[first.id]
     flipped = BookmakerBetStatus.LOST if real is SettlementOutcome.WON else BookmakerBetStatus.WON
-    pay = Decimal("0") if flipped is BookmakerBetStatus.LOST else net_payout(first.stake, first.placed_odds, world.settings)
+    pay = (
+        Decimal("0")
+        if flipped is BookmakerBetStatus.LOST
+        else net_payout(first.stake, first.placed_odds, world.settings)
+    )
     for i, rec in enumerate(ex.history):
         if rec.external_bet_id == first.external_bet_id:
             ex.balance = (ex.balance or Decimal(0)) - (rec.payout or Decimal(0)) + pay
@@ -313,7 +331,9 @@ def test_crash_after_handing_the_order_to_the_executor_never_double_bets(world: 
     crashed = rows[0]
 
     # restart: the PLACING bet blocks its outcome; other outcomes may be bet, the crashed one never again
-    rep = run_betting_cycle(world.factory, world.settings, ex, world.bundle, now=world.now + timedelta(minutes=3))
+    rep = run_betting_cycle(
+        world.factory, world.settings, ex, world.bundle, now=world.now + timedelta(minutes=3)
+    )
     assert not rep.errors, rep.as_dict()
     keys = [(o.market_raw_name, o.selection_raw_name) for o in ex.orders]
     assert keys.count((crashed.market_raw, crashed.selection_raw)) == 1
@@ -350,7 +370,9 @@ def test_crash_before_the_order_was_handed_over_is_cancelled_and_redecided(
     rows = bets(world)
     assert len(rows) == 1 and rows[0].status is BetStatus.PENDING and not ex.orders
 
-    rep = run_betting_cycle(world.factory, world.settings, ex, world.bundle, now=world.now + timedelta(minutes=5))
+    rep = run_betting_cycle(
+        world.factory, world.settings, ex, world.bundle, now=world.now + timedelta(minutes=5)
+    )
     assert rep.stale_pending_cancelled == 1 and rep.placed >= 1, rep.as_dict()
     first = next(b for b in bets(world) if b.id == rows[0].id)
     assert first.status is BetStatus.CANCELLED
@@ -376,17 +398,23 @@ def test_kill_switch_and_pause_block_every_placement(world: World) -> None:
     rep = run_betting_cycle(world.factory, world.settings, ex, world.bundle, now=world.now)
     assert rep.bets_created == 0 and not ex.orders and rep.halted_reason
     with world.factory() as s:
-        accepted_before_sizing = list(s.scalars(select(M.BetDecisionRow).where(M.BetDecisionRow.reasons.is_not(None))))
+        accepted_before_sizing = list(
+            s.scalars(select(M.BetDecisionRow).where(M.BetDecisionRow.reasons.is_not(None)))
+        )
         assert any(any("halted" in r for r in d.reasons) for d in accepted_before_sizing)
         db_state.set_kill_switch(s, False, actor="test")
         db_state.set_paused(s, True, actor="test", reason="manual")
         s.commit()
-    rep = run_betting_cycle(world.factory, world.settings, ex, world.bundle, now=world.now + timedelta(minutes=1))
+    rep = run_betting_cycle(
+        world.factory, world.settings, ex, world.bundle, now=world.now + timedelta(minutes=1)
+    )
     assert rep.bets_created == 0 and not ex.orders and rep.paused_reason == "manual"
     with world.factory() as s:
         db_state.set_paused(s, False, actor="test")
         s.commit()
-    rep = run_betting_cycle(world.factory, world.settings, ex, world.bundle, now=world.now + timedelta(minutes=2))
+    rep = run_betting_cycle(
+        world.factory, world.settings, ex, world.bundle, now=world.now + timedelta(minutes=2)
+    )
     assert rep.placed >= 1
 
 
@@ -408,10 +436,36 @@ def test_kill_switch_switched_on_mid_cycle_stops_before_the_next_placement(
 
     monkeypatch.setattr(ex, "place", place_and_hit_kill_switch)
     rep = run_betting_cycle(world.factory, world.settings, ex, world.bundle, now=world.now)
-    assert rep.placed == 1 and rep.cancelled == 1, rep.as_dict()
-    statuses = sorted(b.status.value for b in bets(world))
-    assert statuses == ["cancelled", "placed"]
-    assert len(ex.orders) == 1
+    assert rep.placed == 1 and len(ex.orders) == 1, rep.as_dict()
+    assert [b.status for b in bets(world)] == [BetStatus.PLACED]
+    with world.factory() as s:
+        # the remaining accepted outcomes were stopped at sizing (the fresh state carries the kill switch)
+        halted = [d for d in s.scalars(select(M.BetDecisionRow)) if any("halted" in r for r in d.reasons)]
+        assert halted
+
+
+def test_kill_switch_between_bet_row_and_placement_cancels_the_bet(
+    world: World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The halt flags are re-read right before ``executor.place`` (after the PENDING row exists)."""
+    live(world)
+    prepare_market(world, world.match_ids[0])
+    ex = FakeExecutor(balance=Decimal("1000.00"))
+    real = betting._fresh_halt
+
+    def press_kill_switch_then_check(factory: Any) -> tuple[bool, str | None]:
+        with world.factory() as s:
+            db_state.set_kill_switch(s, True, actor="dashboard", reason="panic")
+            s.commit()
+        return real(factory)
+
+    monkeypatch.setattr(betting, "_fresh_halt", press_kill_switch_then_check)
+    rep = run_betting_cycle(world.factory, world.settings, ex, world.bundle, now=world.now)
+    assert rep.cancelled == 1 and rep.placed == 0 and not ex.orders, rep.as_dict()
+    assert rep.halted_reason and "kill switch" in rep.halted_reason
+    rows = bets(world)
+    assert len(rows) == 1 and rows[0].status is BetStatus.CANCELLED
+    assert ledger_balance(world) == Decimal("1000.00")
 
 
 def test_loss_limit_pauses_trading(world: World) -> None:
@@ -441,7 +495,9 @@ def test_loss_limit_pauses_trading(world: World) -> None:
         ledger.apply_placement(
             s,
             loser,
-            PlacementResult(status=PlacementStatus.PLACED, external_bet_id="X1", at=world.now - timedelta(hours=2)),
+            PlacementResult(
+                status=PlacementStatus.PLACED, external_bet_id="X1", at=world.now - timedelta(hours=2)
+            ),
             world.settings,
         )
         ledger.settle_bet(s, loser, "lost", world.settings, at=world.now - timedelta(hours=1))
@@ -458,7 +514,9 @@ def test_loss_limit_pauses_trading(world: World) -> None:
     ("status", "word"),
     [(PlacementStatus.LOGIN_REQUIRED, "login"), (PlacementStatus.SELECTOR_ERROR, "selector")],
 )
-def test_login_required_and_selector_error_pause_trading(world: World, status: PlacementStatus, word: str) -> None:
+def test_login_required_and_selector_error_pause_trading(
+    world: World, status: PlacementStatus, word: str
+) -> None:
     live(world)
     mid = world.match_ids[0]
     prepare_market(world, mid)
@@ -490,13 +548,17 @@ def test_uncertain_placement_stays_open_counts_as_exposure_and_is_failed_after_g
         assert state.exposure_by_match.get(mid, Decimal(0)) >= unsure.stake
         assert s.scalar(select(M.AuditLog).where(M.AuditLog.action == "bet_uncertain")) is not None
     n_orders = len(ex.orders)
-    rep2 = run_betting_cycle(world.factory, world.settings, ex, world.bundle, now=world.now + timedelta(minutes=2))
+    rep2 = run_betting_cycle(
+        world.factory, world.settings, ex, world.bundle, now=world.now + timedelta(minutes=2)
+    )
     assert all(o.idempotency_key != unsure.idempotency_key for o in ex.orders[n_orders:])
     assert rep2.bets_created == 0 or all(b.selection_raw != unsure.selection_raw for b in bets(world)[1:])
 
     # not in the history yet, inside the grace period: stays open
     s1 = settle_bets(world.factory, world.settings, ex, now=world.now + timedelta(minutes=5))
-    assert s1.placing_open == 1 and next(b for b in bets(world) if b.id == unsure.id).status is BetStatus.PLACING
+    assert (
+        s1.placing_open == 1 and next(b for b in bets(world) if b.id == unsure.id).status is BetStatus.PLACING
+    )
     # still absent after the grace period: FAILED, exposure released, owner alerted
     s2 = settle_bets(world.factory, world.settings, ex, now=world.now + timedelta(hours=1))
     assert s2.placing_failed == 1, s2.as_dict()
@@ -511,9 +573,7 @@ def test_no_executor_records_decisions_only(world: World) -> None:
     rep = run_betting_cycle(world.factory, world.settings, None, world.bundle, now=world.now)
     assert rep.bets_created == 0 and rep.decisions > 0 and not bets(world)
     with world.factory() as s:
-        assert any(
-            any("no_executor" in r for r in d.reasons) for d in s.scalars(select(M.BetDecisionRow))
-        )
+        assert any(any("no_executor" in r for r in d.reasons) for d in s.scalars(select(M.BetDecisionRow)))
 
 
 def test_stale_prediction_or_other_model_version_is_not_bet(world: World) -> None:

@@ -60,7 +60,11 @@ def market_specs() -> list[tuple[MarketSpec, list[str], str]]:
             "Dokładny wynik",
         ),
         (MarketSpec(market_type=MarketType.TOTAL_MAPS, line=2.5), ["over", "under"], "Liczba map"),
-        (MarketSpec(market_type=MarketType.MAP_WINNER, map_number=1), ["team1", "team2"], "Mapa 1 - Zwycięzca"),
+        (
+            MarketSpec(market_type=MarketType.MAP_WINNER, map_number=1),
+            ["team1", "team2"],
+            "Mapa 1 - Zwycięzca",
+        ),
     ]
 
 
@@ -82,7 +86,9 @@ def add_upcoming(session: Session, uni: object, now: datetime) -> dict[int, int]
         session.flush()
         for tid in (a, b):
             for p in teams[tid].players:
-                session.add(M.MatchLineup(match_id=match.id, team_id=tid, player_id=p.id, source=DataSource.SYNTHETIC))
+                session.add(
+                    M.MatchLineup(match_id=match.id, team_id=tid, player_id=p.id, source=DataSource.SYNTHETIC)
+                )
         event = M.BookmakerEvent(
             bookmaker=Bookmaker.BETCLIC,
             external_id=f"ev{match.id}",
@@ -179,7 +185,9 @@ class World:
     def match_ids(self) -> list[int]:
         return sorted(self.events)
 
-    def selection(self, session: Session, match_id: int, spec_key: str, selection_key: str) -> M.BookmakerSelection:
+    def selection(
+        self, session: Session, match_id: int, spec_key: str, selection_key: str
+    ) -> M.BookmakerSelection:
         sel = session.scalar(
             select(M.BookmakerSelection)
             .join(M.BookmakerMarket, M.BookmakerMarket.id == M.BookmakerSelection.market_id)
@@ -192,7 +200,9 @@ class World:
         assert sel is not None
         return sel
 
-    def set_odds(self, match_id: int, odds: dict[tuple[str, str], Decimal | float | str], *, at: datetime) -> None:
+    def set_odds(
+        self, match_id: int, odds: dict[tuple[str, str], Decimal | float | str], *, at: datetime
+    ) -> None:
         with self.factory() as session:
             for (spec_key, sel_key), value in odds.items():
                 sel = self.selection(session, match_id, spec_key, sel_key)
@@ -200,7 +210,9 @@ class World:
                 sel.last_odds = price
                 sel.last_odds_at = at
                 sel.last_seen_at = at
-                session.add(M.OddsSnapshot(selection_id=sel.id, odds=price, is_available=True, captured_at=at))
+                session.add(
+                    M.OddsSnapshot(selection_id=sel.id, odds=price, is_available=True, captured_at=at)
+                )
             session.commit()
 
 
@@ -214,7 +226,14 @@ def world(world_template: Template, tmp_path: Path) -> Iterator[World]:
     factory = sessionmaker(bind=engine, expire_on_commit=False, autoflush=False)
     bundle = load_bundle(root / "models" / world_template.bundle_path.name)
     try:
-        yield World(root=root, settings=settings, factory=factory, bundle=bundle, events=dict(world_template.events), now=NOW)
+        yield World(
+            root=root,
+            settings=settings,
+            factory=factory,
+            bundle=bundle,
+            events=dict(world_template.events),
+            now=NOW,
+        )
     finally:
         engine.dispose()
 

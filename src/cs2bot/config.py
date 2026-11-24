@@ -41,12 +41,15 @@ OptionalSecret = Annotated[SecretStr | None, BeforeValidator(_blank_to_none)]
 OptionalStr = Annotated[str | None, BeforeValidator(_blank_to_none)]
 
 # The CS2 Active Duty pool changes a few times per year. This is only the *default*; the meta
-# module detects the pool actually being played from recent Tier 1/2 results.
+# module detects the pool actually being played from recent Tier 1/2 results, and
+# config/patches.yaml holds the pool history (whose latest entry differs from this list - see
+# docs/dev/reports/integration.md; the synthetic universe and many tests are pinned to this one).
 DEFAULT_ACTIVE_MAP_POOL: list[str] = ["ancient", "anubis", "dust2", "inferno", "mirage", "nuke", "train"]
 
 
 class DatabaseSettings(BaseModel):
-    url: str = "postgresql+psycopg://cs2bot:cs2bot@localhost:5432/cs2bot"
+    # Matches docker-compose.yml / .env.example; 127.0.0.1 avoids an IPv6 (::1) attempt on Windows.
+    url: str = "postgresql+psycopg://cs2bot:change-me@127.0.0.1:5432/cs2bot"
     echo: bool = False
     pool_size: int = 5
     max_overflow: int = 10
@@ -159,7 +162,7 @@ class ModelSettings(BaseModel):
     min_maps_for_rating: int = 8
     calibration_holdout_days: int = 90
     sigma_floor: float = 0.01
-    scenario_n_simulations: int | None = None  # low/high scenarios; None = n_map_simulations // 2
+    scenario_n_simulations: int | None = None  # low/high scenarios; None = max(2000, n_map_simulations // 2)
     ot_start_money: int = 10_000  # per player at each overtime half (some organisers use 12 500)
     round_model_half_life_days: float = 365.0
     kill_model_half_life_days: float = 120.0
@@ -226,6 +229,12 @@ class ExecutorSettings(BaseModel):
     health_check_event_page: bool = True
     lock_stale_after_s: float = 600.0
     lock_heartbeat_s: float = 30.0
+    # Refuse a price this many times above the requested odds (likely a misread); None disables it.
+    max_odds_rise_factor: float | None = 1.5
+    # Plausible range of the slip's "potential win" / (stake x odds) before the final click.
+    potential_win_min_ratio: float = 0.70
+    potential_win_max_ratio: float = 1.05
+    journal_retention_days: float = 60.0  # placement-journal records older than this are ignored
 
 
 class APISettings(BaseModel):

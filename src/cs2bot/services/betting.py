@@ -45,7 +45,7 @@ from datetime import datetime, timedelta
 from decimal import Decimal
 from typing import Any
 
-from sqlalchemy import func, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.orm import Session, sessionmaker
 
 from cs2bot import datasets
@@ -174,7 +174,9 @@ def outcome_hash(match_id: int, spec_key: str, selection_key: str) -> str:
     return hashlib.sha256(f"{match_id}|{spec_key}#{selection_key}".encode()).hexdigest()[:20]
 
 
-def idempotency_key(session: Session, match_id: int, spec_key: str, selection_key: str, *, dry_run: bool) -> str:
+def idempotency_key(
+    session: Session, match_id: int, spec_key: str, selection_key: str, *, dry_run: bool
+) -> str:
     """Deterministic key: match + market + selection + mode + attempt number.
 
     The attempt number is the count of earlier rows with the same prefix; only FAILED / CANCELLED
@@ -198,7 +200,9 @@ def _blocking_bets(session: Session, match_id: int, *, include_dry_run: bool) ->
 
 
 def _reject(dec: BetDecision, reason: str) -> BetDecision:
-    return dec.model_copy(update={"accepted": False, "reasons": [*dec.reasons, reason], "stake": Decimal("0")})
+    return dec.model_copy(
+        update={"accepted": False, "reasons": [*dec.reasons, reason], "stake": Decimal("0")}
+    )
 
 
 def enforce_one_selection_per_market(
@@ -317,6 +321,50 @@ def write_decision(
     return row
 
 
+def with_open_paper_bets(session: Session, state: BankrollState) -> BankrollState:
+    """The state with every open paper bet reserved, so dry-run caps hold across cycles.
+
+    ``compute_state`` ignores dry-run bets (they must never touch real limits), so without this a
+    second dry-run cycle would see an empty per-match exposure and back the next outcome of a match
+    whose paper exposure is already at the cap. Open = status ``DRY_RUN``, not settled on paper, and
+    its match not finished / cancelled (a paper bet that can never be settled must not block paper
+    betting forever). Only paper bets created since the local day start count towards the daily
+    bet count.
+    """
+    rows = session.execute(
+        select(Bet.match_id, Bet.stake, Bet.created_at)
+        .outerjoin(Match, Match.id == Bet.match_id)
+        .where(
+            Bet.status == BetStatus.DRY_RUN,
+            Bet.settled_at.is_(None),
+            or_(Match.id.is_(None), Match.status.not_in([MatchStatus.FINISHED, MatchStatus.CANCELED])),
+        )
+    ).all()
+    if not rows:
+        return state
+    exposure = dict(state.exposure_by_match)
+    total = Decimal("0")
+    today = 0
+    for match_id, stake, created_at in rows:
+        if stake is None or stake <= 0:
+            continue
+        total += stake
+        if match_id is not None:
+            exposure[match_id] = exposure.get(match_id, Decimal("0")) + stake
+        if state.day_start is None or created_at is None or ensure_utc(created_at) >= state.day_start:
+            today += 1
+    return state.model_copy(
+        update={
+            "balance": state.balance - total,
+            "open_stakes_today": state.open_stakes_today + total,
+            "open_stakes_week": state.open_stakes_week + total,
+            "exposure_by_match": exposure,
+            "reserved_stakes": state.reserved_stakes + total,
+            "bets_placed_today": state.bets_placed_today + today,
+        }
+    )
+
+
 def _fresh_halt(session_factory: sessionmaker[Session]) -> tuple[bool, str | None]:
     """Kill switch / pause read with a NEW session (sessions do not expire cached rows on commit)."""
     try:
@@ -326,7 +374,9 @@ def _fresh_halt(session_factory: sessionmaker[Session]) -> tuple[bool, str | Non
         return True, f"could not read the trading state: {type(exc).__name__}: {exc}"
 
 
-def cancel_stale_pending(session: Session, *, now: datetime, older_than: timedelta = STALE_PENDING_AFTER) -> int:
+def cancel_stale_pending(
+    session: Session, *, now: datetime, older_than: timedelta = STALE_PENDING_AFTER
+) -> int:
     """Cancel PENDING bets an interrupted cycle left behind (they never reached the executor)."""
     n = 0
     for bet in session.scalars(select(Bet).where(Bet.status == BetStatus.PENDING)):
@@ -548,7 +598,9 @@ def _bet_match(
         )
         dec_settings = db_state.effective_decision_settings(session, settings)
         bank_settings = db_state.effective_bankroll_settings(session, settings)
-        pairs = price_quotes(prediction, quotes, sigma_floor=settings.models.sigma_floor, betclic=settings.betclic)
+        pairs = price_quotes(
+            prediction, quotes, sigma_floor=settings.models.sigma_floor, betclic=settings.betclic
+        )
         priced = price_all(pairs, settings)
         by_event: dict[int, list[PricedOutcome]] = defaultdict(list)
         for p in priced:
@@ -564,7 +616,9 @@ def _bet_match(
                 include_dry_run_bets=dry,
             )
             decisions.extend(
-                decision.evaluate_all(items, match=info, settings=dec_settings, betclic=settings.betclic, now=now)
+                decision.evaluate_all(
+                    items, match=info, settings=dec_settings, betclic=settings.betclic, now=now
+                )
             )
         bet_specs: dict[str, set[str]] = defaultdict(set)
         for b in _blocking_bets(session, match_id, include_dry_run=dry):
@@ -582,6 +636,8 @@ def _bet_match(
         placed_decisions: list[BetDecision] = []
         session.expire_all()
         state = bankroll.compute_state(session, settings, now=now)
+        if dry:
+            state = with_open_paper_bets(session, state)
         for dec in accepted:
             sized = bankroll.size_decision(dec, state, bank_settings, settings.betclic)
             if not sized.accepted or sized.stake <= 0 or executor is None or stop_placing:
@@ -628,7 +684,9 @@ def _bet_match(
                 report.notes.append(str(stop))
                 stop_placing = True
         if placed_decisions:
-            _update_rationale(session, analysis, prediction, placed_decisions, settings, analyzer=analyzer, now=now)
+            _update_rationale(
+                session, analysis, prediction, placed_decisions, settings, analyzer=analyzer, now=now
+            )
             session.commit()
     return stop_placing
 
@@ -673,7 +731,7 @@ def _place_one(
     bet.tax = money["tax"]  # type: ignore[assignment]
     bet.potential_payout = money["potential_payout"]  # type: ignore[assignment]
     bet.extra = {
-        **dict(money["extra"]),  # type: ignore[arg-type]
+        **dict(money["extra"]),  # type: ignore[call-overload]
         "cycle_at": now.isoformat(),
         "event_url": quote.event_url,
         "event_name": event_name,
@@ -731,7 +789,9 @@ def _place_one(
         status = ledger.apply_placement(session, bet, result, settings)
     except ledger.LedgerConflictError as exc:
         log.error("placement result for bet %s conflicts with the ledger: %s", bet.id, exc)
-        db_state.audit(session, actor=ACTOR, action="placement_conflict", details={"bet_id": bet.id, "error": str(exc)})
+        db_state.audit(
+            session, actor=ACTOR, action="placement_conflict", details={"bet_id": bet.id, "error": str(exc)}
+        )
         session.commit()
         report.errors.append(f"bet {bet.id}: {exc}")
         return state
@@ -747,7 +807,11 @@ def _place_one(
             session,
             actor=ACTOR,
             action="bet_uncertain",
-            details={"bet_id": bet.id, "message": result.message[:500], "idempotency_key": bet.idempotency_key},
+            details={
+                "bet_id": bet.id,
+                "message": result.message[:500],
+                "idempotency_key": bet.idempotency_key,
+            },
         )
     elif status is BetStatus.DRY_RUN:
         report.dry_run_ok += 1
@@ -755,12 +819,19 @@ def _place_one(
         report.placed += 1
         if "WARNING:" in result.message:
             db_state.audit(
-                session, actor=ACTOR, action="bet_warning", details={"bet_id": bet.id, "message": result.message[:500]}
+                session,
+                actor=ACTOR,
+                action="bet_warning",
+                details={"bet_id": bet.id, "message": result.message[:500]},
             )
     report.bets.append(_summary(bet, result.status.value, result.message))
     stop_reason: str | None = None
     if result.status in PAUSING_STATUSES:
-        what = "Betclic login required" if result.status is PlacementStatus.LOGIN_REQUIRED else "Betclic page layout changed (selector error)"
+        what = (
+            "Betclic login required"
+            if result.status is PlacementStatus.LOGIN_REQUIRED
+            else "Betclic page layout changed (selector error)"
+        )
         stop_reason = f"{what}: {result.message}"[:500]
         ledger.pause_trading(session, stop_reason, actor=ACTOR)
     session.commit()

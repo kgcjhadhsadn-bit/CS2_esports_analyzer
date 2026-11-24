@@ -19,6 +19,10 @@ build/
 # Runtime data (demos, caches, browser profiles, model artifacts, screenshots)
 data/
 !data/.gitkeep
+logs/
+backups/
+# model bundles trained with a relative artifacts dir by mistake (the default is data/models)
+/models/
 
 # Node / dashboard
 node_modules/

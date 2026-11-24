@@ -153,7 +153,9 @@ def compute_fingerprint(
             sorted((p.player_id, p.is_standin) for p in ctx.team2_lineup),
         ],
         "pool": sorted(ctx.map_pool),
-        "veto": [(s.step, s.action.value, s.team.value if s.team else None, s.map_name) for s in ctx.known_veto],
+        "veto": [
+            (s.step, s.action.value, s.team.value if s.team else None, s.map_name) for s in ctx.known_veto
+        ],
         "first_veto": ctx.first_veto_team.value if ctx.first_veto_team else None,
         "sides": sorted((k, v.value if v else None) for k, v in ctx.start_sides.items()),
         "flags": sorted(_flag_signature(f) for f in flags),
@@ -174,7 +176,9 @@ def prepare_match(
 ) -> PreparedMatch:
     """Context, flags, completeness and fingerprint of one match (raises ``MatchNotFoundError``)."""
     now = ensure_utc(now or utcnow())
-    ctx = datasets.load_match_context(session, match_id, settings=settings, now=now, include_context_flags=False)
+    ctx = datasets.load_match_context(
+        session, match_id, settings=settings, now=now, include_context_flags=False
+    )
     flags: list[ContextFlag]
     source = "db"
     if analyzer is not None:
@@ -549,12 +553,21 @@ def predict_upcoming(
         try:
             with session_factory() as session:
                 outcome = _predict_one(
-                    session, match_id, bundle, settings, analyzer=analyzer, now=now, force=force, max_age=max_age
+                    session,
+                    match_id,
+                    bundle,
+                    settings,
+                    analyzer=analyzer,
+                    now=now,
+                    force=force,
+                    max_age=max_age,
                 )
                 session.commit()
         except Exception as exc:
             log.exception("prediction failed for match %s", match_id)
-            outcome = MatchPredictOutcome(match_id=match_id, status="failed", reason=f"{type(exc).__name__}: {exc}")
+            outcome = MatchPredictOutcome(
+                match_id=match_id, status="failed", reason=f"{type(exc).__name__}: {exc}"
+            )
             report.errors.append(f"match {match_id}: {type(exc).__name__}: {exc}")
         report.results.append(outcome)
         report.outcomes_written += outcome.outcomes_written
@@ -594,7 +607,11 @@ def _predict_one(
     if not prepared.ctx.team1_lineup or not prepared.ctx.team2_lineup:
         return MatchPredictOutcome(match_id, "skipped", "lineups not known")
     analysis = latest_analysis(session, match_id)
-    why = "forced" if force else _needs_new_prediction(match, analysis, prepared.fingerprint, now=now, max_age=max_age)
+    why = (
+        "forced"
+        if force
+        else _needs_new_prediction(match, analysis, prepared.fingerprint, now=now, max_age=max_age)
+    )
     if why is None and analysis is not None:
         prediction = MatchPrediction.model_validate(analysis.payload)
         n = write_outcome_predictions(

@@ -483,7 +483,7 @@ def test_event_that_starts_while_the_bot_is_working_is_not_bet(
         holder["order"].event_starts_at = utcnow() - timedelta(seconds=1)  # the match has just started
         return True
 
-    order = TimedOrder(**make_order().model_dump(), event_starts_at=utcnow() + timedelta(minutes=30))
+    order = TimedOrder(**{**make_order().model_dump(), "event_starts_at": utcnow() + timedelta(minutes=30)})
     holder["order"] = order
     executor = _hooked_executor(make_executor, executor_settings, kick_off)
     result = executor.place(order)

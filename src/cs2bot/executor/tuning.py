@@ -29,6 +29,10 @@ SETTINGS_FIELDS: tuple[str, ...] = (
     "health_check_event_page",
     "lock_stale_after_s",
     "lock_heartbeat_s",
+    "max_odds_rise_factor",
+    "potential_win_min_ratio",
+    "potential_win_max_ratio",
+    "journal_retention_days",
 )
 
 

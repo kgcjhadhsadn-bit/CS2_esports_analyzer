@@ -37,7 +37,15 @@ from sqlalchemy.orm import Session, sessionmaker
 from cs2bot import datasets
 from cs2bot.config import Settings
 from cs2bot.db import state as db_state
-from cs2bot.db.models import BankrollLedger, Bet, BookmakerEvent, BookmakerMarket, BookmakerSelection, Match, MatchLineup
+from cs2bot.db.models import (
+    BankrollLedger,
+    Bet,
+    BookmakerEvent,
+    BookmakerMarket,
+    BookmakerSelection,
+    Match,
+    MatchLineup,
+)
 from cs2bot.domain.betting import BookmakerBetRecord, BookmakerBetStatus, PlacementResult, PlacementStatus
 from cs2bot.domain.enums import BetStatus, MatchStatus, TeamSlot
 from cs2bot.domain.results import MatchActuals, SettlementOutcome
@@ -204,7 +212,9 @@ def _same_outcome(a: SettlementOutcome, b: SettlementOutcome) -> bool:
     return a == b or (a.is_refund and b.is_refund)
 
 
-def _alert(session: Session, report: SettlementReport, action: str, message: str, details: dict[str, Any]) -> None:
+def _alert(
+    session: Session, report: SettlementReport, action: str, message: str, details: dict[str, Any]
+) -> None:
     report.alerts.append(message)
     log.warning("settlement alert: %s", message)
     db_state.audit(session, actor=ACTOR, action=action, details={"message": message, **details})
@@ -264,14 +274,20 @@ def settle_bets(
 
     with session_factory() as session:
         claimed = {
-            ext for ext in session.scalars(select(Bet.external_bet_id).where(Bet.external_bet_id.is_not(None))) if ext
+            ext
+            for ext in session.scalars(select(Bet.external_bet_id).where(Bet.external_bet_id.is_not(None)))
+            if ext
         }
-        placing_ids = list(session.scalars(select(Bet.id).where(Bet.status == BetStatus.PLACING).order_by(Bet.id)))
+        placing_ids = list(
+            session.scalars(select(Bet.id).where(Bet.status == BetStatus.PLACING).order_by(Bet.id))
+        )
     for bet_id in placing_ids:
         _guarded(session_factory, report, bet_id, _reconcile_placing, records, claimed, now, grace, settings)
 
     with session_factory() as session:
-        open_ids = list(session.scalars(select(Bet.id).where(Bet.status == BetStatus.PLACED).order_by(Bet.id)))
+        open_ids = list(
+            session.scalars(select(Bet.id).where(Bet.status == BetStatus.PLACED).order_by(Bet.id))
+        )
         paper_ids = list(
             session.scalars(
                 select(Bet.id)
@@ -423,17 +439,24 @@ def _settle_placed(
 
     if record is not None and record.status in _BOOKMAKER_OUTCOME:
         outcome = _BOOKMAKER_OUTCOME[record.status]
-        if local is not None and local.outcome is not SettlementOutcome.UNKNOWN and not _same_outcome(
-            local.outcome, outcome
+        if (
+            local is not None
+            and local.outcome is not SettlementOutcome.UNKNOWN
+            and not _same_outcome(local.outcome, outcome)
         ):
             report.disagreements += 1
             _alert(
                 session,
                 report,
                 "settlement_disagreement",
-                f"bet {bet.id}: Betclic settled it {outcome.value}, the local result says {local.outcome.value} "
-                "- the bookmaker's settlement is used",
-                {"bet_id": bet.id, "bookmaker": outcome.value, "local": local.outcome.value, "reason": local.reason},
+                f"bet {bet.id}: Betclic settled it {outcome.value}, the local result says "
+                f"{local.outcome.value} - the bookmaker's settlement is used",
+                {
+                    "bet_id": bet.id,
+                    "bookmaker": outcome.value,
+                    "local": local.outcome.value,
+                    "reason": local.reason,
+                },
             )
         payout, _ = ledger.settle_bet(session, bet, outcome, settings, at=now)
         bet.extra = {**dict(bet.extra or {}), "settled_by": "bookmaker"}
@@ -459,9 +482,13 @@ def _settle_placed(
         )
         return
     if record is not None and record.status is BookmakerBetStatus.OPEN:
-        if match is not None and match.status in FINISHED_STATUSES and match.scheduled_at is not None:
-            if now - ensure_utc(match.scheduled_at) > OPEN_AT_BOOKMAKER_FLAG_AFTER:
-                report.notes.append(f"bet {bet.id}: match finished but Betclic still shows the bet open")
+        if (
+            match is not None
+            and match.status in FINISHED_STATUSES
+            and match.scheduled_at is not None
+            and now - ensure_utc(match.scheduled_at) > OPEN_AT_BOOKMAKER_FLAG_AFTER
+        ):
+            report.notes.append(f"bet {bet.id}: match finished but Betclic still shows the bet open")
         return
     if local is None:
         return
@@ -471,7 +498,8 @@ def _settle_placed(
             session,
             report,
             "settlement_unknown",
-            f"bet {bet.id} cannot be settled from the match data ({local.reason or 'unknown'}); it stays open",
+            f"bet {bet.id} cannot be settled from the match data ({local.reason or 'unknown'}); "
+            "it stays open",
             {"bet_id": bet.id, "reason": local.reason},
         )
         return
@@ -523,7 +551,9 @@ def _update_clv(session_factory: sessionmaker[Session], report: SettlementReport
                 select(Bet).where(
                     Bet.closing_odds.is_(None),
                     Bet.selection_id.is_not(None),
-                    Bet.status.in_([BetStatus.PLACED, BetStatus.WON, BetStatus.LOST, BetStatus.VOID, BetStatus.DRY_RUN]),
+                    Bet.status.in_(
+                        [BetStatus.PLACED, BetStatus.WON, BetStatus.LOST, BetStatus.VOID, BetStatus.DRY_RUN]
+                    ),
                 )
             )
         )

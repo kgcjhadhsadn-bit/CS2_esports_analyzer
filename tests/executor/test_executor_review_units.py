@@ -287,7 +287,7 @@ def test_from_settings_picks_up_tuning_fields_added_to_the_settings_later() -> N
 
     base = ExecutorSettings().model_dump()
     future: Any = SimpleNamespace(
-        executor=SimpleNamespace(**base, max_odds_rise_factor=2.5, journal_retention_days=10.0)
+        executor=SimpleNamespace(**{**base, "max_odds_rise_factor": 2.5, "journal_retention_days": 10.0})
     )
     tuning = ExecutorTuning.from_settings(future)
     assert tuning.max_odds_rise_factor == 2.5 and tuning.journal_retention_days == 10.0
@@ -308,7 +308,7 @@ def test_order_whose_event_already_started_is_refused_without_a_browser(settings
     factory = Factory()
     executor = _executor(settings, factory)
     base = _order().model_dump()
-    late = TimedOrder(**base, event_starts_at=utcnow() - timedelta(seconds=1))
+    late = TimedOrder(**{**base, "event_starts_at": utcnow() - timedelta(seconds=1)})
     result = executor.place(late)
     assert result.status is PlacementStatus.MARKET_UNAVAILABLE
     assert "started" in result.message and "pre-match" in result.message
@@ -318,7 +318,7 @@ def test_order_whose_event_already_started_is_refused_without_a_browser(settings
     assert refused.status is PlacementStatus.MARKET_UNAVAILABLE and "timezone-aware" in refused.message
     assert factory.created == []
     # a future kick-off (or none at all, as today) goes on to the browser (fake page: navigation error)
-    for order in (TimedOrder(**base, event_starts_at=utcnow() + timedelta(hours=2)), _order()):
+    for order in (TimedOrder(**{**base, "event_starts_at": utcnow() + timedelta(hours=2)}), _order()):
         assert executor.place(order).status is PlacementStatus.FAILED
     assert len(factory.created) == 1
     executor.close()
@@ -340,7 +340,7 @@ def test_blocked_key_is_uncertain_even_when_the_order_is_no_longer_placeable(set
     cases: list[tuple[Settings, BetOrder, bool]] = [
         (disabled, _order(idempotency_key="k1"), False),
         (settings, _order(idempotency_key="k1", stake=Decimal("0.50")), False),
-        (settings, TimedOrder(**base, event_starts_at=utcnow() - timedelta(minutes=5)), False),
+        (settings, TimedOrder(**{**base, "event_starts_at": utcnow() - timedelta(minutes=5)}), False),
         (settings, _order(idempotency_key="k1"), True),
     ]
     for cfg, order, halted in cases:
