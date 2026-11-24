@@ -1,6 +1,8 @@
 # Cloud autonomy: auto-login, auto-resume, circuit breaker, Telegram
 
-**Owned paths:** you run alongside ONE other engineer (cloud_deploy, who owns `deploy/linux/`, `Dockerfile*`, `docker-compose.cloud.yml`, `Caddyfile`, `docs/VPS_SETUP.md`, `.github/workflows/`). Everything else in the repository is yours to edit, including foundation files (config, domain, db + an Alembic migration if needed), `services/`, `flows/`, `executor/`, `api/`, `dashboard/`, `cli.py` and docs other than `docs/VPS_SETUP.md`.
+**Owned paths:** you run alongside TWO other engineers: cloud_deploy (owns `deploy/linux/`, `Dockerfile*`, `docker-compose.cloud.yml`, `Caddyfile`, `docs/VPS_SETUP.md`, `.github/workflows/`) and deep_data (owns `datasets/`, `features/`, `models/`, `backtest/`, `ingest/`, `odds/`). Yours: `services/`, `flows/`, `executor/`, `api/`, `dashboard/`, `cli.py`, `domain/`, `db/` (+ an Alembic migration if needed), `engine/` (decision wiring), `config/betclic_selectors.yaml`, and docs other than `docs/VPS_SETUP.md`. In `src/cs2bot/config.py` only add sections/fields with the Edit tool (deep_data edits it too); never rewrite it.
+
+**Decision rule change (owner, 2026-11-24):** min_probability 0.75 with a break-even guard only (`decision.min_ev = 0.0`, already set). Make sure engine/decision, the dashboard settings page, docs and tests reflect it, and wire deep_data's per-market "trusted" calibration flag into the decision when its report describes it (if it is not ready when you finish, leave a clear TODO for the final review).
 
 **Tests:** tests/services/ (new files prefixed `test_autonomy_` / `test_telegram_`), plus tests next to any package you change.
 

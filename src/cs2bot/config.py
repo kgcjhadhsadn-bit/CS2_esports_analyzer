@@ -183,7 +183,9 @@ class DecisionSettings(BaseModel):
     """Bet only if ALL checks pass (PLAN.md section 6)."""
 
     min_probability: float = 0.75
-    min_ev: float = 0.03
+    # Break-even guard only (owner decision 2026-11-24): bet whenever the model is confident and the
+    # price is not a loss after the 12% stake tax. No extra "value" margin.
+    min_ev: float = 0.0
     max_sigma: float = 0.05
     min_data_completeness: float = 0.95
     min_event_link_confidence: float = 0.90
