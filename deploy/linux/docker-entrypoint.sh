@@ -105,8 +105,7 @@ start_xvfb() {
     # -nolisten tcp: only the Unix socket inside the container; nothing is reachable from outside.
     Xvfb "$DISPLAY" -screen 0 "$XVFB_SCREEN" -nolisten tcp -noreset -dpi 96 >/tmp/xvfb.log 2>&1 &
     XVFB_PID=$!
-    local i
-    for i in $(seq 1 100); do
+    for _ in $(seq 1 100); do
         if [[ -S "$socket" ]]; then
             log "Xvfb ready on $DISPLAY ($XVFB_SCREEN, pid $XVFB_PID)"
             return 0
@@ -148,8 +147,7 @@ db_upgrade() {
 # Lets the tee flush the bot's last lines (bounded: a leftover child holding the pipe cannot block us).
 stop_tee() {
     [[ -n "$TEE_PID" ]] || return 0
-    local i
-    for i in $(seq 1 50); do
+    for _ in $(seq 1 50); do
         kill -0 "$TEE_PID" 2>/dev/null || return 0
         sleep 0.1
     done

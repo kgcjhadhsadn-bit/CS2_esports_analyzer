@@ -143,7 +143,15 @@ class FakeExecutor:
             status = LoginStatus.LOGGED_IN if self.login_succeeds else LoginStatus.FAILED
         if status.logged_in:
             self.logged_in = True
-        return LoginAttempt(status=status, message=f"fake auto-login: {status.value}", at=utcnow())
+        # like the real executor: the form was submitted unless nothing had to / could be typed
+        submitted = status not in (
+            LoginStatus.ALREADY_LOGGED_IN,
+            LoginStatus.NO_CREDENTIALS,
+            LoginStatus.FORM_NOT_FOUND,
+        )
+        return LoginAttempt(
+            status=status, message=f"fake auto-login: {status.value}", at=utcnow(), submitted=submitted
+        )
 
     def fetch_bet_history(self, since: datetime) -> list[BookmakerBetRecord]:
         self._check_open()

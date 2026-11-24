@@ -14,7 +14,14 @@ Leakage rules (same as the store)
 * The match being predicted contributes only **static pre-match facts**: its scheduled time, format,
   stage text, tournament and venue (public before the match), and the market prices captured before
   ``as_of``.
-* Schedule features of *other* matches use their scheduled start strictly before ``as_of``.
+* Schedule features of *other* matches use the public schedule: matches scheduled before the start of
+  the match being predicted (its ``scheduled_at``), results only when played before ``as_of``.
+* Train / live parity (review round 1): training rows are computed at kick-off, live rows hours before.
+  So the schedule windows ("3 / 7 days before", "the match day", rest days) are anchored to the
+  match's *scheduled start* rather than to ``as_of``, a series counts as won / lost only once it is
+  complete (a live match already has its first maps stored), and the market block of a kick-off row
+  reads the prices a per-match lead before the start (``DeepConfig.market_lead_hours``), as the live
+  bot does - never the closing line it cannot see when it bets.
 
 Column names
 ------------
@@ -25,10 +32,10 @@ team2, and also as ``t1_dp_*`` / ``t2_dp_*`` with ``DeepConfig.team_columns="all
 
 Team features (windows in days)
 * schedule / fatigue: ``dp_maps_3d``, ``dp_maps_7d``, ``dp_matches_3d``, ``dp_matches_7d`` (series
-  completed in the window; a series is placed at the start of its last map, so one still being played
-  at ``as_of`` is invisible), ``dp_rest_days`` (since the last map of the previous series),
+  in the window before the scheduled start; a series is placed at the start of its last map),
+  ``dp_rest_days`` (from the last map of the previous series to the scheduled start),
   ``dp_play_streak_days`` (consecutive previous UTC days with a series), ``dp_same_day_series`` (series
-  of this team earlier the same UTC day: played ones, or scheduled ones from the metadata),
+  of this team earlier the same UTC day as the match: played ones, or scheduled ones from the metadata),
   ``dp_maps_today``;
 * travel: ``dp_tz_shift`` (hours between the venue and the team's home; 0 online), ``dp_away_region``,
   ``dp_first_after_travel`` (first match at a new venue after playing elsewhere), ``dp_days_at_event``;
@@ -59,7 +66,10 @@ Match features (team1 point of view)
   places, minus the reverse, 365 d);
 * ``dp_map_days_in_pool`` (days since the map (re-)entered Active Duty; new maps are less predictable);
 * market: :data:`cs2bot.odds.movement.MARKET_FEATURE_NAMES` (Betclic match-winner line movement and
-  the optional sharp benchmark).
+  the optional sharp benchmark) read at :meth:`DeepFeatureIndex.market_reference`, plus
+  ``mkt_lead_hours`` (hours between that moment and the scheduled start; NaN without a quote). The
+  block is NaN when the match metadata cannot tell the orientation (prices are stored in the match's
+  team1 / team2 order).
 """
 
 from __future__ import annotations
@@ -86,6 +96,10 @@ if TYPE_CHECKING:
 
 NAN: Final[float] = math.nan
 _DAY: Final[float] = 86_400.0
+#: A query this close to (or after) the scheduled start is a "kick-off row" (training / backtest).
+_KICKOFF_BAND_S: Final[float] = 300.0
+#: A scheduled start further ahead than this is not trusted as the schedule anchor (stale data).
+_MAX_ANCHOR_AHEAD_S: Final[float] = 7 * 86_400.0
 
 __all__ = [
     "DEEP_MATCH_FEATURES",
@@ -154,6 +168,7 @@ DEEP_MATCH_FEATURES: Final[tuple[str, ...]] = (
     "dp_area_open_edge",
     "dp_map_days_in_pool",
     *MARKET_FEATURE_NAMES,
+    "mkt_lead_hours",
 )
 
 
@@ -178,6 +193,20 @@ class DeepConfig:
     #: "all" = also ``t1_dp_*`` / ``t2_dp_*``. Differences carry the matchup signal; the per-team
     #: levels triple the column count, which costs more in noise than it gains on small data sets.
     team_columns: Literal["diff", "all"] = "diff"
+    #: Hours before the scheduled start at which the market block of a *kick-off row* (a training or
+    #: backtest row, computed at the start of a finished match) reads the prices: a deterministic
+    #: pseudo-random lead per match, uniform in ``[lo, hi]``. Live rows read the prices on offer at
+    #: ``as_of`` (the bot bets 10 min .. 48 h before the start, ``DecisionSettings``). Without this the
+    #: model would learn from (nearly) closing prices and meet earlier, noisier prices live - an
+    #: over-confident use of the market exactly where a confident wrong bet costs most. The lead is
+    #: also a feature (``mkt_lead_hours``) so the model can learn how much a price is worth by its age.
+    #: ``None`` = read at ``as_of`` (kick-off) in training too.
+    market_lead_hours: tuple[float, float] | None = (0.25, 48.0)
+
+    def __post_init__(self) -> None:
+        lead = self.market_lead_hours
+        if lead is not None and not (0.0 <= lead[0] <= lead[1]):
+            raise ValueError("market_lead_hours must be (lo, hi) with 0 <= lo <= hi")
 
 
 # ------------------------------------------------------------------------------------- helpers
@@ -208,9 +237,13 @@ class _Cum:
                 i -= 1
         return i
 
-    def window(self, ts: float, days: float, exclude: int | None) -> tuple[int, int]:
+    def window(
+        self, ts: float, days: float, exclude: int | None, ref: float | None = None
+    ) -> tuple[int, int]:
+        """Rows in ``[ref - days, ts)`` (``ref`` defaults to ``ts``; rows are never read at/after ``ts``)."""
         hi = self.end(ts, exclude)
-        return min(bisect.bisect_left(self.t, ts - days * _DAY), hi), hi
+        start = (ts if ref is None else ref) - days * _DAY
+        return min(bisect.bisect_left(self.t, start), hi), hi
 
     def total(self, name: str, lo: int, hi: int) -> float:
         c = self.cum[name]
@@ -223,6 +256,17 @@ class _Cum:
 
 def _rate(w: float, n: float) -> float:
     return w / n if n > 0 else NAN
+
+
+def _unit_hash(match_id: int) -> float:
+    """Deterministic value in [0, 1) per match (Knuth multiplicative hash; same for every map / side)."""
+    return ((int(match_id) * 2_654_435_761) & 0xFFFFFFFF) / 4_294_967_296.0
+
+
+def _kickoff(meta: MatchMetaRecord | None) -> float | None:
+    if meta is None or meta.scheduled_at is None:
+        return None
+    return ensure_utc(meta.scheduled_at).timestamp()
 
 
 _TEAM_MAP_COLS: Final[tuple[str, ...]] = (
@@ -339,6 +383,20 @@ class _MatchInfo:
     maps2: int = 0
 
 
+def _series_complete(info: _MatchInfo) -> bool:
+    """True when the stored maps finish the series (a BO3 needs a team with two map wins, ...).
+
+    A live match already has its first finished maps in the database; counting it as decided would
+    hand the leader a series win that does not exist yet (and, in training, every series is complete,
+    so live rows would differ from training rows). Unknown format: any decided map score counts.
+    """
+    if info.fmt is None:
+        return True
+    if info.fmt is MatchFormat.BO2:
+        return info.maps1 + info.maps2 >= 2
+    return max(info.maps1, info.maps2) >= info.fmt.n_maps // 2 + 1
+
+
 @dataclass
 class _TeamMatches:
     cum: _Cum  # one row per series, at the time of its last map
@@ -439,7 +497,8 @@ class DeepFeatureIndex:
         self._matches = matches
         per_team: dict[int, list[tuple[float, int, list[float], float]]] = defaultdict(list)
         for mid, info in matches.items():
-            decided = info.maps1 != info.maps2
+            # a series still being played (live: only its first maps are stored) has no result yet
+            decided = info.maps1 != info.maps2 and _series_complete(info)
             bo1 = 1.0 if info.fmt is MatchFormat.BO1 else 0.0
             bo3 = 1.0 if info.fmt in (MatchFormat.BO3, MatchFormat.BO5) else 0.0
             for team, won in (
@@ -615,24 +674,67 @@ class DeepFeatureIndex:
         lan = is_lan if is_lan is not None else (meta.is_lan if meta is not None else None)
         stage_text = stage if stage is not None else (meta.stage if meta is not None else None)
         info = classify_stage(stage_text)
-        f1 = self._team_block(team1_id, map_name, ts, exclude_match_id, team1_lineup, meta, lan, info.swiss)
-        f2 = self._team_block(team2_id, map_name, ts, exclude_match_id, team2_lineup, meta, lan, info.swiss)
+        kick = _kickoff(meta)
+        # Anchor of the schedule features: the scheduled start of the match (public before it). A live
+        # row computed hours ahead then describes the same "match day" / "days before the match" as the
+        # training row computed at kick-off. Results are still only read strictly before ``as_of``.
+        ref = kick if kick is not None and ts < kick <= ts + _MAX_ANCHOR_AHEAD_S else ts
+        f1 = self._team_block(
+            team1_id, map_name, ts, ref, exclude_match_id, team1_lineup, meta, lan, info.swiss
+        )
+        f2 = self._team_block(
+            team2_id, map_name, ts, ref, exclude_match_id, team2_lineup, meta, lan, info.swiss
+        )
         m: dict[str, float] = info.features()
         m.update(self._matchup(team1_lineup, team2_lineup, map_name, ts, exclude_match_id))
         m["dp_map_days_in_pool"] = self._days_in_pool(map_name, ts)
-        flip = meta is not None and meta.team1_id == team2_id and meta.team2_id == team1_id
-        if self.config.with_market and match_id is not None:
-            m.update(
-                market_features(
-                    self._market.get(match_id, ()),
-                    datetime.fromtimestamp(ts, tz=UTC),
-                    flip=flip,
-                    sharp=self._sharp.get(match_id, ()),
-                )
-            )
-        else:
-            m.update(market_features((), datetime.fromtimestamp(ts, tz=UTC)))
+        m.update(self._market_block(match_id, meta, team1_id, team2_id, ts, kick))
         return f1, f2, m
+
+    def market_reference(self, match_id: int, ts: float, kick: float | None) -> float:
+        """When the market block reads the prices (epoch seconds): ``as_of`` for a live row, a
+        per-match lead before the scheduled start for a kick-off row (``DeepConfig.market_lead_hours``)."""
+        lead = self.config.market_lead_hours
+        if lead is None or kick is None or ts < kick - _KICKOFF_BAND_S:
+            return ts
+        lo, hi = lead
+        return min(ts, kick) - (lo + _unit_hash(match_id) * (hi - lo)) * 3600.0
+
+    def _market_block(
+        self,
+        match_id: int | None,
+        meta: MatchMetaRecord | None,
+        team1_id: int,
+        team2_id: int,
+        ts: float,
+        kick: float | None,
+    ) -> dict[str, float]:
+        """Market features in the row's orientation; all NaN when the orientation is unknown.
+
+        The stored prices are in the match's team1 / team2 order, so the match metadata must say which
+        of the row's teams is the match's team1 (a mirrored training row, a live context). Without it, or
+        when the row's teams are not the match's teams, the block is empty rather than possibly flipped.
+        """
+        empty = market_features((), datetime.fromtimestamp(ts, tz=UTC))
+        empty["mkt_lead_hours"] = NAN
+        if not self.config.with_market or match_id is None or meta is None:
+            return empty
+        if (meta.team1_id, meta.team2_id) == (team1_id, team2_id):
+            flip = False
+        elif (meta.team1_id, meta.team2_id) == (team2_id, team1_id):
+            flip = True
+        else:
+            return empty
+        ref = self.market_reference(match_id, ts, kick)
+        out = market_features(
+            self._market.get(match_id, ()),
+            datetime.fromtimestamp(ref, tz=UTC),
+            flip=flip,
+            sharp=self._sharp.get(match_id, ()),
+        )
+        quoted = not (math.isnan(out["mkt_p_last"]) and math.isnan(out["sharp_p_last"]))
+        out["mkt_lead_hours"] = (kick - ref) / 3600.0 if quoted and kick is not None else NAN
+        return out
 
     # ---------------------------------------------------------------------------- team block
     def _team_block(
@@ -640,6 +742,7 @@ class DeepFeatureIndex:
         team: int,
         map_name: str,
         ts: float,
+        ref: float,
         exclude: int | None,
         lineup: Sequence[int],
         meta: MatchMetaRecord | None,
@@ -651,26 +754,27 @@ class DeepFeatureIndex:
         # -- schedule / fatigue (results)
         tc = self._team.get(team)
         tm = self._team_matches.get(team)
+        # windows end at the match's scheduled start ``ref`` but only hold results before ``ts``
         for days in (3, 7):
             if tc is not None:
-                lo, hi = tc.window(ts, days, exclude)
+                lo, hi = tc.window(ts, days, exclude, ref)
                 out[f"dp_maps_{days}d"] = float(hi - lo)
             else:
                 out[f"dp_maps_{days}d"] = 0.0
             if tm is not None:
-                lo, hi = tm.cum.window(ts, days, exclude)
+                lo, hi = tm.cum.window(ts, days, exclude, ref)
                 out[f"dp_matches_{days}d"] = float(hi - lo)
             else:
                 out[f"dp_matches_{days}d"] = 0.0
-        day_start = math.floor(ts / _DAY) * _DAY
+        day_start = math.floor(ref / _DAY) * _DAY  # UTC day of the match
         same_day = 0
         streak = 0.0
         if tm is not None:
             e = tm.cum.end(ts, exclude)
             if e > 0:
-                out["dp_rest_days"] = max(0.0, (ts - tm.cum.t[e - 1]) / _DAY)
+                out["dp_rest_days"] = max(0.0, (ref - tm.cum.t[e - 1]) / _DAY)
                 days_played = {math.floor(t / _DAY) for t in tm.cum.t[max(0, e - 30) : e]}
-                today = math.floor(ts / _DAY)
+                today = math.floor(ref / _DAY)
                 same_day = sum(1 for t in tm.cum.t[max(0, e - 10) : e] if t >= day_start)
                 d = today - 1
                 while d in days_played:
@@ -678,19 +782,19 @@ class DeepFeatureIndex:
                     d -= 1
         out["dp_play_streak_days"] = streak
         sched = self._sched.get(team)
-        if sched is not None:
-            hi = bisect.bisect_left(sched.t, ts)
+        if sched is not None:  # the public schedule: series scheduled earlier on the match day
+            hi = bisect.bisect_left(sched.t, ref)
             lo = bisect.bisect_left(sched.t, day_start)
             sched_same = sum(1 for k in range(lo, hi) if sched.match_id[k] != exclude)
             same_day = max(same_day, sched_same)
         out["dp_same_day_series"] = float(same_day)
         if tc is not None:
-            lo, hi = tc.window(ts, (ts - day_start) / _DAY, exclude)
+            lo, hi = tc.window(ts, 0.0, exclude, day_start)
             out["dp_maps_today"] = float(hi - lo)
         else:
             out["dp_maps_today"] = 0.0
         # -- travel
-        out.update(self._travel(team, ts, exclude, meta, is_lan))
+        out.update(self._travel(team, ref, exclude, meta, is_lan))
         # -- stakes inside the event
         if meta is not None and meta.tournament_id is not None and tm is not None:
             e = tm.cum.end(ts, exclude)
@@ -762,7 +866,7 @@ class DeepFeatureIndex:
         if coach is not None:
             k = bisect.bisect_left(coach, ts - _DAY)  # changes on days strictly before as_of's day
             if k > 0:
-                since_change = (ts - coach[k - 1]) / _DAY
+                since_change = (ref - coach[k - 1]) / _DAY
                 out["dp_days_since_coach_change"] = since_change
                 out["dp_coach_change_90d"] = 1.0 if since_change <= 90 else 0.0
             else:
@@ -770,8 +874,9 @@ class DeepFeatureIndex:
         return out
 
     def _travel(
-        self, team: int, ts: float, exclude: int | None, meta: MatchMetaRecord | None, is_lan: bool | None
+        self, team: int, ref: float, exclude: int | None, meta: MatchMetaRecord | None, is_lan: bool | None
     ) -> dict[str, float]:
+        """Travel / event features from the public schedule before the match's scheduled start ``ref``."""
         out = {
             "dp_tz_shift": NAN,
             "dp_away_region": NAN,
@@ -794,7 +899,7 @@ class DeepFeatureIndex:
         sched = self._sched.get(team)
         if sched is None:
             return out
-        hi = bisect.bisect_left(sched.t, ts)
+        hi = bisect.bisect_left(sched.t, ref)
         prev: MatchMetaRecord | None = None
         first_at_event: float | None = None
         for k in range(hi - 1, -1, -1):
@@ -808,7 +913,7 @@ class DeepFeatureIndex:
             elif first_at_event is not None or k < hi - 40:
                 break
         if meta.tournament_id is not None:
-            out["dp_days_at_event"] = (ts - first_at_event) / _DAY if first_at_event is not None else 0.0
+            out["dp_days_at_event"] = (ref - first_at_event) / _DAY if first_at_event is not None else 0.0
         if online:
             out["dp_first_after_travel"] = 0.0
         elif prev is not None and place is not None:

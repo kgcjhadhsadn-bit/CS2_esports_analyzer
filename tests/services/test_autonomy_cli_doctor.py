@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from collections.abc import Iterator
+from datetime import timedelta
+from decimal import Decimal
 from pathlib import Path
 from typing import Any, ClassVar
 
@@ -10,8 +12,10 @@ import httpx
 import pytest
 import respx
 from pydantic import SecretStr
+from sqlalchemy import select
 from typer.testing import CliRunner
 
+import cs2bot.db.models as M
 from cs2bot.cli import app
 from cs2bot.config import (
     AutonomySettings,
@@ -25,8 +29,11 @@ from cs2bot.db import state as db_state
 from cs2bot.db.base import Base
 from cs2bot.db.session import make_engine, make_session_factory, reset_engine_cache
 from cs2bot.domain.control import PauseCode
+from cs2bot.executor import FakeExecutor
 from cs2bot.services import doctor
-from cs2bot.services.betting import trusted_markets
+from cs2bot.services.betting import run_betting_cycle, trusted_markets
+from tests.services.conftest import World
+from tests.services.test_services_e2e import live, prepare_market
 
 runner = CliRunner()
 TOKEN = "123:secret"
@@ -121,6 +128,26 @@ def test_doctor_telegram_check() -> None:
     assert probed.level == "ok" and "@cs2_bot" in probed.message and TOKEN not in probed.message
     assert doctor.default_telegram_probe(_settings()) is None
     assert doctor.default_telegram_probe(_settings(telegram=good)) is not None
+    # an @channel works for notifications, but only a numeric chat id may send commands
+    channel = TelegramSettings(enabled=True, bot_token=SecretStr(TOKEN), chat_id="@my_channel")
+    warned = doctor.check_telegram(_settings(telegram=channel))
+    assert warned.level == "warn" and "numeric chat id" in warned.message
+
+
+def test_backtest_writes_the_confidence_guard(tmp_path: Path) -> None:
+    from types import SimpleNamespace
+
+    from cs2bot.cli import _save_confidence_guard
+    from cs2bot.models.confidence import ConfidenceGuard
+
+    settings = Settings()
+    settings.models.confidence_guard_file = tmp_path / "models" / "guard.json"
+    _save_confidence_guard(settings, SimpleNamespace(predictions=[]))
+    assert not settings.models.confidence_guard_file.exists()  # nothing resolved: nothing written
+    records = [SimpleNamespace(market_type="match_winner", p=0.8, y=i % 5 != 0) for i in range(50)]
+    _save_confidence_guard(settings, SimpleNamespace(predictions=records))
+    guard = ConfidenceGuard.load(settings.models.confidence_guard_file)
+    assert "match_winner" in guard.trust and not guard.is_trusted("match_winner")  # far too little history
 
 
 def test_doctor_autonomy_and_credentials(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -172,3 +199,64 @@ def test_trusted_markets_from_a_bundle() -> None:
 
     assert trusted_markets(Bundle()) == {"match_winner", "total_maps"}
     assert trusted_markets(object()) is None and trusted_markets(None) is None
+
+
+def _guard_trusting(*markets: str) -> Any:
+    from cs2bot.models.confidence import ConfidenceGuard, MarketTrust
+
+    guard = ConfidenceGuard.fit([("match_winner", 0.8, 1), ("total_maps", 0.8, 0)])
+    for market in ("match_winner", "total_maps", "map_winner"):
+        guard.trust[market] = MarketTrust(
+            market_type=market,
+            trusted=market in markets,
+            n=500,
+            n_high=100,
+            ece=0.01,
+            high_mean_predicted=0.82,
+            high_observed_rate=0.83,
+            high_ci_high=0.9,
+        )
+    return guard
+
+
+def test_trusted_markets_from_the_confidence_guard_file(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Review round 1: deep_data's per-market trust verdict (ConfidenceGuard, written by `cs2bot
+    backtest`) is the source of ``decision.require_trusted_calibration``."""
+    settings = Settings()
+    settings.models.confidence_guard_file = tmp_path / "guard.json"
+    assert trusted_markets(None, settings) is None  # no guard yet: unknown
+    _guard_trusting("match_winner").save(settings.models.confidence_guard_file)
+    assert trusted_markets(None, settings) == {"match_winner"}
+
+    class Bundle:
+        market_trust: ClassVar[dict[str, Any]] = {"total_maps": True}
+
+    assert trusted_markets(Bundle(), settings) == {"match_winner"}  # the guard file wins
+    settings.models.confidence_guard_file.write_text("{not json", encoding="utf-8")
+    assert trusted_markets(None, settings) is None and "confidence guard" in caplog.text
+
+
+def test_require_trusted_calibration_is_fail_safe_in_the_betting_cycle(world: World, tmp_path: Path) -> None:
+    """With the requirement on, a market type is bet only when the guard trusts it - and with no guard
+    at all nothing is bet (an unknown verdict is not "trusted")."""
+    live(world)
+    mid = world.match_ids[0]
+    prepare_market(world, mid)
+    world.settings.decision.require_trusted_calibration = True
+    world.settings.models.confidence_guard_file = tmp_path / "guard.json"
+    ex = FakeExecutor(balance=Decimal("1000.00"))
+    run_betting_cycle(world.factory, world.settings, ex, world.bundle, now=world.now)
+    assert ex.orders == []
+    with world.factory() as s:
+        rows = list(s.scalars(select(M.BetDecisionRow)))
+    assert rows and not any(r.accepted for r in rows)
+    assert any(any("untrusted_calibration" in reason for reason in r.reasons) for r in rows)
+    # the guard trusts the match winner only: that market type may be bet, the others still not
+    _guard_trusting("match_winner").save(world.settings.models.confidence_guard_file)
+    run_betting_cycle(world.factory, world.settings, ex, world.bundle, now=world.now + timedelta(minutes=1))
+    assert ex.orders, "a trusted, attractive match-winner price must be bet"
+    with world.factory() as s:
+        accepted = [r.spec_key for r in s.scalars(select(M.BetDecisionRow).where(M.BetDecisionRow.accepted))]
+    assert accepted and all(key.startswith("match_winner") for key in accepted), accepted

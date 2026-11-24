@@ -278,10 +278,111 @@ def test_wrong_password_stops_the_retries_until_the_owner_acts(
     blocked = service.run_once(now=T + timedelta(days=2))
     assert "auto-login stopped" in blocked.checks[0].detail
     assert sum(1 for c in fake.calls if c[0] == "auto_login") == 1
-    with session_factory() as s:  # a restart clears the block (corrected credentials)
-        clear_login_block(s, actor="startup")
+    with session_factory() as s:  # a restart does NOT clear it (a crash loop must not hammer Betclic)
+        assert not clear_login_block(s, actor="startup", startup=True)
         s.commit()
-    assert service.run_once(now=T + timedelta(days=2)).resumed == ["login_required"]
+    assert service.run_once(now=T + timedelta(days=3)).login is None
+    with session_factory() as s:  # the owner's resume does (and lifts the pause: re-pause to retry)
+        db_state.set_paused(s, False, actor="telegram")
+        db_state.add_pause_reason(s, PauseCode.LOGIN_REQUIRED, "Betclic login required")
+        s.commit()
+    assert service.run_once(now=T + timedelta(days=3)).resumed == ["login_required"]
+
+
+def test_startup_clears_only_a_block_that_never_reached_betclic(session: Session) -> None:
+    db_state.set_state(session, db_state.AUTO_LOGIN, {"status": "no_credentials", "blocked": True})
+    assert clear_login_block(session, actor="startup", startup=True)  # the owner just added them
+    assert db_state.get_state(session, db_state.AUTO_LOGIN)["blocked"] is False
+    for status in ("bad_credentials", "account_locked", "failed"):
+        db_state.set_state(session, db_state.AUTO_LOGIN, {"status": status, "blocked": True})
+        assert not clear_login_block(session, actor="startup", startup=True)
+        assert db_state.get_state(session, db_state.AUTO_LOGIN)["blocked"] is True
+    assert clear_login_block(session, actor="owner")  # not at start-up: always
+
+
+def test_a_manual_login_clears_an_old_login_back_off(session_factory: sessionmaker[Session]) -> None:
+    """Review round 1: after an SMS step the owner logs in by hand; when the session expires later the
+    auto-login must not wait out the old 4-hour 2FA interval (or a failure back-off)."""
+    _pause(session_factory, PauseCode.LOGIN_REQUIRED, "Betclic login required")
+    fake = FakeExecutor(logged_in=False, auto_login_results=[LoginStatus.TWO_FA_REQUIRED])
+    service = AutonomyService(session_factory, _settings(), fake)
+    service.run_once(now=T)
+    fake.logged_in = True  # the owner typed the SMS code over VNC
+    assert sorted(service.run_once(now=T + timedelta(minutes=30)).resumed) == [
+        "2fa_required",
+        "login_required",
+    ]
+    fake.logged_in = False  # the session expires an hour later
+    _pause(session_factory, PauseCode.LOGIN_REQUIRED, "Betclic login required")
+    later = service.run_once(now=T + timedelta(minutes=90))
+    assert later.login is not None and later.resumed == ["login_required"]
+
+
+def test_unrecognised_login_failures_stop_after_the_limit(session_factory: sessionmaker[Session]) -> None:
+    """Review round 1: an error text the classifier does not know (a reworded "wrong password") was
+    retried for ever with back-off - enough submissions to lock the account. Now at most
+    ``max_login_failures`` submitted failures in a row, then the owner decides."""
+    _pause(session_factory, PauseCode.LOGIN_REQUIRED, "Betclic login required")
+    fake = FakeExecutor(
+        logged_in=False,
+        auto_login_results=[
+            LoginStatus.FAILED,
+            LoginStatus.FORM_NOT_FOUND,  # nothing typed: does not count
+            LoginStatus.FAILED,
+            LoginStatus.FAILED,
+            LoginStatus.LOGGED_IN,
+        ],
+    )
+    service = AutonomyService(
+        session_factory, _settings(max_login_failures=3, login_retry_interval_min=1), fake
+    )
+    when = T
+    for _ in range(4):
+        report = service.run_once(now=when)
+        assert report.login is not None and not report.login.status.logged_in
+        when += timedelta(days=1)  # past any back-off
+    with session_factory() as s:
+        memo = db_state.get_state(s, db_state.AUTO_LOGIN)
+    assert memo["blocked"] is True and memo["submit_failures"] == 3
+    assert "3 submitted logins failed in a row" in memo["message"]
+    stopped = service.run_once(now=when + timedelta(days=5))
+    assert stopped.login is None and "auto-login stopped" in stopped.checks[0].detail
+    assert sum(1 for c in fake.calls if c[0] == "auto_login") == 4
+    alerts = _audits(session_factory, "auto_login")
+    assert alerts[-1]["blocked"] is True
+    from cs2bot.db.models import AuditLog as _Row
+    from cs2bot.services.telegram import format_audit
+
+    text = format_audit(_Row(ts=T, actor="autonomy", action="auto_login", details=alerts[-1]))
+    assert text is not None and "STOPPED" in text and "/resume" in text
+
+
+def test_the_sms_step_resets_the_failure_budget(session_factory: sessionmaker[Session]) -> None:
+    _pause(session_factory, PauseCode.LOGIN_REQUIRED, "Betclic login required")
+    fake = FakeExecutor(
+        logged_in=False,
+        auto_login_results=[LoginStatus.FAILED, LoginStatus.FAILED, LoginStatus.TWO_FA_REQUIRED],
+    )
+    service = AutonomyService(session_factory, _settings(max_login_failures=3), fake)
+    for day in range(3):
+        service.run_once(now=T + timedelta(days=day))
+    with session_factory() as s:
+        memo = db_state.get_state(s, db_state.AUTO_LOGIN)
+    assert memo["status"] == "2fa_required" and memo["submit_failures"] == 0 and not memo["blocked"]
+
+
+def test_a_crashing_auto_login_reports_one_line_only(session_factory: sessionmaker[Session]) -> None:
+    class Crashing(FakeExecutor):
+        def auto_login(self, timeout_s: float | None = None) -> Any:
+            raise RuntimeError('Locator.fill: Timeout\nCall log:\n  - fill("hunter2-secret")')
+
+    _pause(session_factory, PauseCode.LOGIN_REQUIRED, "Betclic login required")
+    report = AutonomyService(session_factory, _settings(), Crashing(logged_in=False)).run_once(now=T)
+    assert report.login is not None and report.login.status is LoginStatus.FAILED
+    assert "hunter2" not in report.login.message and "Locator.fill" in report.login.message
+    with session_factory() as s:
+        assert "hunter2" not in str(db_state.get_state(s, db_state.AUTO_LOGIN))
+    assert all("hunter2" not in str(a) for a in _audits(session_factory, "auto_login"))
 
 
 def test_failed_logins_back_off(session_factory: sessionmaker[Session]) -> None:
@@ -404,6 +505,111 @@ def test_circuit_breaker_opens_after_repeated_resumes(session_factory: sessionma
         db_state.set_paused(s, False, actor="owner")  # ... until the owner resumes
         s.commit()
     assert _codes(session_factory) == []
+
+
+def test_two_codes_tripping_the_breaker_both_stay_held(session_factory: sessionmaker[Session]) -> None:
+    """Review round 1: the circuit_open reason kept a single ``details["code"]``; a second code tripping
+    the breaker overwrote it, so the first code was checked again on every run (auto-login attempts,
+    health checks) and re-opened the breaker each time - a new alert every few minutes."""
+    settings = _settings(circuit_breaker_limit=1)
+    fake = FakeExecutor(logged_in=True)
+    service = AutonomyService(session_factory, settings, fake)
+    now = utcnow()
+    for code in (PauseCode.LOGIN_REQUIRED, PauseCode.SELECTOR_ERROR):
+        _pause(session_factory, code, "x", at=now - timedelta(minutes=30))
+        assert service.run_once(now=now).resumed == [code.value]
+        _pause(session_factory, code, "x again", at=now - timedelta(minutes=20))
+    first = service.run_once(now=now + timedelta(minutes=1))
+    assert sorted(first.circuit_opened) == ["login_required", "selector_error"]
+    executor_calls = len(fake.calls)
+    for i in range(2, 5):
+        later = service.run_once(now=now + timedelta(minutes=i))
+        assert later.resumed == [] and later.login is None
+        assert all(
+            c.detail == "circuit breaker open - waiting for the owner"
+            for c in later.checks
+            if c.code != "circuit_open"
+        )
+    assert len(fake.calls) == executor_calls  # held codes are not checked again (no logins, no health checks)
+    assert len(_audits(session_factory, "circuit_open")) == 2  # one alert per code, not one per run
+    with session_factory() as s:
+        overview = pause_overview(s, settings)
+    assert overview["circuit_codes"] == ["login_required", "selector_error"]
+    assert not any(r["auto_resume"] for r in overview["reasons"])
+
+
+def test_the_owner_resume_restarts_the_breaker_window(session_factory: sessionmaker[Session]) -> None:
+    """After the owner looked at an open breaker and resumed, the next genuine pause may lift itself
+    again (previously the old resumes in the window re-opened the breaker at once)."""
+    settings = _settings(circuit_breaker_limit=2)
+    fake = FakeExecutor(logged_in=True)
+    service = AutonomyService(session_factory, settings, fake)
+    now = utcnow()
+    for i in range(2):
+        _pause(session_factory, PauseCode.LOGIN_REQUIRED, "x")
+        assert service.run_once(now=now + timedelta(seconds=i)).resumed == ["login_required"]
+    _pause(session_factory, PauseCode.LOGIN_REQUIRED, "x")
+    assert service.run_once(now=now + timedelta(seconds=5)).circuit_opened == ["login_required"]
+    with session_factory() as s:
+        db_state.set_paused(s, False, actor="telegram", reason="checked it")
+        s.commit()
+    _pause(session_factory, PauseCode.LOGIN_REQUIRED, "x")
+    later = utcnow() + timedelta(seconds=1)
+    assert service.run_once(now=later).resumed == ["login_required"]
+
+
+def test_pause_writers_lock_the_pause_row(session: Session, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Every read-modify-write of ``system_state["paused"]`` reads the row FOR UPDATE (PostgreSQL), so
+    an auto-resume can never drop a manual pause written concurrently by Telegram / the dashboard."""
+    calls: list[bool] = []
+    real = db_state._pause_row
+
+    def spy(sess: Session, *, lock: bool) -> Any:
+        calls.append(lock)
+        return real(sess, lock=lock)
+
+    monkeypatch.setattr(db_state, "_pause_row", spy)
+    db_state.add_pause_reason(session, PauseCode.LOGIN_REQUIRED, "x")
+    assert calls and calls[0] is True
+    calls.clear()
+    db_state.resolve_pause_reasons(session, ["login_required"], actor="autonomy")
+    assert calls and calls[0] is True
+    calls.clear()
+    db_state.set_paused(session, False, actor="owner")
+    assert calls and calls[0] is True
+    calls.clear()
+    db_state.get_pause_reasons(session)  # plain readers do not lock
+    assert calls == [False]
+
+
+@pytest.mark.postgres
+def test_concurrent_pause_and_auto_resume_on_postgres(pg_session: Session) -> None:
+    import threading
+    import time as _time
+
+    factory = sessionmaker(bind=pg_session.get_bind(), expire_on_commit=False)
+    with factory() as s:
+        db_state.add_pause_reason(s, PauseCode.LOGIN_REQUIRED, "Betclic login required")
+        s.commit()
+    owner = factory()
+    db_state.set_paused(owner, True, actor="telegram", reason="I am watching")  # holds the row lock
+    resumed: list[int] = []
+
+    def auto_resume() -> None:
+        with factory() as s:
+            resumed.append(len(db_state.resolve_pause_reasons(s, ["login_required"], actor="autonomy")))
+            s.commit()
+
+    worker = threading.Thread(target=auto_resume)
+    worker.start()
+    _time.sleep(0.5)
+    assert worker.is_alive()  # waits for the owner's transaction instead of reading a stale state
+    owner.commit()
+    owner.close()
+    worker.join(10)
+    assert resumed == [1]
+    with factory() as s:
+        assert [r.code for r in db_state.get_pause_reasons(s)] == [PauseCode.MANUAL]  # never dropped
 
 
 def test_resumes_outside_the_window_do_not_count(session_factory: sessionmaker[Session]) -> None:

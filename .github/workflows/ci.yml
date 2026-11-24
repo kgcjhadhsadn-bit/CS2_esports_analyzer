@@ -1,5 +1,6 @@
 # Continuous integration: lint + types, tests on Linux (with PostgreSQL and Chromium) and Windows,
-# and the dashboard build. Local equivalent: scripts/test.sh (--pg for the PostgreSQL tests).
+# the dashboard build, and the cloud Docker image (build, self-test, compose smoke test; no push).
+# Local equivalent of the Python part: scripts/test.sh (--pg for the PostgreSQL tests).
 name: CI
 
 on:
@@ -150,3 +151,75 @@ jobs:
       - name: npm run build
         if: steps.present.outputs.present == 'true'
         run: npm run build
+
+  docker:
+    # The VPS deployment (docs/VPS_SETUP.md): build the image exactly as deploy.sh does (no push), run
+    # its self-test (Chromium headful on Xvfb + headless, dashboard, demo tools), then bring up the
+    # whole stack with deploy.sh and exercise HTTPS through Caddy, the dashboard login, backup and
+    # restore. The bot runs with scheduler, executor and Claude switched off: no external services.
+    name: Docker image (build, self-test, compose smoke test)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      COMPOSE_FILE: docker-compose.cloud.yml
+    steps:
+      - uses: actions/checkout@v7
+      - name: Shell scripts (bash -n, shellcheck)
+        run: |
+          for f in deploy/linux/*.sh; do bash -n "$f"; done
+          command -v shellcheck >/dev/null || { sudo apt-get update -q && sudo apt-get install -y -q shellcheck; }
+          shellcheck --version
+          shellcheck -x -S warning deploy/linux/*.sh
+      - name: Test .env
+        run: |
+          {
+            echo "COMPOSE_FILE=docker-compose.cloud.yml"
+            echo "APP_UID=$(id -u)"
+            echo "APP_GID=$(id -g)"
+            echo "POSTGRES_PASSWORD=$(openssl rand -hex 16)"
+            echo "CS2BOT_API__PASSWORD=$(openssl rand -hex 16)"
+            echo "CS2BOT_API__SESSION_SECRET=$(openssl rand -hex 32)"
+            echo "CS2BOT_PUBLIC_HOST=localhost"
+            echo "CS2BOT_TLS_MODE=internal"
+            echo "CS2BOT_EXECUTOR__DRY_RUN=true"
+            echo "CS2BOT_EXECUTOR__ENABLED=false"
+            echo "CS2BOT_SCHEDULER__ENABLED=false"
+            echo "CS2BOT_LLM__ENABLED=false"
+          } > .env
+          chmod 600 .env
+          mkdir -p data logs backups
+      - name: Compose file
+        run: docker compose config --quiet
+      - name: Caddyfile
+        run: |
+          for site in "localhost internal" "bot.example.pl auto"; do
+            set -- $site
+            docker run --rm -e CS2BOT_PUBLIC_HOST="$1" -e CS2BOT_TLS_MODE="$2" \
+              -v "$PWD/deploy/linux/Caddyfile:/etc/caddy/Caddyfile:ro" caddy:2.11.9-alpine \
+              caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile
+          done
+      - name: Build the image
+        run: docker compose build --pull app
+      - name: Image self-test
+        run: docker compose run --rm --no-deps app selftest
+      - name: Compose smoke test
+        run: |
+          bash deploy/linux/deploy.sh --no-build --timeout 600
+          curl -fsS -k --retry 10 --retry-delay 3 --retry-all-errors https://localhost/api/ping
+          curl -fsS -k https://localhost/ | grep -q '<div id="root"'
+          # Through Caddy: Host allow-list, https origin (CSRF) and the session cookie.
+          pw="$(grep '^CS2BOT_API__PASSWORD=' .env | cut -d= -f2)"
+          curl -fsS -k -c cookies.txt -H 'Content-Type: application/json' -H 'X-Requested-With: cs2bot' \
+            -H 'Origin: https://localhost' -d "{\"username\":\"admin\",\"password\":\"$pw\"}" \
+            https://localhost/api/auth/login
+          curl -fsS -k -b cookies.txt -o /dev/null https://localhost/api/health
+          test "$(curl -s -k -o /dev/null -w '%{http_code}' https://localhost/api/health)" = 401
+          bash deploy/linux/backup.sh --label ci
+          bash deploy/linux/restore.sh --yes
+          bash deploy/linux/status.sh
+      - name: Container logs
+        if: failure()
+        run: docker compose logs --no-color --tail=300 || true
+      - name: Clean up
+        if: always()
+        run: docker compose down --volumes --remove-orphans || true

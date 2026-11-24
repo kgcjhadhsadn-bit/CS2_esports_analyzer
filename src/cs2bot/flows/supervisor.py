@@ -10,8 +10,9 @@ Start-up order (:func:`run_up`):
    here: tests inject one through ``executor_factory``;
 4. the Claude context analyzer (disabled without a key: template rationales, no flags);
 4b. cloud autonomy: the Telegram client (``telegram.enabled`` with token + chat id; a "started" message
-   goes out once everything runs) and a reset of a stopped auto-login (a restart is how the owner
-   applies corrected credentials);
+   goes out once everything runs) and a reset of an auto-login that stopped for missing credentials
+   (a wrong password / locked account stays stopped across restarts until the owner resumes, so a
+   crash loop can never hammer the Betclic login form);
 5. the scheduler (``flows.jobs.build_jobs``) and the API on ``settings.api.host:port`` (``api.make_server``
    with ``login_launcher``, ``executor_health_provider``, ``scheduler_status_provider``,
    ``event_remapper``); the dashboard URL is printed.
@@ -52,6 +53,8 @@ EXIT_OK = 0
 EXIT_ERROR = 1
 EXIT_NOT_READY = 2
 SHUTDOWN_BUDGET_S = 75.0
+#: The "stopping" Telegram message gets one try of at most this long (it runs before the shutdown).
+LIFECYCLE_SEND_TIMEOUT_S = 5.0
 API_START_TIMEOUT_S = 30.0
 
 
@@ -266,7 +269,13 @@ def run_up(
         exit_code = EXIT_ERROR
     finally:
         stop.set()
-        _notify_lifecycle(runtime, f"cs2bot is stopping ({'error' if exit_code else 'normal stop'}).")
+        # bounded: Telegram being slow or down must not eat the shutdown budget (docker stop grace period)
+        _notify_lifecycle(
+            runtime,
+            f"cs2bot is stopping ({'error' if exit_code else 'normal stop'}).",
+            attempts=1,
+            timeout_s=LIFECYCLE_SEND_TIMEOUT_S,
+        )
         _shutdown(server, api_thread, scheduler, runtime, executor, analyzer)
         if runtime.telegram is not None:
             _safe_close("telegram", runtime.telegram)
@@ -296,12 +305,13 @@ def _start_telegram(settings: Settings, factory: Callable[[Settings], Any] | Non
 
 
 def _reset_auto_login(session_factory: sessionmaker[Session]) -> None:
-    """A restart re-reads the credentials: a stopped auto-login (wrong password ...) may try again."""
+    """A restart re-reads the credentials: an auto-login stopped for missing credentials may try again
+    (any other stop waits for the owner's resume, see ``services.autonomy.clear_login_block``)."""
     try:
         from cs2bot.services.autonomy import clear_login_block
 
         with session_factory() as session:
-            clear_login_block(session, actor="startup")
+            clear_login_block(session, actor="startup", startup=True)
             session.commit()
     except Exception:
         log.warning("could not reset the auto-login state", exc_info=True)
@@ -328,12 +338,12 @@ def _startup_text(settings: Settings, session_factory: sessionmaker[Session], mo
     return "\n".join(lines)
 
 
-def _notify_lifecycle(runtime: Runtime, text: str) -> None:
+def _notify_lifecycle(runtime: Runtime, text: str, **send_options: Any) -> None:
     client = runtime.telegram
     if client is None or not runtime.settings.telegram.notify_lifecycle:
         return
     try:
-        client.send(text)
+        client.send(text, **send_options)
     except Exception:  # send never raises, but a test double might
         log.warning("could not send the Telegram lifecycle message", exc_info=True)
 

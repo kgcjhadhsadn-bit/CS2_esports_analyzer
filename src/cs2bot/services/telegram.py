@@ -28,7 +28,7 @@ import logging
 import threading
 import time
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from decimal import Decimal
 from typing import Any
@@ -54,6 +54,9 @@ MAX_RETRY_AFTER_S = 30.0
 #: Bet ids remembered per kind (placed / settled) so nothing is announced twice.
 REMEMBERED_IDS = 2000
 NOTIFY_LOOKBACK = timedelta(days=14)
+#: failed job runs remembered (so the overlap of two scans never reports one twice)
+REMEMBERED_JOB_RUNS = 500
+JOB_SCAN_OVERLAP = timedelta(minutes=2)
 
 PLACED_STATUSES = (
     BetStatus.PLACED,
@@ -65,7 +68,28 @@ SETTLED_STATUSES = (BetStatus.WON, BetStatus.LOST, BetStatus.VOID)
 
 
 class TelegramError(RuntimeError):
-    """A Bot API call failed (message already redacted)."""
+    """A Bot API call failed (message already redacted); ``status_code`` of Telegram's answer, if any."""
+
+    def __init__(self, message: str, *, status_code: int | None = None) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+
+
+def truncate_message(text: str, limit: int = MAX_MESSAGE_CHARS) -> str:
+    """``text`` cut to Telegram's limit, counted in UTF-16 code units (an emoji counts twice) to be safe."""
+    if len(text.encode("utf-16-le")) // 2 <= limit:
+        return text
+    tail = "\n[...] (truncated)"
+    budget = limit - len(tail)
+    out: list[str] = []
+    used = 0
+    for ch in text:
+        units = 2 if ord(ch) > 0xFFFF else 1
+        if used + units > budget:
+            break
+        out.append(ch)
+        used += units
+    return "".join(out) + tail
 
 
 def redact(text: str, token: str | None) -> str:
@@ -99,6 +123,9 @@ class TelegramClient:
         self._last_send: float | None = None
         self.last_ok_at: datetime | None = None
         self.last_error: str | None = None
+        #: The last failed send was refused for its content (HTTP 400 not about the chat): sending the
+        #: same text again cannot work, so the notifier skips it instead of retrying it forever.
+        self.last_failure_permanent = False
         self.sent = 0
         self.failed = 0
 
@@ -120,14 +147,24 @@ class TelegramClient:
     def _redact(self, text: str) -> str:
         return redact(text, self._token)
 
-    def call(self, method: str, payload: dict[str, Any], *, timeout_s: float | None = None) -> Any:
+    def call(
+        self,
+        method: str,
+        payload: dict[str, Any],
+        *,
+        timeout_s: float | None = None,
+        attempts: int | None = None,
+    ) -> Any:
         """POST one Bot API method; returns ``result``. Retries network errors, 5xx and 429.
 
-        Raises :class:`TelegramError` (redacted) when it finally fails or Telegram answers ``ok: false``.
+        ``attempts`` (default ``max_retries + 1``) bounds the tries. Raises :class:`TelegramError`
+        (redacted, ``status_code`` set for an HTTP answer) when it finally fails or Telegram answers
+        ``ok: false``.
         """
         if not self._token:
             raise TelegramError("no bot token configured (CS2BOT_TELEGRAM__BOT_TOKEN)")
-        attempts = max(1, self.settings.max_retries + 1)
+        attempts = max(1, self.settings.max_retries + 1 if attempts is None else attempts)
+        last_status: int | None = None
         last = "unknown error"
         for attempt in range(attempts):
             retry_after: float | None = None
@@ -139,6 +176,11 @@ class TelegramClient:
                 )
             except httpx.HTTPError as exc:
                 last = f"{type(exc).__name__}: {self._redact(str(exc))}"[:300]
+            except Exception as exc:
+                # e.g. httpx.InvalidURL (a bad api_base): not retryable. ``from None`` keeps the original
+                # exception - whose text or traceback may carry the URL with the token - out of any log
+                detail = self._redact(str(exc))[:200]
+                raise TelegramError(f"{method}: {type(exc).__name__}: {detail}") from None
             else:
                 body: dict[str, Any] = {}
                 try:
@@ -150,6 +192,7 @@ class TelegramClient:
                     return body.get("result")
                 description = self._redact(str(body.get("description") or response.reason_phrase))[:300]
                 last = f"HTTP {response.status_code}: {description}"
+                last_status = response.status_code
                 if response.status_code == 429:
                     params = body.get("parameters") if isinstance(body.get("parameters"), dict) else {}
                     try:
@@ -157,22 +200,38 @@ class TelegramClient:
                     except (TypeError, ValueError):
                         retry_after = 1.0
                 elif response.status_code < 500:
-                    raise TelegramError(f"{method}: {last}")  # 400 / 401 / 403: retrying cannot help
+                    # 400 / 401 / 403: retrying cannot help
+                    raise TelegramError(f"{method}: {last}", status_code=response.status_code)
             if attempt + 1 < attempts:
                 wait = min(retry_after, MAX_RETRY_AFTER_S) if retry_after is not None else float(2**attempt)
                 self._sleep(wait)
-        raise TelegramError(f"{method}: {last}")
+        raise TelegramError(f"{method}: {last}", status_code=last_status)
 
-    def send(self, text: str, *, chat_id: str | None = None, silent: bool = False) -> bool:
-        """Send a plain-text message; True on success. Never raises (failures are logged, redacted)."""
+    def send(
+        self,
+        text: str,
+        *,
+        chat_id: str | None = None,
+        silent: bool = False,
+        attempts: int | None = None,
+        timeout_s: float | None = None,
+    ) -> bool:
+        """Send a plain-text message; True on success. Never raises (failures are logged, redacted).
+
+        ``attempts`` / ``timeout_s`` bound a message that must not hold anything up (the shutdown
+        message: one try, a short timeout, and it does not wait longer than ``timeout_s`` for another
+        message being sent).
+        """
         target = chat_id or self.settings.chat_id
         if not self.configured or not target:
             return False
-        body = (
-            text if len(text) <= MAX_MESSAGE_CHARS else text[: MAX_MESSAGE_CHARS - 20] + "\n[...] (truncated)"
-        )
+        body = truncate_message(text)
+        self.last_failure_permanent = False
+        lock_wait = -1.0 if timeout_s is None else max(0.0, timeout_s)
         try:
-            with self._send_lock:
+            if not self._send_lock.acquire(timeout=lock_wait):
+                raise TelegramError("another message is still being sent")
+            try:
                 if self._last_send is not None:
                     gap = self.settings.min_send_interval_s - (self._monotonic() - self._last_send)
                     if gap > 0:
@@ -186,12 +245,21 @@ class TelegramClient:
                             "disable_web_page_preview": True,
                             "disable_notification": silent,
                         },
+                        timeout_s=timeout_s,
+                        attempts=attempts,
                     )
                 finally:
                     self._last_send = self._monotonic()
+            finally:
+                self._send_lock.release()
         except Exception as exc:  # TelegramError or anything unexpected: never into the caller
             self.failed += 1
             self.last_error = self._redact(str(exc))[:300]
+            self.last_failure_permanent = (
+                isinstance(exc, TelegramError)
+                and exc.status_code == 400
+                and "chat" not in str(exc).lower()  # "chat not found" etc.: a setting, not this text
+            )
             log.warning("telegram: could not send a message (%s)", self.last_error)
             return False
         self.sent += 1
@@ -311,7 +379,7 @@ def format_audit(row: AuditLog) -> str | None:
                 "Betclic asks for an SMS / 2FA code. The bot stays paused: log in once by hand "
                 "(dashboard login button or VNC). It retries the login later."
             )
-        if status in ("bad_credentials", "account_locked", "no_credentials"):
+        if status in ("bad_credentials", "account_locked", "no_credentials") or d.get("blocked"):
             return f"Betclic auto-login STOPPED ({status}): {d.get('message') or ''} - fix it, then /resume."
         return f"Betclic auto-login failed ({status}): {d.get('message') or ''} - retrying later."
     if action == "bet_uncertain":
@@ -340,6 +408,8 @@ class _Cursor:
     settled_ids: list[int]
     job_check_at: datetime
     job_alerts: dict[str, str]
+    #: failed job runs already handled (alerted or muted by the cooldown), newest last
+    job_run_ids: list[int] = field(default_factory=list)
 
     @classmethod
     def load(cls, raw: dict[str, Any], session: Session, now: datetime) -> _Cursor:
@@ -362,6 +432,7 @@ class _Cursor:
             settled_ids=[int(i) for i in raw.get("settled_ids", []) if isinstance(i, int)],
             job_check_at=when("job_check_at"),
             job_alerts={str(k): str(v) for k, v in (raw.get("job_alerts") or {}).items()},
+            job_run_ids=[int(i) for i in raw.get("job_run_ids", []) if isinstance(i, int)],
         )
 
     def dump(self) -> dict[str, Any]:
@@ -373,6 +444,7 @@ class _Cursor:
             "settled_ids": self.settled_ids[-REMEMBERED_IDS:],
             "job_check_at": self.job_check_at.isoformat(),
             "job_alerts": self.job_alerts,
+            "job_run_ids": self.job_run_ids[-REMEMBERED_JOB_RUNS:],
         }
 
 
@@ -427,8 +499,15 @@ class TelegramNotifier:
             session.commit()
         return sent
 
-    def _send(self, text: str) -> bool:
-        return self.client.send(text)
+    def _send(self, text: str) -> str:
+        """``"sent"``, ``"skipped"`` (Telegram refused this text for good: moving on, so one bad message
+        never blocks every later one) or ``"failed"`` (stop the scan; retried on the next one)."""
+        if self.client.send(text):
+            return "sent"
+        if getattr(self.client, "last_failure_permanent", False):
+            log.warning("telegram: a notification was refused for its content and is skipped")
+            return "skipped"
+        return "failed"
 
     def _audit_events(self, session: Session, cursor: _Cursor, budget: int) -> tuple[bool, int]:
         rows = session.scalars(
@@ -440,9 +519,10 @@ class TelegramNotifier:
             if text is not None:
                 if sent >= budget:
                     return True, sent  # the rest goes out with the next scan
-                if not self._send(text):
+                outcome = self._send(text)
+                if outcome == "failed":
                     return False, sent
-                sent += 1
+                sent += outcome == "sent"
             cursor.audit_id = row.id
         return True, sent
 
@@ -467,10 +547,11 @@ class TelegramNotifier:
                 continue
             if sent >= budget:
                 return True, sent
-            if not self._send(format_bet_placed(session, bet)):
+            outcome = self._send(format_bet_placed(session, bet))
+            if outcome == "failed":
                 return False, sent
             cursor.placed_ids.append(bet.id)
-            sent += 1
+            sent += outcome == "sent"
         return True, sent
 
     def _settled_bets(
@@ -489,37 +570,51 @@ class TelegramNotifier:
                 continue
             if sent >= budget:
                 return True, sent
-            if not self._send(format_settlement(session, bet)):
+            outcome = self._send(format_settlement(session, bet))
+            if outcome == "failed":
                 return False, sent
             cursor.settled_ids.append(bet.id)
-            sent += 1
+            sent += outcome == "sent"
         return True, sent
 
     def _job_failures(
         self, session: Session, cursor: _Cursor, now: datetime, budget: int
     ) -> tuple[bool, int]:
+        # by the time a run FAILED (``finished_at``), not when it started: a long job that was still
+        # running at the previous scan must still be reported. A small overlap covers rows committed a
+        # moment after their ``finished_at``; ``job_run_ids`` keeps a run from being reported twice.
         rows = session.scalars(
             select(JobRun)
-            .where(JobRun.status == JobStatus.FAILED, JobRun.started_at >= cursor.job_check_at)
+            .where(
+                JobRun.status == JobStatus.FAILED,
+                JobRun.finished_at >= cursor.job_check_at - JOB_SCAN_OVERLAP,
+            )
             .order_by(JobRun.id)
         ).all()
         cooldown = timedelta(minutes=self.tg.error_alert_cooldown_min)
+        seen = set(cursor.job_run_ids)
         sent = 0
         for run in rows:
+            if run.id in seen:
+                continue
             last_raw = cursor.job_alerts.get(run.job_name)
             try:
                 last = ensure_utc(datetime.fromisoformat(last_raw)) if last_raw else None
             except ValueError:
                 last = None
-            if last is not None and ensure_utc(run.started_at) - last < cooldown:
+            failed_at = ensure_utc(run.finished_at or run.started_at)
+            if last is not None and failed_at - last < cooldown:
+                cursor.job_run_ids.append(run.id)
                 continue
             if sent >= budget:
                 return True, sent
             text = f"Job {run.job_name} failed: {(run.error or 'no details')[:400]}"
-            if not self._send(text):
+            outcome = self._send(text)
+            if outcome == "failed":
                 return False, sent
-            cursor.job_alerts[run.job_name] = ensure_utc(run.started_at).isoformat()
-            sent += 1
+            cursor.job_alerts[run.job_name] = failed_at.isoformat()
+            cursor.job_run_ids.append(run.id)
+            sent += outcome == "sent"
         cursor.job_check_at = now
         return True, sent
 
@@ -677,14 +772,19 @@ class TelegramCommands:
         self.clock = clock
 
     def _authorised(self, message: dict[str, Any]) -> bool:
-        chat = message.get("chat") if isinstance(message.get("chat"), dict) else {}
+        """Only the configured numeric ``chat_id`` may command the bot.
+
+        Usernames are deliberately not accepted: they can be changed, released and claimed by someone
+        else, while a chat id is fixed. (An ``@channel`` chat id still works for notifications, but then
+        no command is obeyed.)
+        """
+        raw_chat = message.get("chat")
+        chat: dict[str, Any] = raw_chat if isinstance(raw_chat, dict) else {}
         wanted = str(self.settings.telegram.chat_id or "").strip()
-        if not wanted or not chat:
+        chat_id = chat.get("id")
+        if not wanted or isinstance(chat_id, bool) or not isinstance(chat_id, int):
             return False
-        if str(chat.get("id")) == wanted:
-            return True
-        username = chat.get("username")
-        return bool(wanted.startswith("@") and username and f"@{username}".lower() == wanted.lower())
+        return str(chat_id) == wanted
 
     def handle_update(self, update: dict[str, Any], now: datetime | None = None) -> str | None:
         """Execute one update's command; returns the reply (None = nothing to answer / ignored)."""

@@ -324,6 +324,11 @@ class AutonomySettings(BaseModel):
     circuit_breaker_limit: int = 3
     circuit_breaker_window_h: float = 24.0
     login_retry_interval_min: float = 15.0
+    # Submitted auto-logins that neither log in nor reach the SMS step (an unrecognised error message,
+    # no answer) in a row before the auto-login stops until the owner resumes - so a wrong password with
+    # an unknown error text can never lock the account by repetition. A recognised wrong password /
+    # locked account stops at once.
+    max_login_failures: int = Field(default=3, ge=1)
     # A login that stopped at the SMS/2FA step is retried this rarely (every try may send an SMS).
     twofa_retry_interval_min: float = 240.0
     # Re-read the Betclic balance before lifting a balance-mismatch pause (books any remaining

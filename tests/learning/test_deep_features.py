@@ -543,7 +543,8 @@ def test_from_session_loads_every_deep_part(session: Session) -> None:
         session.add(sel)
         session.flush()
         session.add(
-            OddsSnapshot(selection_id=sel.id, odds=odds, captured_at=last.played_at - timedelta(hours=2))
+            # 60 h ahead: visible at every training lead (DeepConfig.market_lead_hours <= 48 h)
+            OddsSnapshot(selection_id=sel.id, odds=odds, captured_at=last.played_at - timedelta(hours=60))
         )
     session.flush()
 
@@ -573,7 +574,7 @@ def test_from_session_attaches_sharp_quotes(session: Session, tmp_path) -> None:
     quotes = [
         {
             "match_id": m.id,
-            "captured_at": (m.played_at - timedelta(hours=1)).isoformat(),
+            "captured_at": (m.played_at - timedelta(hours=60)).isoformat(),
             "team1_odds": 1.5,
             "team2_odds": 2.7,
         }

@@ -74,9 +74,10 @@ def test_shrinker_is_monotone_never_raises_and_round_trips() -> None:
     grid = np.linspace(0.5, 1.0, 401)
     adjusted = s.adjust_many(grid)
     assert np.all(adjusted <= grid + 1e-12)
-    above = grid > 0.75  # non-decreasing above the threshold (at or below it p is returned as is)
-    assert np.all(np.diff(adjusted[above]) >= -1e-9)
-    assert np.array_equal(adjusted[~above], grid[~above])
+    assert np.all(np.diff(adjusted) >= -1e-9)  # non-decreasing everywhere, across the threshold too
+    floor = s.adjust(0.75)  # p == threshold is adjusted (review round 1)
+    below = grid < 0.75  # below the threshold p is kept, capped at the adjusted threshold value
+    assert np.allclose(adjusted[below], np.minimum(grid[below], floor))
     copy = HighConfidenceShrinker.from_dict(s.to_dict())
     assert np.allclose(copy.adjust_many(grid), adjusted)
 

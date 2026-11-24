@@ -81,6 +81,7 @@ from typing import TYPE_CHECKING, Any, Final, Literal
 
 import numpy as np
 import pandas as pd
+from numpy.typing import ArrayLike
 from pydantic import BaseModel, ConfigDict, Field
 
 from cs2bot.config import ModelSettings, Settings, get_settings
@@ -189,6 +190,11 @@ class EnsembleConfig(BaseModel):
     n_bootstrap: int = Field(default=5, ge=0)
     sigma_floor: float | None = None  # None -> settings.models.sigma_floor
     calibration_eps: float = 1e-3
+    # deep_data review: pseudo-wins and pseudo-losses added to the two END plateaus of the isotonic map
+    # (rule of succession). Isotonic regression gives a top block of maps that were all won the value
+    # 1 - eps (0.999) whatever its size - a confident wrong probability waiting to happen. With 1.0 a
+    # top block of 30 won maps calibrates to 31/32 = 0.969. 0 = plain isotonic.
+    calibration_end_prior: float = Field(default=1.0, ge=0.0)
     # average every context prediction with the team-swapped one (orientation-free p, see module docstring)
     symmetric: bool = True
 
@@ -463,7 +469,9 @@ class MapWinEnsemble:
         for name, prefixes in cfg.feature_groups:
             members = [c for c in cols if c.startswith(tuple(prefixes)) and c not in assigned]
             assigned.update(members)
-            with_data = [c for c in members if x_frame[c].notna().any()]
+            # a constant column (all NaN, or 0 counts such as mkt_n_moves without any market data)
+            # cannot change a tree model: a group of only such columns is not worth a CV pass
+            with_data = [c for c in members if x_frame[c].nunique(dropna=True) > 1]
             if with_data:
                 groups[name] = with_data
         summary: dict[str, Any] = {"groups": {}, "base_log_loss": None}
@@ -746,7 +754,8 @@ class MapWinEnsemble:
             return IdentityCalibrator(eps=cfg.calibration_eps).fit(p, y)
         if n_maps < cfg.min_isotonic_rows:
             return PlattCalibrator(eps=cfg.calibration_eps).fit(p, y)
-        return IsotonicCalibrator(eps=cfg.calibration_eps).fit(p, y)
+        iso = IsotonicCalibrator(eps=cfg.calibration_eps).fit(p, y)
+        return temper_isotonic_ends(iso, p, y, prior=cfg.calibration_end_prior)
 
     def _holdout_metrics(
         self, out: Mapping[str, np.ndarray], y: np.ndarray, meta: pd.DataFrame
@@ -1159,6 +1168,49 @@ class MapWinEnsemble:
     @classmethod
     def load(cls, path: str | Path) -> MapWinEnsemble:
         return cls.from_dict(json.loads(Path(path).read_text(encoding="utf-8")))
+
+
+def temper_isotonic_ends(
+    cal: IsotonicCalibrator, p: ArrayLike, y: ArrayLike, *, prior: float = 1.0
+) -> IsotonicCalibrator:
+    """Shrink the end plateaus of a fitted isotonic map toward 1/2 by ``prior`` pseudo-counts each way.
+
+    The top plateau (the highest calibrated value, shared by every probability above its first
+    breakpoint) holds ``n`` fitted samples with ``k`` wins; its value ``k / n`` becomes at most
+    ``(k + prior) / (n + 2 prior)`` - and the bottom plateau symmetrically at least that. Only the
+    ends move, only toward 1/2, and the map stays non-decreasing (lower plateaus are capped by the new
+    top value, higher ones floored by the new bottom value). In place; returns ``cal``.
+    """
+    if prior <= 0 or not cal.fitted or cal.x_.size < 2:
+        return cal
+    pa = np.asarray(p, dtype=float).ravel()
+    ya = np.asarray(y, dtype=float).ravel()
+    ok = np.isfinite(pa) & np.isfinite(ya)
+    pa, ya = pa[ok], ya[ok]
+    xs, ys = cal.x_, np.array(cal.y_, dtype=float)
+    last = ys.size - 1
+    j = last
+    while j > 0 and ys[j - 1] == ys[last]:
+        j -= 1
+    top = pa >= xs[j]
+    if top.any():
+        value = (float(ya[top].sum()) + prior) / (float(top.sum()) + 2.0 * prior)
+        if value < ys[last]:
+            ys[j:] = value
+            for i in range(j - 1, -1, -1):
+                ys[i] = min(ys[i], ys[i + 1])
+    j = 0
+    while j < last and ys[j + 1] == ys[0]:
+        j += 1
+    low = pa <= xs[j]
+    if low.any():
+        value = (float(ya[low].sum()) + prior) / (float(low.sum()) + 2.0 * prior)
+        if value > ys[0]:
+            ys[: j + 1] = value
+            for i in range(j + 1, ys.size):
+                ys[i] = max(ys[i], ys[i - 1])
+    cal.y_ = np.clip(ys, cal.eps, 1.0 - cal.eps)
+    return cal
 
 
 def _nanmean(values: np.ndarray) -> float | None:

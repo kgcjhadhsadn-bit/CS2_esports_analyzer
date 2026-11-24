@@ -22,12 +22,15 @@ calibration. This module provides three things:
    well-populated, well-calibrated bin converges back to ``p``; an over-confident bin is pulled down to
    its observed rate - possibly below the threshold, which then blocks the bet. It never raises a
    probability (under-confident bins are left alone: being too cautious only costs bets).
-   Probabilities at or below ``t`` are returned unchanged.
+   ``p == t`` is adjusted too (review round 1: it used to pass unchanged, so a probability of exactly
+   the threshold escaped an over-confident first bin), and a probability below ``t`` is capped at the
+   adjusted value of ``t`` so the map stays monotone (``p < t`` is never bet anyway).
 3. :class:`MarketTrust` / :func:`assess_market_trust` - a per-market "trusted" flag: enough resolved
-   predictions overall and in the high-confidence range, calibration error within tolerance, and
-   the high-confidence bins not over-confident beyond tolerance (Wilson upper bound of the observed
-   rate at least the mean prediction minus the tolerance). Every failed condition is listed in
-   ``reasons``.
+   predictions overall and in the high-confidence range, calibration error within tolerance, the
+   high-confidence range as a whole within tolerance (observed hit rate at least the mean prediction
+   minus ``high_tolerance`` - a point estimate, so a model has to *show* its calibration), and no
+   populated 2.5-pp bin significantly over-confident (Wilson upper bound below its mean prediction
+   minus the tolerance). Every failed condition is listed in ``reasons``.
 
 :class:`ConfidenceGuard` bundles a shrinker and a trust verdict per market type (fitted from
 ``(market_type, p, y)`` triples, e.g. the backtest's :class:`~cs2bot.backtest.report.PredictionRecord`
@@ -82,6 +85,7 @@ class ConfidenceConfig:
     min_high_predictions: int = 60
     max_ece: float = 0.04
     high_tolerance: float = 0.03
+    min_bin_predictions: int = 20  # a 2.5-pp bin is checked on its own from this many predictions
 
 
 DEFAULT_CONFIDENCE = ConfidenceConfig()
@@ -208,19 +212,26 @@ class HighConfidenceShrinker:
         return self
 
     def adjust(self, p: float) -> float:
-        """The adjusted probability (``p`` itself at or below the threshold, never above ``p``)."""
+        """The adjusted probability: never above ``p``, non-decreasing in ``p``.
+
+        From the threshold up the bin-wise adjustment applies (``p == t`` included). Below it ``p`` is
+        kept, capped at the adjusted value of the threshold so the map stays monotone.
+        """
         t = self.config.threshold
-        if not math.isfinite(p) or p <= t:
+        if not math.isfinite(p):
             return p
-        if not self._centers:  # unfitted: the no-evidence prior
-            return min(p, self._skeptic(p))
+        if not self._centers:  # unfitted: the no-evidence prior (identity below the threshold)
+            return min(p, self._skeptic(p)) if p >= t else p
         # adjusted value at each bin center, made non-decreasing by a running minimum from the top
         # (conservative: an over-confident higher bin also caps the bins below it)
         values = [c + o for c, o in zip(self._centers, self._offsets, strict=True)]
         for i in range(len(values) - 2, -1, -1):
             values[i] = min(values[i], values[i + 1])
+        floor = min(t, values[0])
+        if p < t:
+            return min(p, floor)
         xs = [t, *self._centers]
-        ys = [min(t, values[0]), *values]
+        ys = [floor, *values]
         return float(min(p, np.interp(p, xs, ys)))
 
     def adjust_many(self, p: ArrayLike) -> np.ndarray:
@@ -305,11 +316,17 @@ def assess_market_trust(
         reasons.append(f"only {n_high} predictions >= {cfg.threshold:.2f} (< {cfg.min_high_predictions})")
     if n and not e <= cfg.max_ece:
         reasons.append(f"ECE {e:.3f} > {cfg.max_ece:.3f}")
-    if n_high and not ci_high >= hm - cfg.high_tolerance:
+    if n_high and not ho >= hm - cfg.high_tolerance:
         reasons.append(
             f"over-confident above {cfg.threshold:.2f}: observed {ho:.3f} (95% upper {ci_high:.3f}) "
-            f"vs predicted {hm:.3f}"
+            f"vs predicted {hm:.3f} (tolerance {cfg.high_tolerance:.3f})"
         )
+    for b in high_confidence_reliability(pa, ya, lo=cfg.threshold, width=cfg.bin_width, include_empty=False):
+        if b.count >= cfg.min_bin_predictions and b.ci_high < b.mean_predicted - cfg.high_tolerance:
+            reasons.append(
+                f"bin [{b.lower:.3f}, {b.upper:.3f}) over-confident: observed {b.observed_rate:.3f} "
+                f"(95% upper {b.ci_high:.3f}) vs predicted {b.mean_predicted:.3f} over {b.count}"
+            )
     return MarketTrust(
         market_type=market_type,
         trusted=not reasons,
@@ -378,15 +395,23 @@ class ConfidenceGuard:
         """From objects with ``market_type``, ``p`` and ``y`` (backtest ``PredictionRecord``)."""
         return cls.fit(((r.market_type, r.p, r.y) for r in predictions), config=config)
 
-    def _shrinker(self, market_type: str) -> HighConfidenceShrinker:
-        s = self.shrinkers.get(market_type)
-        if s is None or s.n_high == 0:
-            s = self.shrinkers.get(POOLED, s)
-        return s if s is not None else HighConfidenceShrinker(self.config)
-
     def adjust(self, market_type: str, p: float) -> float:
-        """Conservatively adjusted probability (market's own shrinker; pooled when it has no history)."""
-        return self._shrinker(str(market_type)).adjust(p)
+        """Conservatively adjusted probability.
+
+        The market's own shrinker; while its high-confidence history is thin (fewer than
+        ``min_high_predictions``) the more conservative of its own and the pooled adjustment, so an
+        over-confidence seen across all markets is not ignored for a market with little history.
+        """
+        own = self.shrinkers.get(str(market_type))
+        pooled = self.shrinkers.get(POOLED)
+        if own is None and pooled is None:
+            return HighConfidenceShrinker(self.config).adjust(p)
+        if own is None:
+            return pooled.adjust(p) if pooled is not None else p
+        value = own.adjust(p)
+        if pooled is not None and pooled is not own and own.n_high < self.config.min_high_predictions:
+            value = min(value, pooled.adjust(p))
+        return value
 
     def is_trusted(self, market_type: str) -> bool:
         """True only when the market itself passed :func:`assess_market_trust` (never via the pool)."""

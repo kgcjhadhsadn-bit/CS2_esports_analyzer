@@ -114,11 +114,13 @@ features_for_match_map(ctx, ...)                               # passes ctx.stag
 DeepConfig(format_window_days=365, economy_window_days=180, map_round_window_days=365, clutch_window_days=180,
            duel_window_days=180, map_duel_window_days=365, h2h_window_days=365, min_open_attempts=10,
            min_awp_kills=30, min_awper_share=0.25, swiss_wins_needed=3, swiss_losses_needed=3,
-           with_market=True, team_columns: Literal["diff", "all"] = "diff")
+           with_market=True, team_columns: Literal["diff", "all"] = "diff",
+           market_lead_hours: tuple[float, float] | None = (0.25, 48.0))     # review round 1
 DeepFeatureIndex(records, *, rounds=(), deep=None, patch_timeline=None, config=None)
 index.features(team1_id, team2_id, map_name, as_of, *, match_id=None, exclude_match_id=None, team1_lineup=(),
                team2_lineup=(), is_lan=None, stage=None) -> (team1: dict, team2: dict, match: dict)
-DEEP_TEAM_FEATURES, DEEP_MATCH_FEATURES, deep_feature_names(team_columns="diff") -> list[str]
+index.market_reference(match_id, ts, kick) -> float   # epoch s the market block reads (review round 1)
+DEEP_TEAM_FEATURES, DEEP_MATCH_FEATURES (now incl. "mkt_lead_hours"), deep_feature_names(team_columns="diff")
 
 classify_stage(text) -> StageInfo  (.features() -> stage_* + stakes_level); swiss_situation(wins, losses, ...)
 parse_location(text) -> Place | None; team_home(country, player_countries=()) -> Place | None; tz_shift_hours(a, b)
@@ -148,18 +150,24 @@ sharp_source_from_settings(settings) -> SharpOddsSource              # settings.
 
 ```python
 ConfidenceConfig(threshold=0.75, bin_width=0.025, skeptic_lambda=0.5, prior_strength=50.0, min_predictions=300,
-                 min_high_predictions=60, max_ece=0.04, high_tolerance=0.03)
+                 min_high_predictions=60, max_ece=0.04, high_tolerance=0.03,
+                 min_bin_predictions=20)                                    # review round 1
 high_confidence_reliability(p, y, *, lo=0.75, width=0.025, fold=False, include_empty=True) -> list[HighConfidenceBin]
 high_confidence_report(p, y, *, config=None, fold=False) -> dict      # JSON: n, hit_rate, mean_predicted, gap, bins
 HighConfidenceShrinker(config=None).fit(p, y); .adjust(p) -> float; .adjust_many(p); .to_dict()/.from_dict()
+    # adjust: never above p, non-decreasing; p >= threshold adjusted (p == threshold included), p below
+    # the threshold kept but capped at the adjusted threshold value (review round 1)
 assess_market_trust(market_type, p, y, *, config=None) -> MarketTrust   # .trusted, .reasons, n, n_high, ece, ...
 ConfidenceGuard.fit(records: Iterable[(market_type, p_win, won)], *, config=None)
 ConfidenceGuard.from_predictions(backtest_report.predictions)
-guard.adjust(market_type, p) -> float; guard.is_trusted(market_type) -> bool; guard.reasons(market_type)
+guard.adjust(market_type, p) -> float   # own shrinker; min(own, pooled) while own n_high < min_high_predictions
+guard.is_trusted(market_type) -> bool; guard.reasons(market_type)
 guard.save(path) / ConfidenceGuard.load(path)
 
 EnsembleConfig(..., screen_feature_groups=True, feature_groups=(("deep", (...)), ("market", ("mkt_", "sharp_"))),
-               screen_min_gain=0.0005, screen_z=1.0)   # new fields
+               screen_min_gain=0.0005, screen_z=1.0,   # new fields
+               calibration_end_prior=1.0)              # review round 1: isotonic end plateaus tempered
+temper_isotonic_ends(cal: IsotonicCalibrator, p, y, *, prior=1.0) -> IsotonicCalibrator   # review round 1
 FitReport.high_confidence: dict; FitReport.feature_groups: dict    # new fields (persisted with the bundle)
 BacktestReport.high_confidence: dict; .market_trust: dict; .predictions: list[PredictionRecord] (exclude=True)
 ```
@@ -244,3 +252,102 @@ if require_trusted and not guard.is_trusted(spec.market_type.value): reject("mar
 ## New dependency requests
 
 None.
+
+## Review round 1
+
+Independent review (special focus: look-ahead leakage of every new feature, calibration in the
+0.75-1.0 range, nothing breaks without a PandaScore token). The brief has no Addendum / Review focus
+section beyond that. Every requirement was re-checked against the code, the math re-derived, and the
+fixes below were made in the owned paths with regression tests in
+`tests/learning/test_deep_review.py` (16 tests; existing tests adapted where the behaviour changed
+on purpose).
+
+### What was verified (no change needed)
+
+* **Leakage of the stored data**: every results-like input (maps, rounds, kills, clutches, coach periods,
+  market snapshots, sharp quotes) is read strictly before `as_of`; match metadata (schedule, stage,
+  venue, tournament, format) is static pre-match information; the store's `cutoff` clamps finished
+  matches to their start; the "full history vs history cut at kick-off" test is meaningful (deep columns
+  are filled) and still passes after the fixes. Coach changes become visible the day after the change
+  (date-only data). Betclic live prices are not stored (`store_live_odds=False`), so the market block
+  can never see an in-play price; snapshots keep their selection (remaps after a team-order flip
+  re-key the selection, the price history stays with the team).
+* **Economy / clutch / duel math**: pistol rounds 1 and 13 (MR12), conversion / recovery over the two
+  following rounds, force / eco vs full buy, post-plant (T) vs retake (CT) after a plant, clutch 1v1 vs
+  1vX, opening duels per side, trade share, AWP-vs-AWP duels, pair kills in both directions, area edge.
+* **Stakes**: Swiss elimination / qualification from the record before the match.
+* **HLTV proxy fallback**: direct first, retry through the proxy only on a challenge / 403 / 429 or an
+  active direct cool-down, separate cool-down file and browser profile, never a challenge solver, the
+  proxy URL (credentials) is never logged, `proxy_mode="always"` = classic single route.
+* **PandaScore optional**: every sync returns a "disabled" report without network or DB access, one INFO
+  note per process; services / scheduler / CLI / doctor check the token before building a client;
+  `data_completeness` has no PandaScore component (lineups, recent maps, vetoes, player stats and the
+  odds link all come from HLTV / Betclic); HLTV-only matches get a derived tier, so scope and the tier
+  features work.
+* **Confidence math**: Wilson intervals, bins of 2.5 pp over [0.75, 1] (last bin closed), Beta posterior
+  per bin around the skeptical prior, running minimum from the top (monotone, conservative), JSON
+  round trip. The cloud_autonomy wiring (`services.betting.trusted_markets`, `cli backtest` writing the
+  guard) uses `ConfidenceGuard.load / is_trusted / trust / from_predictions / save`, all unchanged.
+
+### Issues found and fixed
+
+| # | Severity | Issue | Fix |
+|---|---|---|---|
+| 1 | major | **A series still being played counted as won / lost.** A live match already has its first finished maps in the database (`load_map_results` keeps a FINISHED map of a LIVE match). The deep index placed the series at its latest stored map and called it decided as soon as the map score differed: a BO3 at 1-0 was a series *win* for `dp_bo3_series_win`, `dp_bo1_series_win`, `dp_event_wins` / `dp_event_losses` and the Swiss elimination / qualification flags of the team's *next* match - live only (in training every series is complete), i.e. a train / live skew right in the stakes features. | A series is decided only when the stored maps finish it (`_series_complete`: a BO3 needs a team with 2 map wins, BO5 3, BO1 1, BO2 two maps; unknown format = old behaviour). It still counts for the schedule load. |
+| 2 | major | **Market block could be read in the wrong orientation.** `flip` was only set when the match metadata matched the reversed teams; with no metadata (a failed metadata load, a match outside it) or with teams that are not the match's teams, a mirrored training row / live context got team1's price as its own (shown: P = 0.729 for both orientations). | The block needs the metadata and the row's teams must be the match's teams in one order or the other; otherwise every market column is NaN. |
+| 3 | major (calibration) | **Training read the closing line, live reads earlier prices.** Training rows are computed at kick-off, so the market block saw the price minutes before the start (the most accurate one); live, the bot predicts and bets 10 min .. 48 h before the start and sees an earlier, noisier price. A model fitted on closing prices over-trusts early prices - over-confidence exactly in the >= 75 % range. `mkt_hours_since_move` / `mkt_hours_quoted` were also measured to two different reference points. | A kick-off row (`as_of` within 5 min of / after the scheduled start) now reads the market a deterministic per-match lead before the scheduled start, uniform in `DeepConfig.market_lead_hours = (0.25, 48.0)` hours (the betting window of `DecisionSettings`); live rows read the price on offer at `as_of`. New column `mkt_lead_hours` (age of the price relative to the start; NaN without a quote) lets the model learn how much a price is worth by its age. `market_lead_hours=None` restores the old behaviour. Test: a late steam move after the lead never changes a training row. |
+| 4 | major (train / live skew) | **Schedule features anchored to `as_of`.** Live rows are computed hours before the start, training rows at the start, so `dp_rest_days`, `dp_days_at_event`, `dp_days_since_coach_change` (levels), the 3 / 7-day windows, "the same UTC day" of `dp_same_day_series` / `dp_maps_today` / `dp_play_streak_days` described different things live and in training (a prediction made the evening before used the wrong day; a series scheduled earlier on the match day but after `as_of` was not counted). The existing parity test only covered the backtest path (the match in the store, `as_of` clamped to its start). | The schedule anchor is the match's scheduled start (`MatchMetaRecord.scheduled_at`, public before the match; ignored when more than 7 days ahead): windows are `[start - d, as_of)`, rest / event / coach days are measured to the start, the match day is the start's UTC day, scheduled series earlier on that day are counted from the public schedule. Results are still only read before `as_of`. New test: a live row at 08:00 equals the kick-off row when nothing was played in between. |
+| 5 | major (calibration) | **Isotonic calibration gave small extreme blocks 0.999.** Isotonic regression gives the top block of holdout maps that were all won the value `1 - eps` whatever its size (e.g. 30 lopsided maps -> 0.999), which the series simulation turns into near-certain match / handicap probabilities - the costliest kind of error under the confidence rule. (Pre-existing in the ensemble, found while checking the 0.75-1.0 range.) | `temper_isotonic_ends`: the two end plateaus get `EnsembleConfig.calibration_end_prior = 1.0` pseudo-win and pseudo-loss (rule of succession, `(k+1)/(n+2)`), only the ends move, monotonicity kept; 0 = plain isotonic. Holdout log-loss and ECE improved in both seeds (table below). |
+| 6 | minor (calibration) | `HighConfidenceShrinker.adjust` returned `p == threshold` unchanged, so a probability of exactly 0.75 escaped an over-confident first bin and still passed `p >= 0.75`. | `p >= t` is adjusted; below `t` the value is capped at the adjusted threshold value (monotone across the threshold, never above `p`). |
+| 7 | minor (calibration) | Trust verdict was lenient: "over-confident" only when the Wilson *upper* bound of the whole high range was below mean - tolerance (400 predictions at 0.90 winning 80 % passed). | Trusted now also needs the observed hit rate of the high range >= mean prediction - `high_tolerance` (a point estimate) and no 2.5-pp bin with >= `min_bin_predictions` (20) significantly over-confident. Conservative on purpose: `trusted` is what `require_trusted_calibration` relies on. |
+| 8 | minor (calibration) | `ConfidenceGuard.adjust` used a market's own, nearly empty shrinker even when the pooled history showed strong over-confidence. | While a market has fewer than `min_high_predictions` high-confidence predictions, the more conservative of its own and the pooled adjustment is used. |
+| 9 | minor | Stage text: a Major's "Elimination stage" (a Swiss stage) was flagged as an elimination match (stakes 3) on every match; GSL "winners' / losers' match" counted as playoff; "lower bracket round 1" as an opening match; lower-bracket matches were elimination only with a round / final word. | `_ELIM` ignores "elimination stage"; every lower-bracket / losers' match is an elimination; group matches are not playoff; bracket rounds are not "opening". |
+| 10 | minor | The ensemble's group screen ran a full CV pass for a group whose columns are all constant (e.g. `mkt_n_moves` / `mkt_steam` = 0 without any market data). | Only columns with at least two distinct values make a group worth screening. |
+
+### Synthetic retrain after the fixes (requirement 5)
+
+Same setup as above (`generate_universe(n_teams=20, n_matches=1200, days=540, drift_sd_per_30d=0.08)`,
+`synthetic_deep_data`, `EnsembleConfig(holdout_days=90, n_bootstrap=2)`), plus the market block forced in
+(`deep_market_unscreened`). Before -> after the review for the default model:
+
+| seed | variant | log-loss | Brier | ECE | n >= 0.75 | hit rate | mean p |
+|---|---|---|---|---|---|---|---|
+| 7 | baseline / deep / deep_market (screened, identical) | 0.4609 -> **0.4569** | 0.1489 -> 0.1488 | 0.0255 -> **0.0226** | 248 | 0.843 | 0.883 -> **0.878** |
+| 7 | deep_unscreened | 0.4705 -> 0.4668 | 0.1517 | 0.0341 -> 0.0309 | 224 | 0.848 | 0.894 -> 0.888 |
+| 7 | deep_market_unscreened | - -> 0.4690 | 0.1527 | 0.0454 | 234 | 0.855 | 0.882 |
+| 11 | baseline / deep / deep_market (screened, identical) | 0.4161 -> **0.4066** | 0.1300 -> 0.1300 | 0.0375 -> **0.0345** | 267 | 0.906 | 0.909 -> **0.904** |
+| 11 | deep_unscreened | 0.4151 -> 0.4081 | 0.1299 -> 0.1308 | 0.0495 -> 0.0296 | 260 | 0.900 | 0.922 -> 0.908 |
+| 11 | deep_market_unscreened | - -> 0.4022 | 0.1285 | 0.0268 | 254 | 0.898 | 0.910 |
+
+Screen decisions (paired out-of-fold gain +- SE): seed 7 deep -0.0012 +- 0.0013, market (read at the
+lead) +0.0002 +- 0.0013; seed 11 deep -0.0014 +- 0.0015, market +0.0003 +- 0.0011 - all dropped, so the
+default model is the baseline in both seeds. The tempered isotonic ends lower the holdout log-loss by
+0.004 / 0.010 and the ECE by 0.003, and the high-confidence predictions are less over-confident (seed 7:
+mean p 0.878 for a hit rate of 0.843, was 0.883). The market block read at a realistic lead carries
+less signal than the near-closing prices it was trained on before (as expected: the synthetic prices
+are noisier further from the start); forced in it is mixed (worse in seed 7, better in seed 11), which
+is exactly what the screen is for. Feature importance is unchanged (calibration does not touch
+LightGBM; the synthetic metadata has `scheduled_at = played_at`, so the schedule anchor is the same).
+
+### Remaining concerns
+
+* **Probability adjustment not wired.** `services.betting` now reads the guard's `trusted` flags
+  (cloud_autonomy), but nothing calls `ConfidenceGuard.adjust` before the `min_probability` check / the
+  stake tier. Until it is wired (engine.decision / services.betting, not deep_data's paths), the shrinker
+  only shows up in reports. Recommended: `p_adj = guard.adjust(spec.market_type.value, p_win_given_settled)`
+  for the confidence check and the stake tier.
+* **Rest of the row is still computed at kick-off in training** (form, ratings, player aggregates):
+  the review aligned the deep schedule and market blocks; the other blocks keep the existing
+  convention (the difference matters little for 90-365-day aggregates).
+* **Lead distribution is an assumption**: uniform over the betting window. If the bot in practice bets
+  mostly early (as soon as odds appear and p >= 0.75), a lead distribution skewed to 24-48 h would match
+  better (`DeepConfig.market_lead_hours`).
+* **Team home from the current roster**: `load_team_meta` uses today's players' countries when
+  `teams.country` is empty - a small static look-ahead (a team that moved region). `teams.country` from
+  HLTV is preferred and is the usual source.
+* **Trust counts both sides of a two-way market** (and every line of a handicap / total market), so `n`
+  overstates the number of independent events; the per-bin and point-estimate checks partly compensate.
+* **Swiss record per tournament id**: a multi-stage event stored under one tournament id carries the
+  earlier stage's record into the next Swiss stage (no stage boundary in the data).
+* Whole-suite / live checks as before: HLTV, Betclic and PandaScore payloads are unverified against the
+  live services.

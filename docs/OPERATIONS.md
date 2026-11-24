@@ -101,6 +101,15 @@ CS2BOT_TELEGRAM__ENABLED=true          # with BOT_TOKEN (@BotFather) and CHAT_ID
 **The bet rule** (owner decision 2026-11-24): confidence only, odds ignored - a pick is bet when the
 calibrated probability is at least `decision.min_probability` (75%), whatever the odds (even 1.28).
 `decision.min_ev = -1.0` switches the EV check off; set `0.0` for a break-even guard after the 12% tax.
+Until the confidence-tier staking (`bankroll.staking_mode = "confidence_tiers"`) is wired into the stake
+sizing (final review), stakes are still sized with fractional Kelly, which stakes nothing on a pick
+whose EV after tax is not positive - so in practice those picks are recorded but not bet yet.
+
+**Trusted calibration (optional):** `CS2BOT_DECISION__REQUIRE_TRUSTED_CALIBRATION=true` bets a market
+type only when the calibration check of its backtest history trusts it (enough resolved predictions,
+calibrated above 75%). `cs2bot backtest` writes that verdict to `data/models/confidence_guard.json`
+(`models.confidence_guard_file`) and prints the trusted market types. With the setting on and no such
+file, nothing is bet (an unknown verdict is not "trusted").
 
 **Browser on the server:** the Betclic executor runs a *visible* Chromium (`CS2BOT_EXECUTOR__HEADLESS=false`)
 on the Xvfb virtual display of the container (`DISPLAY=:99`) - less bot-like than headless. Without
@@ -128,8 +137,12 @@ audit log and sent to Telegram.
 
 The **kill switch** is not a pause reason: only you turn it off (dashboard, Telegram `/go`, CLI).
 Logins that fail are retried every `LOGIN_RETRY_INTERVAL_MIN` (15 min, doubling after each failure, at
-most once a day); a wrong password, a locked account or missing credentials stop the retries until you
-fix it and resume (or restart the bot).
+most once a day). A wrong password or a locked account (recognised from Betclic's message), or
+`MAX_LOGIN_FAILURES` (3) submitted logins in a row that neither log in nor reach the SMS step (e.g. an
+error text the bot does not recognise), stop the retries until **you resume** (`/resume`, dashboard or
+`cs2bot control resume`) - a restart does not clear them, so a restarting container can never lock the
+account by repeating a wrong password. Missing credentials are the exception: add them to `.env` and
+restart. Your resume also restarts the circuit-breaker count.
 
 ### What still needs you
 
@@ -155,14 +168,15 @@ Messages (each can be switched off with `CS2BOT_TELEGRAM__NOTIFY_*`):
 | `Auto-resume: ...` / `RESUMED automatically` | a reason was resolved / every reason is gone - betting continues |
 | `CIRCUIT BREAKER OPEN for '...'` | a pause kept coming back: check the cause (logs, dashboard Health), then `/resume` |
 | `Betclic asks for an SMS / 2FA code` | log in by hand once (see above) |
-| `Betclic auto-login STOPPED (bad_credentials / account_locked)` | fix the password in `.env` (restart) or check the account at Betclic, then `/resume` |
+| `Betclic auto-login STOPPED (bad_credentials / account_locked / failed)` | fix the password in `.env` (restart) or check the account at Betclic, then `/resume` (a restart alone does not retry) |
 | `KILL SWITCH ON by ...` | all betting stopped until `/go` |
 | `Balance mismatch: ...` | money moved that the bot does not know (deposit, withdrawal, a bet placed by hand); booked automatically |
 | `Unconfirmed placement (UNCERTAIN)` | check "Moje zakłady"; settlement reconciles it |
 | `Job ... failed: ...` | a data job fails (at most one message per job every 6 h); see the Health page / logs |
 | `cs2bot started` / `cs2bot is stopping` | the process started / stops (deploys, reboots) |
 
-Commands (only from `CHAT_ID`; other chats are ignored and logged; commands older than 10 minutes are
+Commands (only from the numeric `CHAT_ID` - an `@channel` id gets notifications but no commands, and
+usernames are never trusted; other chats are ignored and logged; commands older than 10 minutes are
 ignored): `/status`, `/balance`, `/bets`, `/pause [reason]`, `/resume` (lifts every pause, never the
 kill switch), `/stop` (kill switch ON), `/go` (kill switch OFF), `/help`. Test the setup with
 `cs2bot telegram test`.

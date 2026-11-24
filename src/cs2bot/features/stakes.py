@@ -34,7 +34,10 @@ _SEMI: Final = _rx(r"\bsemi[\s\-]*finals?\b|\bsf\b")
 _QUARTER: Final = _rx(r"\bquarter[\s\-]*finals?\b|\bqf\b")
 _LOWER: Final = _rx(r"\blower\b|\blosers?\b|\blb\b")
 _UPPER: Final = _rx(r"\bupper\b|\bwinners?\b|\bub\b")
-_ELIM: Final = _rx(r"\belimination\b|\blosers?[\s\-]*match\b|\bknock[\s\-]*out\b|\bsudden death\b")
+# "Elimination stage" is the name of a Major's Swiss stage, not an elimination match
+_ELIM: Final = _rx(
+    r"\belimination\b(?![\s\-]*stage)|\blosers?[\s\-]*match\b|\bknock[\s\-]*out\b|\bsudden death\b"
+)
 _DECIDER: Final = _rx(r"\bdecider\b|\bdeciding\b")
 _QUALIFY: Final = _rx(
     r"\bqualif\w*\b|\bqualification\b|\blast[\s\-]*chance\b|\blcq\b|\bplay[\s\-]*in\b|\bpromotion\b|\brelegation\b"
@@ -135,21 +138,25 @@ def classify_stage(text: str | None) -> StageInfo:
     quarter = bool(_QUARTER.search(s))
     final = grand or (bool(_FINAL.search(s)) and not semi and not quarter)
     lower = bool(_LOWER.search(s))
-    elimination = bool(_ELIM.search(s)) or (lower and (final or semi or quarter or "round" in s.lower()))
+    upper = bool(_UPPER.search(s))
+    group = bool(_GROUP.search(s))
+    # every lower-bracket / losers' match of a double-elimination bracket or GSL group is an
+    # elimination match; winners' / losers' matches of a GSL *group* are not playoff matches
+    elimination = bool(_ELIM.search(s)) or lower
     return StageInfo(
         grand_final=grand,
         final=final,
         semi=semi,
         quarter=quarter,
-        playoff=bool(_PLAYOFF.search(s)) or grand or semi or quarter or lower or bool(_UPPER.search(s)),
+        playoff=bool(_PLAYOFF.search(s)) or grand or semi or quarter or ((lower or upper) and not group),
         lower_bracket=lower,
-        upper_bracket=bool(_UPPER.search(s)),
+        upper_bracket=upper,
         elimination=elimination,
         decider=bool(_DECIDER.search(s)),
         qualification=bool(_QUALIFY.search(s)),
         swiss=bool(_SWISS.search(s)),
-        group=bool(_GROUP.search(s)),
-        opening=bool(_OPENING.search(s)),
+        group=group,
+        opening=bool(_OPENING.search(s)) and not (lower or upper),  # "lower bracket round 1" is no opener
         low_stakes=bool(_LOW_STAKES.search(s)),
     )
 

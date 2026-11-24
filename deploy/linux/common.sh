@@ -114,7 +114,7 @@ compose() {
 
 # Container id of a compose service ("" when it does not exist).
 service_container() {
-    compose ps -q "$1" 2>/dev/null | head -n 1
+    compose ps --all -q "$1" 2>/dev/null | head -n 1
 }
 
 service_health() {

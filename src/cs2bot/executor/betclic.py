@@ -471,6 +471,8 @@ class BetclicExecutor:
         """
         self._ensure_open()
         wait_s = self.settings.executor.login_submit_timeout_s if timeout_s is None else timeout_s
+        secrets: tuple[str, ...] = ()
+        submitted = False
         try:
             page = self._session.ensure_page()
             self._goto(page, self._safe_url(self.selectors.urls.login))
@@ -484,6 +486,7 @@ class BetclicExecutor:
                     "username and password)",
                 )
             username, password, source = credentials
+            secrets = (password.get_secret_value(), username)
             t = self.tuning
             if self.selectors.probe(page, "login_username_input") is None:
                 button = self.selectors.try_resolve(page, "login_button", t.element_timeout_s)
@@ -503,14 +506,20 @@ class BetclicExecutor:
             pass_field.first.fill(password.get_secret_value())
             self._pacer.pause(0.4)
             submit = self.selectors.try_resolve(page, "login_submit_button", t.optional_timeout_s)
+            submitted = True  # counted from here on, even if the click itself fails (conservative)
             if submit is not None:
                 submit.first.click()
             else:
                 pass_field.first.press("Enter")
             log.info("submitted the Betclic login form (credentials from %s)", source)
             attempt = self._await_login_outcome(page, wait_s)
-        except (BrowserStartError, ProfileLockedError, PlaywrightError, OSError, ValueError) as exc:
+        except Exception as exc:  # any failure is an outcome here, never an exception
+            # Playwright's call log (``fill("<value>")``) can carry the typed password; _short_error keeps
+            # the first line only and _scrub removes the credentials from whatever is left
             attempt = self._login_attempt(LoginStatus.FAILED, f"browser error: {_short_error(exc)}")
+        attempt = attempt.model_copy(
+            update={"message": _scrub(attempt.message, secrets), "submitted": submitted}
+        )
         log.log(
             logging.INFO if attempt.status.logged_in else logging.WARNING,
             "Betclic auto-login: %s (%s)",
@@ -2742,6 +2751,13 @@ def _attribute_values(locator: Locator, names: list[str]) -> tuple[str, ...]:
         if value:
             values.append(value)
     return tuple(values)
+
+
+def _scrub(text: str, secrets: tuple[str, ...]) -> str:
+    """``text`` with every non-trivial secret (password, username) replaced by ``<redacted>``."""
+    for secret in sorted((x for x in secrets if x and len(x) >= 3), key=len, reverse=True):
+        text = text.replace(secret, "<redacted>")
+    return text
 
 
 def _short_error(exc: BaseException) -> str:

@@ -104,9 +104,29 @@ def _combine(existing: str, new: str) -> str:
     return combined
 
 
-def get_pause_reasons(session: Session) -> list[PauseReason]:
-    """The active pause reasons, oldest first (empty when the bot is not paused)."""
-    row = session.get(SystemState, PAUSED)
+def _pause_row(session: Session, *, lock: bool) -> SystemState | None:
+    """The ``paused`` row; ``lock=True`` reads it ``SELECT ... FOR UPDATE`` (fresh from the database).
+
+    Every read-modify-write of the pause reasons locks the row first: the auto-resume service (fast lane),
+    the Telegram commands (telegram lane), the dashboard (API thread) and the betting / settlement code
+    change it from different threads and transactions. Without the lock, PostgreSQL's READ COMMITTED lets
+    two writers both read ``[a]`` and write back their own version - e.g. an auto-resume removing ``a``
+    could silently drop a ``manual`` pause the owner added a millisecond earlier and unpause the bot.
+    SQLite (tests, development) ignores ``FOR UPDATE``; production runs PostgreSQL. Writers that also
+    change another ``system_state`` row (``set_paused`` -> ``auto_login``) lock ``paused`` first, so the
+    lock order is the same everywhere (no deadlock).
+    """
+    if lock:
+        return session.get(SystemState, PAUSED, with_for_update=True, populate_existing=True)
+    return session.get(SystemState, PAUSED)
+
+
+def get_pause_reasons(session: Session, *, lock: bool = False) -> list[PauseReason]:
+    """The active pause reasons, oldest first (empty when the bot is not paused).
+
+    ``lock=True`` locks the row for the rest of the transaction (used by every writer below).
+    """
+    row = _pause_row(session, lock=lock)
     if row is None:
         return []
     st = dict(row.value or {})
@@ -186,7 +206,7 @@ def add_pause_reason(
     pcode = parse_pause_code(code)
     when = ensure_utc(at) if at is not None else utcnow()
     msg = _bounded(message.strip() or pcode.value)
-    reasons = get_pause_reasons(session)
+    reasons = get_pause_reasons(session, lock=True)
     was_paused = bool(reasons)
     current = next((r for r in reasons if r.code is pcode), None)
     if current is not None:
@@ -219,7 +239,7 @@ def resolve_pause_reasons(
     ``set_paused(False)``. Flushes, never commits.
     """
     wanted = {parse_pause_code(c) for c in codes}
-    reasons = get_pause_reasons(session)
+    reasons = get_pause_reasons(session, lock=True)
     removed = [r for r in reasons if r.code in wanted]
     if not removed:
         return []
@@ -244,11 +264,17 @@ def set_paused(
     if on:
         add_pause_reason(session, code, reason, actor=actor, replace=True)
         return
-    previous = get_pause_reasons(session)
+    previous = get_pause_reasons(session, lock=True)
     _write_reasons(session, [], actor=actor)
     login = get_state(session, AUTO_LOGIN)
-    if login.get("blocked"):  # the owner has looked at it: automatic logins may try again
-        set_state(session, AUTO_LOGIN, {**login, "blocked": False, "failures": 0}, actor=actor)
+    if login.get("blocked") or login.get("submit_failures"):
+        # the owner has looked at it: automatic logins may try again (with a fresh failure budget)
+        set_state(
+            session,
+            AUTO_LOGIN,
+            {**login, "blocked": False, "failures": 0, "submit_failures": 0},
+            actor=actor,
+        )
     audit(
         session,
         actor=actor,

@@ -626,7 +626,9 @@ def run_betting_cycle(
             executor if settings.executor.enabled else None,
             bundle,
             report,
-            cycle=_Cycle(start=now, should_stop=should_stop, trusted_markets=trusted_markets(bundle)),
+            cycle=_Cycle(
+                start=now, should_stop=should_stop, trusted_markets=trusted_markets(bundle, settings)
+            ),
             dry=dry,
             analyzer=analyzer,
             max_prediction_age=max_prediction_age,
@@ -758,6 +760,10 @@ def _bet_match(
         for p in priced:
             by_event[p.quote.bookmaker_event_id].append(p)
         decisions: list[BetDecision] = []
+        trusted = cycle.trusted_markets
+        if trusted is None and dec_settings.require_trusted_calibration:
+            # required but unknown (no confidence guard written yet): nothing is trusted - fail safe
+            trusted = set()
         for event_id, items in by_event.items():
             info = decision.load_match_decision_info(
                 session,
@@ -774,7 +780,7 @@ def _bet_match(
                     settings=dec_settings,
                     betclic=settings.betclic,
                     now=now,
-                    trusted_markets=cycle.trusted_markets,
+                    trusted_markets=trusted,
                 )
             )
         bet_specs: dict[str, set[str]] = defaultdict(set)
@@ -1082,15 +1088,21 @@ def _place_one(
     return _sizing_state(session, settings, now=now, dry=dry)
 
 
-def trusted_markets(bundle: Any) -> set[str] | None:
-    """Market types whose calibration the model bundle marks as trusted, or ``None`` when unknown.
+def trusted_markets(bundle: Any, settings: Settings | None = None) -> set[str] | None:
+    """Market types whose calibration is trusted, or ``None`` when unknown (decision: no check).
 
-    Used only with ``decision.require_trusted_calibration``. TODO(final review): deep_data exposes the
-    per-market "trusted" verdict (``cs2bot.models.confidence`` / ``BacktestReport.market_trust``); wire
-    its final attribute here once docs/dev/reports/deep_data.md documents it. Until then a bundle
-    attribute ``market_trust`` (``{market_type: {"trusted": bool}}`` or ``{market_type: bool}``) is read
-    when present; otherwise ``None`` = no check.
+    Source, in this order: deep_data's confidence guard (``cs2bot.models.confidence.ConfidenceGuard``,
+    written by ``cs2bot backtest`` to ``models.confidence_guard_file``): the market types whose own
+    resolved predictions passed ``assess_market_trust`` (``guard.is_trusted``); else a bundle attribute
+    ``market_trust`` (``{market_type: {"trusted": bool}}`` or ``{market_type: bool}``, e.g. a
+    ``BacktestReport.market_trust``). Enforced only with ``decision.require_trusted_calibration``, and
+    then an unknown set means "nothing trusted" (see ``_bet_match``). A malformed guard file is logged
+    and ignored (never aborts a cycle).
     """
+    if settings is not None:
+        guard = load_confidence_guard(settings)
+        if guard is not None:
+            return {str(m) for m in guard.trust if guard.is_trusted(str(m))}
     trust = getattr(bundle, "market_trust", None)
     if not isinstance(trust, dict):
         return None
@@ -1100,6 +1112,21 @@ def trusted_markets(bundle: Any) -> set[str] | None:
         if ok is True:
             out.add(str(market))
     return out
+
+
+def load_confidence_guard(settings: Settings) -> Any | None:
+    """The persisted :class:`~cs2bot.models.confidence.ConfidenceGuard`; ``None`` if missing / unreadable."""
+    from cs2bot.models.confidence import ConfidenceGuard
+    from cs2bot.utils.paths import resolve_path
+
+    path = resolve_path(settings.models.confidence_guard_file)
+    if not path.is_file():
+        return None
+    try:
+        return ConfidenceGuard.load(path)
+    except Exception as exc:  # a broken file must never stop betting decisions from being made
+        log.warning("could not read the confidence guard %s (%s): ignored", path, type(exc).__name__)
+        return None
 
 
 def _repeated_uncertain_reason(session: Session, bet: Bet) -> str | None:

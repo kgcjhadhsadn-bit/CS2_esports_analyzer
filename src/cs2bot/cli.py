@@ -730,6 +730,25 @@ def backtest(
     if output is not None:
         output.write_text(text, encoding="utf-8")
         typer.echo(f"written to {output}")
+    _save_confidence_guard(s, report)
+
+
+def _save_confidence_guard(s: Settings, report: Any) -> None:
+    """Persist deep_data's per-market confidence guard (trusted flags) from the backtest's resolved
+    predictions to ``models.confidence_guard_file``; ``decision.require_trusted_calibration`` reads it."""
+    predictions = list(getattr(report, "predictions", None) or [])
+    if not predictions:
+        typer.echo("confidence guard not updated: the backtest resolved no predictions")
+        return
+    from cs2bot.models.confidence import ConfidenceGuard
+    from cs2bot.utils.paths import resolve_path
+
+    guard = ConfidenceGuard.from_predictions(predictions)
+    path = guard.save(resolve_path(s.models.confidence_guard_file))
+    trusted = sorted(m for m in guard.trust if m != "*" and guard.is_trusted(m))
+    typer.echo(
+        f"confidence guard written to {path}; trusted market types: {', '.join(trusted) or 'none yet'}"
+    )
 
 
 # -------------------------------------------------------------------------------------------- executor

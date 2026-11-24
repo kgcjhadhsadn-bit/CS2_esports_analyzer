@@ -124,9 +124,9 @@ The installer opens `C:\cs2bot\.env` in Notepad (later: `notepad C:\cs2bot\.env`
 | `CS2BOT_BANKROLL__MAX_MATCH_EXPOSURE_FRACTION` | Most money at risk on one match (`0.04` = 4%). |
 | `CS2BOT_BANKROLL__DAILY_LOSS_LIMIT_FRACTION` / `..._WEEKLY_...` | When the day's (week's) losses reach this share, the bot pauses itself (`0.05` / `0.10`). |
 | `CS2BOT_BANKROLL__MAX_BETS_PER_DAY` | Upper limit of bets per day (`10`). Low numbers look less like a bot to Betclic. |
-| `CS2BOT_DECISION__MIN_PROBABILITY`, `..._MIN_EV` | How sure the model must be (`0.75`) and the minimum expected value after tax (`0.03` = +3%). Raising them means fewer, safer-looking bets. |
+| `CS2BOT_DECISION__MIN_PROBABILITY`, `..._MIN_EV` | How sure the model must be (`0.75`) and the minimum expected value after tax. The owner's rule since 2026-11-24 is "confidence only, odds ignored": `MIN_EV=-1.0` switches the EV check off; `0.0` would demand at least break-even after the 12% stake tax. Raising them means fewer bets. |
 | `CS2BOT_EXECUTOR__DRY_RUN` | **Leave `true` for now.** `true` = bets are simulated, no money moves. |
-| `CS2BOT_BETCLIC__CREDENTIALS_SOURCE` | `none` (default): you type your Betclic login yourself each time a login is needed. `keyring`: the login window pre-fills it from Windows Credential Manager (entry `cs2bot-betclic`). Avoid `env` (it stores the password in plain text in `.env`). The bot never submits the form or 2FA for you. |
+| `CS2BOT_BETCLIC__CREDENTIALS_SOURCE` | `none` (default): you type your Betclic login yourself each time a login is needed. `keyring`: the login window pre-fills it from Windows Credential Manager (entry `cs2bot-betclic`). Avoid `env` (it stores the password in plain text in `.env`). The bot never submits the form or 2FA for you (unless you turn on `CS2BOT_AUTONOMY__AUTO_LOGIN`, meant for the unattended VPS; even then it never types an SMS / 2FA code). |
 | `CS2BOT_HLTV__PROXY_URL` | Optional residential proxy for the big HLTV history download, so your home IP is not rate-limited by HLTV (`http://user:pass@host:port`). |
 | `CS2BOT_API__PASSWORD` | Leave empty. A dashboard password is only needed if you ever make the dashboard reachable from other devices (not recommended). |
 
@@ -238,8 +238,9 @@ immediately without stopping the bot, use the **kill switch** on the dashboard (
 **The risks, plainly:**
 
 - **No system wins every bet.** CS2 has real variance (clutches, eco-round upsets, overtime, off
-  days). The bot only bets when its probability is high *and* the price is profitable after tax,
-  but high-probability bets still lose regularly, and losing streaks happen. Judge it over hundreds
+  days). The bot only bets when its calibrated probability is high (75%+; since 2026-11-24 the odds are
+  not a criterion, so at low odds the 12% stake tax can make a bet lose money on average), and
+  high-probability bets still lose regularly, and losing streaks happen. Judge it over hundreds
   of bets (ROI, closing-line value), never over a few days.
 - **Betclic's terms of service forbid bots and automated betting.** If Betclic detects it, it can
   limit or close the account and **withhold the balance**. This is the account you use, so keep

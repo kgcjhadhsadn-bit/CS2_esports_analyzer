@@ -50,6 +50,7 @@ def test_auto_login_fills_and_submits_the_form(
     with caplog.at_level(logging.DEBUG):
         attempt = executor.auto_login()
     assert attempt.status is LoginStatus.LOGGED_IN, attempt.message
+    assert attempt.submitted
     assert site.state.login_submits == 1 and site.state.login_payloads == [
         {"username": USER, "password": PASSWORD}
     ]
@@ -111,6 +112,46 @@ def test_auto_login_without_an_answer_fails_after_the_timeout(
     site.state.login_mode = "silent"
     attempt = make_executor(settings=_with_credentials(executor_settings)).auto_login(timeout_s=1.0)
     assert attempt.status is LoginStatus.FAILED and "no login outcome" in attempt.message
+    assert attempt.submitted  # counts towards autonomy.max_login_failures
+
+
+@pytest.mark.browser
+@requires_chromium
+def test_a_browser_error_never_leaks_the_credentials(
+    site: MockBetclicServer,
+    make_executor: ExecutorFactory,
+    executor_settings: Settings,
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Review round 1: Playwright's call log contains ``fill("<value>")``; an error raised after the
+    form was filled must not carry the password / username into the attempt (logged, stored in the
+    database, sent to Telegram). Any exception is an outcome, never raised."""
+    from playwright.sync_api import Error as PlaywrightError
+
+    site.state.logged_in = False
+    executor = make_executor(settings=_with_credentials(executor_settings))
+
+    def boom(page: object, timeout_s: float) -> object:
+        raise PlaywrightError(
+            f'Locator.fill: fill("{PASSWORD}") for {USER} failed\nCall log: fill("{PASSWORD}")'
+        )
+
+    monkeypatch.setattr(executor, "_await_login_outcome", boom)
+    with caplog.at_level(logging.DEBUG):
+        attempt = executor.auto_login()
+    assert attempt.status is LoginStatus.FAILED and attempt.submitted
+    assert PASSWORD not in attempt.message and USER not in attempt.message
+    assert "<redacted>" in attempt.message
+    _no_secrets(caplog)
+
+    def other(page: object, timeout_s: float) -> object:
+        raise RuntimeError(f"unexpected {PASSWORD}")
+
+    monkeypatch.setattr(executor, "_await_login_outcome", other)
+    site.state.logged_in = False  # the mock accepted the first submit
+    attempt = executor.auto_login()
+    assert attempt.status is LoginStatus.FAILED and PASSWORD not in attempt.message
 
 
 @pytest.mark.browser
@@ -121,7 +162,7 @@ def test_auto_login_without_credentials_submits_nothing(
     site.state.logged_in = False
     attempt = make_executor().auto_login()  # credentials_source "none"
     assert attempt.status is LoginStatus.NO_CREDENTIALS and attempt.status.stops_retrying
-    assert site.state.login_submits == 0
+    assert site.state.login_submits == 0 and not attempt.submitted
 
 
 @pytest.mark.browser

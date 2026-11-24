@@ -10,6 +10,7 @@ not a pause reason at all.
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from datetime import datetime
 from enum import StrEnum
 from typing import Any
@@ -115,3 +116,25 @@ class LoginAttempt(BaseModel):
     status: LoginStatus
     message: str = ""
     at: datetime
+    #: True when the credentials were actually submitted to Betclic (counts towards
+    #: ``autonomy.max_login_failures`` unless it logged in or reached the SMS step).
+    submitted: bool = False
+
+
+def circuit_codes(reasons: Iterable[PauseReason]) -> set[str]:
+    """The pause codes an open circuit breaker holds (``circuit_open`` reason ``details``).
+
+    ``details["codes"]`` lists every code the breaker tripped for; ``details["code"]`` (the latest one) is
+    read too, for entries written before the list existed.
+    """
+    out: set[str] = set()
+    for r in reasons:
+        if r.code is not PauseCode.CIRCUIT_OPEN:
+            continue
+        listed = r.details.get("codes")
+        if isinstance(listed, list):
+            out.update(str(c) for c in listed if c)
+        single = r.details.get("code")
+        if single:
+            out.add(str(single))
+    return out

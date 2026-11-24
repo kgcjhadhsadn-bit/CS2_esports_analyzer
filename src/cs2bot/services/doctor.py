@@ -229,13 +229,17 @@ def check_telegram(settings: Settings, *, probe: Callable[[], dict[str, object]]
     ]
     if missing:
         return Check("telegram", "fail", f"enabled but {' and '.join(missing)} not set")
-    if not str(tg.chat_id).lstrip("-").isdigit() and not str(tg.chat_id).startswith("@"):
+    chat = str(tg.chat_id).strip()
+    if not chat.lstrip("-").isdigit() and not chat.startswith("@"):
         return Check("telegram", "fail", "chat id must be a number (from @userinfobot) or @channelname")
+    # commands are obeyed only from a numeric chat id (usernames can change hands)
+    level: Literal["ok", "warn"] = "warn" if chat.startswith("@") and tg.commands_enabled else "ok"
+    note = " - commands (/pause, /stop ...) need the numeric chat id" if level == "warn" else ""
     if probe is None:
-        return Check("telegram", "ok", f"token set, chat id {tg.chat_id}")
+        return Check("telegram", level, f"token set, chat id {tg.chat_id}{note}")
     me = probe()
     name = me.get("username") if isinstance(me, dict) else None
-    return Check("telegram", "ok", f"bot @{name} reachable, chat id {tg.chat_id}")
+    return Check("telegram", level, f"bot @{name} reachable, chat id {tg.chat_id}{note}")
 
 
 def default_telegram_probe(settings: Settings) -> Callable[[], dict[str, object]] | None:

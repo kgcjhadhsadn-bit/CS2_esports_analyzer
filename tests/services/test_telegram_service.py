@@ -288,12 +288,108 @@ def test_job_failures_are_rate_limited_per_job(session_factory: sessionmaker[Ses
                     job_name="ingest_results_hltv",
                     status=JobStatus.FAILED,
                     started_at=t0 + timedelta(minutes=minutes),
+                    finished_at=t0 + timedelta(minutes=minutes, seconds=30),
                     error="HLTVBlockedError: challenge",
                 )
             )
         s.commit()
     assert notifier.scan_once(now=t0 + timedelta(minutes=71)) == 2
     assert sent_texts(route) == ["Job ingest_results_hltv failed: HLTVBlockedError: challenge"] * 2
+    assert notifier.scan_once(now=t0 + timedelta(minutes=72)) == 0  # the scan overlap reports nothing twice
+
+
+@respx.mock
+def test_a_long_job_failing_after_the_scan_is_still_reported(session_factory: sessionmaker[Session]) -> None:
+    """Review round 1: failures were looked up by ``started_at`` >= last scan, so a job that was still
+    running at the previous scan (e.g. a 20-minute retrain) and failed afterwards was never reported."""
+    route = respx.post(SEND_URL).mock(return_value=ok())
+    settings = full_settings()
+    notifier = TelegramNotifier(session_factory, settings, TelegramClient(settings.telegram))
+    t0 = utcnow()
+    with session_factory() as s:
+        run = JobRun(
+            job_name="models_retrain", status=JobStatus.RUNNING, started_at=t0 - timedelta(minutes=10)
+        )
+        s.add(run)
+        s.commit()
+        run_id = run.id
+    notifier.scan_once(now=t0)  # the retrain is still running
+    with session_factory() as s:
+        row = s.get(JobRun, run_id)
+        assert row is not None
+        row.status, row.finished_at, row.error = JobStatus.FAILED, t0 + timedelta(minutes=5), "MemoryError"
+        s.commit()
+    assert notifier.scan_once(now=t0 + timedelta(minutes=6)) == 1
+    assert sent_texts(route) == ["Job models_retrain failed: MemoryError"]
+
+
+@respx.mock
+def test_a_message_telegram_refuses_is_skipped_not_retried_forever(
+    session_factory: sessionmaker[Session],
+) -> None:
+    """Review round 1: a 400 for one message's content used to stop the notifier on that event forever
+    (every later event was never sent). A 400 about the chat (a setting) is still retried."""
+    refused = httpx.Response(400, json={"ok": False, "description": "Bad Request: message is too long"})
+    route = respx.post(SEND_URL).mock(side_effect=[refused, ok(), ok()])
+    settings = full_settings(max_retries=0)
+    notifier = TelegramNotifier(session_factory, settings, TelegramClient(settings.telegram, sleep=Sleeps()))
+    notifier.scan_once()
+    with session_factory() as s:
+        db_state.set_paused(s, True, actor="telegram", reason="break")
+        db_state.set_paused(s, False, actor="telegram", reason="back")
+        db_state.set_kill_switch(s, True, actor="telegram", reason="stop")
+        s.commit()
+    assert notifier.scan_once() == 2  # the refused one is skipped, the next two go out
+    assert [t.split()[0] for t in sent_texts(route)[1:]] == ["RESUMED", "KILL"]
+    assert notifier.scan_once() == 0
+
+
+@respx.mock
+def test_a_chat_error_is_retried_on_the_next_scan(session_factory: sessionmaker[Session]) -> None:
+    chat_missing = httpx.Response(400, json={"ok": False, "description": "Bad Request: chat not found"})
+    route = respx.post(SEND_URL).mock(side_effect=[chat_missing, ok()])
+    settings = full_settings(max_retries=0)
+    client = TelegramClient(settings.telegram, sleep=Sleeps())
+    notifier = TelegramNotifier(session_factory, settings, client)
+    notifier.scan_once()
+    with session_factory() as s:
+        db_state.set_kill_switch(s, True, actor="telegram", reason="stop")
+        s.commit()
+    assert notifier.scan_once() == 0 and not client.last_failure_permanent
+    assert notifier.scan_once() == 1 and sent_texts(route)[-1].startswith("KILL SWITCH ON")
+
+
+def test_an_unexpected_transport_error_is_wrapped_and_redacted() -> None:
+    class Exploding(httpx.Client):
+        def post(self, url: Any, **kwargs: Any) -> httpx.Response:  # type: ignore[override]
+            raise ValueError(f"cannot parse {url}")
+
+    client = TelegramClient(tg_settings(), http=Exploding(), sleep=Sleeps())
+    with pytest.raises(TelegramError) as info:
+        client.call("getMe", {})
+    assert TOKEN not in str(info.value) and "<token>" in str(info.value)
+    assert info.value.__cause__ is None and info.value.__suppress_context__
+    assert client.send("x") is False and TOKEN not in (client.last_error or "")
+
+
+def test_messages_are_truncated_in_utf16_units() -> None:
+    from cs2bot.services.telegram import MAX_MESSAGE_CHARS, truncate_message
+
+    emoji = "\U0001f3c6"  # outside the BMP: two UTF-16 code units
+    text = emoji * 3000  # 3000 code points, 6000 UTF-16 units
+    out = truncate_message(text)
+    assert len(out.encode("utf-16-le")) // 2 <= MAX_MESSAGE_CHARS and out.endswith("(truncated)")
+    assert truncate_message("short") == "short"
+
+
+@respx.mock
+def test_a_bounded_send_gives_up_quickly() -> None:
+    """The shutdown message: one try, short timeout (Telegram down must not eat the shutdown budget)."""
+    route = respx.post(SEND_URL).mock(return_value=httpx.Response(502, text="bad gateway"))
+    sleeps = Sleeps()
+    client = TelegramClient(tg_settings(max_retries=5), sleep=sleeps)
+    assert client.send("bye", attempts=1, timeout_s=2.0) is False
+    assert route.call_count == 1 and sleeps.calls == []
 
 
 def test_format_audit_covers_the_control_events() -> None:
@@ -396,6 +492,29 @@ def test_other_chats_and_stale_commands_are_ignored(
         assert not db_state.is_kill_switch_on(s)
 
 
+@pytest.mark.parametrize(
+    "chat",
+    [
+        {"id": 999, "type": "private", "username": "owner"},  # username matches an "@owner" chat id
+        {"id": "424242", "type": "private"},  # a string id is not what Telegram sends
+        {"id": True},
+        {"username": "owner"},
+        "424242",
+    ],
+)
+def test_only_the_numeric_chat_id_may_command_the_bot(
+    session_factory: sessionmaker[Session], chat: Any
+) -> None:
+    """Review round 1: a chat whose *username* matched an ``@name`` chat id was obeyed; usernames can
+    be changed and re-registered by someone else, so only the numeric chat id counts now."""
+    for wanted in ("@owner", CHAT):
+        cmd = _commands(session_factory, chat_id=wanted)
+        update = {"update_id": 5, "message": {"chat": chat, "text": "/go", "date": int(time.time())}}
+        assert cmd.handle_update(update) is None
+    with session_factory() as s:
+        assert db_state.get_state(s, db_state.KILL_SWITCH) == {}
+
+
 @respx.mock
 def test_poll_once_answers_and_persists_the_offset(session_factory: sessionmaker[Session]) -> None:
     updates = respx.post(UPDATES_URL).mock(
@@ -466,11 +585,13 @@ def test_run_up_sends_startup_and_shutdown_messages(tmp_path: Path) -> None:
     class Recorder:
         def __init__(self) -> None:
             self.texts: list[str] = []
+            self.options: list[dict[str, Any]] = []
             self.closed = False
             self.last_error: str | None = None
 
-        def send(self, text: str, **_: Any) -> bool:
+        def send(self, text: str, **options: Any) -> bool:
             self.texts.append(text)
+            self.options.append(options)
             return True
 
         def status(self) -> dict[str, Any]:
@@ -500,8 +621,11 @@ def test_run_up_sends_startup_and_shutdown_messages(tmp_path: Path) -> None:
     assert recorder.texts[0].startswith("cs2bot started. Betting mode: DRY RUN")
     assert "Autonomy on" in recorder.texts[0]
     assert recorder.texts[-1] == "cs2bot is stopping (normal stop)." and recorder.closed
+    assert recorder.options[-1] == {"attempts": 1, "timeout_s": 5.0}  # never eats the shutdown budget
     with factory() as s:
-        assert db_state.get_state(s, db_state.AUTO_LOGIN)["blocked"] is False  # a restart may try again
+        # review round 1: a wrong password stays stopped across restarts (a crash-looping container must
+        # not submit it again and again); only the owner's resume clears it
+        assert db_state.get_state(s, db_state.AUTO_LOGIN)["blocked"] is True
     engine.dispose()
 
 
