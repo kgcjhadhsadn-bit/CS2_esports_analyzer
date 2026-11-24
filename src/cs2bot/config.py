@@ -14,7 +14,7 @@ stored in the ``system_state`` table (key ``config_overrides``) and merged by
 
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, time
 from decimal import Decimal
 from functools import lru_cache
 from pathlib import Path
@@ -183,9 +183,9 @@ class DecisionSettings(BaseModel):
     """Bet only if ALL checks pass (PLAN.md section 6)."""
 
     min_probability: float = 0.75
-    # Break-even guard only (owner decision 2026-11-24): bet whenever the model is confident and the
-    # price is not a loss after the 12% stake tax. No extra "value" margin.
-    min_ev: float = 0.0
+    # Owner decision 2026-11-24: bet on confidence only, the odds are not a criterion. -1.0 disables the
+    # EV check (EV per unit staked can never be below -1). Set 0.0 to restore a break-even guard.
+    min_ev: float = -1.0
     max_sigma: float = 0.05
     min_data_completeness: float = 0.95
     min_event_link_confidence: float = 0.90
@@ -196,6 +196,10 @@ class DecisionSettings(BaseModel):
     prefer_known_veto: bool = True
     market_overrides: dict[str, MarketThresholds] = Field(default_factory=dict)
     disabled_markets: list[str] = Field(default_factory=list)
+    # Require the calibration layer's per-market "trusted" flag (enough history, calibrated within
+    # tolerance in the 0.75-1.0 range) before betting a market type. Only enforced when the caller
+    # passes the trusted set to ``engine.decision.evaluate`` (see docs/dev/reports/cloud_autonomy.md).
+    require_trusted_calibration: bool = False
 
 
 class BankrollSettings(BaseModel):
@@ -208,6 +212,13 @@ class BankrollSettings(BaseModel):
     weekly_loss_limit_fraction: float = 0.10
     max_bets_per_day: int = 10
     stake_step: Decimal = Decimal("0.10")
+    # How stakes are sized. "confidence_tiers" (owner decision 2026-11-24) ignores the odds: the stake is
+    # a fraction of the bankroll chosen by the calibrated probability; "kelly" is fractional Kelly.
+    staking_mode: Literal["confidence_tiers", "kelly"] = "confidence_tiers"
+    # (minimum probability, fraction of bankroll); the highest tier whose minimum is met applies.
+    confidence_tiers: list[tuple[float, float]] = Field(
+        default_factory=lambda: [(0.75, 0.01), (0.85, 0.015), (0.92, 0.02)]
+    )
 
 
 class ExecutorSettings(BaseModel):
@@ -239,6 +250,12 @@ class ExecutorSettings(BaseModel):
     potential_win_min_ratio: float = 0.70
     potential_win_max_ratio: float = 1.05
     journal_retention_days: float = 60.0  # placement-journal records older than this are ignored
+    # Linux server without a desktop: a visible (headless=false) browser needs an X display (Xvfb,
+    # DISPLAY=:99 on the VPS). With no DISPLAY / WAYLAND_DISPLAY set the browser falls back to
+    # headless instead of failing to start; false = fail loudly instead.
+    headless_without_display: bool = True
+    # Auto-login (cloud autonomy): seconds to wait for the outcome after submitting the login form.
+    login_submit_timeout_s: float = 30.0
 
 
 class APISettings(BaseModel):
@@ -260,6 +277,77 @@ class APISettings(BaseModel):
     @property
     def is_loopback(self) -> bool:
         return self.host in ("127.0.0.1", "localhost", "::1")
+
+
+AUTO_RESUME_DEFAULT_REASONS: list[str] = [
+    "loss_limit_daily",
+    "loss_limit_weekly",
+    "uncertain_bet",
+    "login_required",
+    "2fa_required",
+    "balance_mismatch",
+    "selector_error",
+    "executor_unavailable",
+]
+
+
+class AutonomySettings(BaseModel):
+    """Unattended operation (PLAN.md 0b): auto-login, auto-resume of automatic pauses, circuit breaker.
+
+    Disabled by default (tests, the Windows PC); the VPS ``.env`` turns it on. The kill switch and a
+    manual pause are never lifted automatically, whatever is configured here.
+    """
+
+    enabled: bool = False
+    # Fill AND submit the Betclic login form with the saved credentials (betclic.credentials_source
+    # env/keyring) when the session is logged out. Stops at an SMS/2FA step (never automated).
+    auto_login: bool = False
+    # Master switch of the auto-resume policy and the pause reasons it may lift.
+    auto_resume: bool = True
+    auto_resume_reasons: list[str] = Field(default_factory=lambda: list(AUTO_RESUME_DEFAULT_REASONS))
+    check_interval_min: float = 5.0
+    # Circuit breaker: the same reason may auto-resume at most this many times per window; one more
+    # and the bot stays paused (circuit_open) until the owner resumes.
+    circuit_breaker_limit: int = 3
+    circuit_breaker_window_h: float = 24.0
+    login_retry_interval_min: float = 15.0
+    # A login that stopped at the SMS/2FA step is retried this rarely (every try may send an SMS).
+    twofa_retry_interval_min: float = 240.0
+    # Re-read the Betclic balance before lifting a balance-mismatch pause (books any remaining
+    # difference as a RECONCILIATION entry). Without a readable balance the entry booked when the
+    # mismatch was found is accepted.
+    balance_recheck: bool = True
+
+
+class TelegramSettings(BaseModel):
+    """Send-only notifications + owner commands through a Telegram bot (Bot API over HTTPS).
+
+    Create the bot with @BotFather (token) and read your chat id with @userinfobot. Commands are
+    accepted only from ``chat_id``; everything else is ignored and logged.
+    """
+
+    enabled: bool = False
+    bot_token: OptionalSecret = None
+    chat_id: OptionalStr = None  # numeric id (negative for groups) or @channelname
+    api_base: str = "https://api.telegram.org"
+    daily_report_time: time = time(21, 0)  # Europe/Warsaw
+    # which events to send
+    notify_bets: bool = True
+    notify_dry_run_bets: bool = True
+    notify_settlements: bool = True
+    notify_control: bool = True  # pause / resume / auto-resume / circuit breaker / kill switch / login
+    notify_errors: bool = True  # failing jobs (rate-limited per job), executor problems
+    notify_lifecycle: bool = True  # startup / shutdown
+    daily_report: bool = True
+    commands_enabled: bool = True
+    # transport
+    request_timeout_s: float = 15.0
+    max_retries: int = 3
+    min_send_interval_s: float = 1.1  # Telegram allows about one message per second per chat
+    poll_timeout_s: int = 5  # getUpdates long-poll timeout (short: shutdown waits for it)
+    poll_session_s: float = 600.0  # one scheduler run of the command poller lasts this long
+    notify_interval_s: int = 30  # how often new events are looked up in the database
+    error_alert_cooldown_min: float = 360.0
 
 
 class SchedulerSettings(BaseModel):
@@ -305,6 +393,8 @@ class Settings(BaseSettings):
     executor: ExecutorSettings = Field(default_factory=ExecutorSettings)
     api: APISettings = Field(default_factory=APISettings)
     scheduler: SchedulerSettings = Field(default_factory=SchedulerSettings)
+    autonomy: AutonomySettings = Field(default_factory=AutonomySettings)
+    telegram: TelegramSettings = Field(default_factory=TelegramSettings)
 
     @model_validator(mode="after")
     def _validate(self) -> Settings:

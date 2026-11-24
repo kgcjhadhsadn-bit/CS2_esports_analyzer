@@ -15,7 +15,8 @@
 | Markets | **Every pre-match CS2 market Betclic offers**, analyzed in full detail |
 | Live (in-play) betting | **No**, pre-match only |
 | AI role | Statistical / simulation model computes probabilities; Claude adds news context and writes rationales |
-| Bet rule | **Confidence first, no value margin** (owner decision 2026-11-24): bet when the calibrated probability is >= 75% and the price is at least break-even after the 12% stake tax (EV >= 0, no extra margin). Any odds qualify, e.g. 1.28 when the model is ~89%+ sure |
+| Bet rule | **Confidence only, odds ignored** (owner decision 2026-11-24, replaces the break-even guard): bet when the calibrated probability is >= 75%, whatever the odds (`decision.min_ev = -1.0` disables the EV check). Owner informed that at low odds the 12% stake tax makes some of these bets lose money on average |
+| Staking | **Tiered by confidence**, not Kelly: 75-85% sure = 1% of bankroll, 85-92% = 1.5%, 92%+ = 2%; per-match 4%, daily -5% and weekly -10% limits unchanged |
 | Data sources | **HLTV (+ demos) is the primary source; PandaScore is optional** (its terms forbid odds-related use and its stats plans exclude betting customers); runs fully without a token |
 | Staking | **¼ Kelly + hard caps**, loss limits, kill switch |
 | Execution | **Fully automatic** bet placement on the **owner's own Betclic.pl account** |
