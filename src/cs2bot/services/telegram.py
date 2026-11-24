@@ -57,6 +57,10 @@ NOTIFY_LOOKBACK = timedelta(days=14)
 #: failed job runs remembered (so the overlap of two scans never reports one twice)
 REMEMBERED_JOB_RUNS = 500
 JOB_SCAN_OVERLAP = timedelta(minutes=2)
+#: Job kinds (``api.health.job_kind``) whose staleness the watchdog reports: the money path.
+WATCHED_JOB_KINDS = frozenset({"odds", "predict", "bet", "settle"})
+#: A job RUNNING longer than this blocks its lane (a betting cycle with human-like pacing takes minutes).
+STUCK_JOB_AFTER = timedelta(minutes=45)
 
 PLACED_STATUSES = (
     BetStatus.PLACED,
@@ -326,6 +330,11 @@ def format_bet_placed(session: Session, bet: Bet) -> str:
     ]
     if decision is not None:
         lines.append(f"p {decision.p_win:.3f}, EV {decision.ev:+.3f}")
+    extra = bet.extra or {}
+    confidence, fraction = extra.get("p_settled"), extra.get("stake_fraction")
+    if isinstance(confidence, (int, float)) and isinstance(fraction, (int, float)) and fraction > 0:
+        # the owner's rule: confidence (after the high-confidence guard) decides the stake tier
+        lines.append(f"confidence {confidence:.1%} -> stake {fraction:.1%} of the bankroll")
     if bet.external_bet_id:
         lines.append(f"Betclic id {bet.external_bet_id}")
     return "\n".join(lines)
@@ -484,6 +493,9 @@ class TelegramNotifier:
                 sent, budget = sent + n, budget - n
             if ok and self.tg.notify_errors:
                 ok, n = self._job_failures(session, cursor, when, budget)
+                sent, budget = sent + n, budget - n
+            if ok and self.tg.notify_errors:
+                ok, n = self._watchdog(session, cursor, when, budget)
                 sent += n
             db_state.set_state(
                 session,
@@ -616,6 +628,63 @@ class TelegramNotifier:
             cursor.job_run_ids.append(run.id)
             sent += outcome == "sent"
         cursor.job_check_at = now
+        return True, sent
+
+    def _watchdog(self, session: Session, cursor: _Cursor, now: datetime, budget: int) -> tuple[bool, int]:
+        """Alert when the money path silently stops (final review, Lens C).
+
+        A failing job is reported by :meth:`_job_failures`, but on the unattended VPS two silent states
+        reached nobody: a money-path job whose last success is too old (e.g. the odds collector
+        "succeeding" while Betclic blocks the IP no longer counts - it fails - but a job that stopped
+        running at all, a dead lane, does not fail) and a job hanging in RUNNING (a stuck browser call
+        blocks the whole fast lane: no odds, no bets, no settlement). Uses the dashboard's own
+        :func:`cs2bot.api.health.job_health`; one alert per job and problem per
+        ``telegram.error_alert_cooldown_min``.
+        """
+        from cs2bot.api.health import job_health
+
+        try:
+            jobs = job_health(session, self.settings.scheduler, now)
+        except Exception:  # a health read must never break notifications
+            log.warning("telegram: the job watchdog could not read the job health", exc_info=True)
+            return True, 0
+        cooldown = timedelta(minutes=self.tg.error_alert_cooldown_min)
+        sent = 0
+        for job in jobs:
+            problems: list[tuple[str, str]] = []
+            stuck = job.status is JobStatus.RUNNING and job.age_s > STUCK_JOB_AFTER.total_seconds()
+            if job.kind in WATCHED_JOB_KINDS and job.stale and not stuck:
+                age = job.last_success_age_s
+                shown = f"{age / 60:.0f} min ago" if age is not None else "never"
+                problems.append(
+                    ("stale", f"Job {job.name} has not succeeded for too long (last success {shown})")
+                )
+            if stuck:
+                problems.append(
+                    (
+                        "stuck",
+                        f"Job {job.name} has been running for {job.age_s / 60:.0f} min - stuck? "
+                        "Its lane is blocked",
+                    )
+                )
+            for code, text in problems:
+                key = f"watchdog:{code}:{job.name}"
+                last_raw = cursor.job_alerts.get(key)
+                try:
+                    last = ensure_utc(datetime.fromisoformat(last_raw)) if last_raw else None
+                except ValueError:
+                    last = None
+                if last is not None and now - last < cooldown:
+                    continue
+                if sent >= budget:
+                    return True, sent
+                outcome = self._send(
+                    text + " (cs2bot doctor / dashboard Health; restart the app if it persists)"
+                )
+                if outcome == "failed":
+                    return False, sent
+                cursor.job_alerts[key] = now.isoformat()
+                sent += outcome == "sent"
         return True, sent
 
     # ------------------------------------------------------------------ daily report

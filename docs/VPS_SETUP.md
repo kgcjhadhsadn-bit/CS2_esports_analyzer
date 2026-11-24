@@ -189,12 +189,16 @@ nano /opt/cs2bot/.env
 | `CS2BOT_BANKROLL__STARTING_BANKROLL` | the money on the Betclic account reserved for the bot, e.g. `1000.00` | |
 | `CS2BOT_BANKROLL__*_LIMIT_*`, `MAX_BETS_PER_DAY` | daily -5% / weekly -10% loss limits, bets per day | defaults follow PLAN.md |
 | `CS2BOT_DECISION__MIN_PROBABILITY` | `0.75` | the bet rule: bet when the model is at least 75% sure, whatever the odds |
+| `CS2BOT_DECISION__REQUIRE_PROFITABLE_WIN` | `true` | skips only odds below 1.137, where a WIN pays back less than the stake after the 12% tax (`false` = odds fully ignored) |
+| `CS2BOT_BANKROLL__STAKING_MODE` / `CONFIDENCE_TIERS` | `confidence_tiers` / 75% -> 1%, 85% -> 1.5%, 92% -> 2% | the stake by confidence ([section 10](#10-dry-run-smoke-test-then-going-live)) |
+| `CS2BOT_DECISION__USE_CONFIDENCE_GUARD` | `true` | probabilities above 75% are shrunk where the backtest shows the model was too sure (weekly refresh, automatic) |
 | `CS2BOT_EXECUTOR__DRY_RUN` | **`true`** | keep it `true` until the smoke test in [section 10](#10-dry-run-smoke-test-then-going-live) passed |
 | `CS2BOT_AUTONOMY__ENABLED`, `CS2BOT_AUTONOMY__AUTO_LOGIN`, `CS2BOT_TELEGRAM__ENABLED` | `true` (already set) | unattended operation |
 | `CS2BOT_PUBLIC_HOST`, `CS2BOT_TLS_MODE` | set by the script (`bot.example.pl` + `auto`, or the IP + `internal`) | |
 | `CS2BOT_API__PASSWORD` | generated - this is your **dashboard password** | user name: `CS2BOT_API__USERNAME` (`admin`) |
 | `POSTGRES_PASSWORD`, `CS2BOT_API__SESSION_SECRET`, `APP_UID`, `APP_GID`, `COMPOSE_FILE` | generated - leave them alone | changing `POSTGRES_PASSWORD` later does not change the existing database's password |
 | `RCLONE_REMOTE` (optional) | e.g. `b2:cs2bot-backups` | off-site copy of the backups ([section 13](#13-backups-and-restore)) |
+| `CADDY_IPV4`, `FRONTEND_SUBNET` (optional) | `172.30.250.10`, `172.30.250.0/24` | Caddy's fixed address on the internal Docker network (the bot trusts only its forwarding headers). Change both only if `deploy.sh` fails with "Pool overlaps with other one on this address space"; then `docker compose down` (never `-v`) and `deploy.sh` |
 
 **Quotes:** if a value contains a `$` sign (or spaces), wrap it in **single quotes**:
 `CS2BOT_BETCLIC__PASSWORD='my$ecret pass'`. Docker would otherwise treat `$ecret` as a variable.
@@ -267,6 +271,11 @@ docker logs -f cs2bot-backfill        # progress (Ctrl+C stops following)
 - When it is finished (`docker ps -a` shows it as "Exited (0)"): `docker rm cs2bot-backfill`. The
   **nightly retrain** (05:00) trains on the new data; to train right away:
   `docker compose exec app cs2bot models train` and then `docker compose restart app`.
+- Calibration: once Betclic prices of at least 40 finished matches are stored (the odds collector
+  runs from the first start, so after a few weeks), the weekly `confidence_guard_refresh` job runs a
+  backtest and writes `data/models/confidence_guard.json` by itself. Until then the bot uses a cautious
+  default (stakes stay in the lower tiers). `docker compose exec app cs2bot doctor` shows its state;
+  `docker compose exec app cs2bot backtest --from 2026-06-01 --to 2026-11-01` runs one by hand.
 - HLTV may block a server that reads too much (Cloudflare). The bot then waits and retries by
   itself. A residential proxy for HLTV (`CS2BOT_HLTV__PROXY_URL` in `.env`, then `deploy.sh`) is used
   as a fallback while the server's own IP is blocked (`CS2BOT_HLTV__PROXY_MODE=after_block`, the
@@ -300,9 +309,16 @@ the slip again. Let it run like this for a day or two:
 **kill switch** (dashboard, Telegram `/stop`; `/go` turns it off again).
 
 **The bet rule** (your decision, 2026-11-24): the bot bets when its calibrated probability is at least
-75%, **whatever the odds** - also at 1.28. Stakes follow the confidence tiers (1% / 1.5% / 2% of the
-bankroll). At very low odds the 12% stake tax can make such a bet lose money on average even when it
-wins most of the time; you chose this knowingly.
+75%, **whatever the odds** - also at 1.28. Stakes follow the confidence tiers: 75-85% sure = 1% of the
+bankroll, 85-92% = 1.5%, 92%+ = 2% (never more than 4% on one match, the daily -5% / weekly -10% limits
+still apply). At low odds the 12% stake tax can make such a bet lose money on average even when it
+wins most of the time; you chose this knowingly. One exception was added in the final review and is
+on by default: below **1.137** even a *winning* bet pays back less than its stake (at 1.10 a win
+returns 0.968 per 1 PLN), so such prices are skipped (`CS2BOT_DECISION__REQUIRE_PROFITABLE_WIN=false`
+turns this off). Before the 75% check and the tier, probabilities above 75% pass through the
+**confidence guard**: without any backtest yet a pick keeps half of its excess over 75% (0.95 counts
+as 0.85), so stakes start cautious; once the weekly backtest has enough history the guard follows the
+model's real hit rate above 75%.
 
 ## 11. Betclic and the server's IP address
 
@@ -449,9 +465,9 @@ Run it with bash: `bash /opt/cs2bot/deploy/linux/deploy.sh`.
 ### The bot does not become healthy
 
 `deploy/linux/logs.sh app` shows why. Typical: a typo in `.env` (the bot names the setting), the
-database is not ready (`deploy/linux/logs.sh postgres`), or the first model training is still
-running (the bot only answers after it; `deploy.sh` waits up to 20 minutes). `status.sh --doctor`
-lists every check.
+database is not ready (`deploy/linux/logs.sh postgres`), or the migrations are still retrying. The
+first model training runs in the background (the dashboard answers meanwhile; predictions and bets
+start once it finishes - the log says "models: trained ..."). `status.sh --doctor` lists every check.
 
 ### The dashboard does not open / certificate errors
 

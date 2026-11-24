@@ -17,6 +17,7 @@ from __future__ import annotations
 import logging
 from collections.abc import Callable
 from datetime import datetime, timedelta
+from typing import Any
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -118,8 +119,23 @@ def load_historical_data(
     with_rounds: bool = True,
     with_player_maps: bool = False,
     result_delay: timedelta = timedelta(hours=1),
+    with_deep: bool = False,
+    sharp: Any = None,
 ) -> HistoricalData:
-    """Every training record in ``[since, until)`` wrapped for the walk-forward engine."""
+    """Every training record in ``[since, until)`` wrapped for the walk-forward engine.
+
+    ``with_deep`` also loads the demo team stats and deep_data's ``DeepData`` (cut at every training
+    cutoff by :meth:`HistoricalData.until`), so the backtest's feature store has the live inputs.
+    """
+    team_demo: list[Any] = []
+    deep: Any = None
+    if with_deep:
+        team_demo = datasets.load_team_demo_stats(
+            session, since=since, until=until, in_scope_only=in_scope_only
+        )
+        deep = datasets.DeepData.from_session(
+            session, since=since, until=until, in_scope_only=in_scope_only, sharp=sharp
+        )
     return HistoricalData(
         map_results=datasets.load_map_results(session, since=since, until=until, in_scope_only=in_scope_only),
         vetoes=datasets.load_veto_records(session, since=since, until=until, in_scope_only=in_scope_only),
@@ -133,6 +149,8 @@ def load_historical_data(
         else (),
         matches=matches,
         result_delay=result_delay,
+        team_demo_stats=team_demo,
+        deep=deep,
     )
 
 
@@ -180,6 +198,8 @@ def run_db_backtest(
         in_scope_only=in_scope_only,
         with_rounds=pc.simulate or pc.use_ensemble,
         with_player_maps=pc.player_props or pc.use_ensemble,
+        with_deep=pc.use_ensemble,
+        sharp=_sharp_source(settings),
     )
     return run_backtest(
         data,
@@ -189,3 +209,14 @@ def run_db_backtest(
         settings=settings,
         progress=progress,
     )
+
+
+def _sharp_source(settings: Settings) -> Any:
+    """The configured sharp benchmark (disabled by default); never fails the backtest."""
+    try:
+        from cs2bot.odds.sharp import sharp_source_from_settings
+
+        return sharp_source_from_settings(settings)
+    except Exception:
+        logger.warning("sharp odds source unavailable for the backtest", exc_info=True)
+        return None

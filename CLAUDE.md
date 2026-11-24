@@ -3,7 +3,9 @@
 Counter-Strike 2 Tier 1/2 pre-match analyzer: collects PandaScore / HLTV / demo data, models every
 match (ratings, veto, round simulation, player props, ensemble, calibration, Claude context layer),
 prices every Betclic.pl market and bets automatically when the calibrated probability is high
-(confidence only, odds ignored: `decision.min_ev = -1.0` since 2026-11-24). Main runtime: a Polish
+(confidence only, odds ignored: `decision.min_ev = -1.0` since 2026-11-24; only a win that would pay
+back less than the stake after the 12% tax - odds below 1.137 - is skipped), stakes by confidence tier
+(`bankroll.staking_mode = "confidence_tiers"`) after the high-confidence guard. Main runtime: a Polish
 VPS, fully autonomous (auto-login, auto-resume of automatic pauses with a circuit breaker, Telegram
 notifications + commands; `services/autonomy.py`, `services/telegram.py`); the Windows-PC install
 (PostgreSQL in Docker Desktop, the Python app natively via uv, dashboard on 127.0.0.1:8000) remains.
@@ -17,6 +19,7 @@ notifications + commands; `services/autonomy.py`, `services/telegram.py`); the W
 - `src/cs2bot/` - the package; foundation = `config.py`, `domain/`, `db/`, `utils/`, `testing/synthetic.py`.
 - `config/*.yaml` - Betclic market rules and selectors (edited on the owner's PC).
 - `deploy/windows/` (PowerShell 5.1 scripts + `.cmd` launchers), `scripts/` (Linux/macOS), `docker-compose.yml`, `.github/workflows/ci.yml`.
+- VPS: `Dockerfile`, `docker-compose.cloud.yml`, `deploy/linux/` (provision / deploy / backup / restore scripts, entrypoint, Caddyfile), `docs/VPS_SETUP.md`.
 
 ## Conventions
 

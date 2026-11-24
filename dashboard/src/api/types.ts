@@ -769,6 +769,11 @@ export interface DecisionConfig {
   prefer_known_veto: boolean;
   market_overrides: Record<string, MarketThresholds>;
   disabled_markets: string[];
+  require_trusted_calibration?: boolean;
+  /** A win must pay back more than the stake after the 12% stake tax (odds >= 1.137). */
+  require_profitable_win?: boolean;
+  /** Conservative high-confidence calibration applied before the confidence check and the tier. */
+  use_confidence_guard?: boolean;
 }
 
 /** cs2bot.config.BankrollSettings in JSON mode (Decimals are strings). */
@@ -782,6 +787,10 @@ export interface BankrollConfig {
   weekly_loss_limit_fraction: number;
   max_bets_per_day: number;
   stake_step: string;
+  /** "confidence_tiers" (the owner's rule: stake by confidence, odds ignored) or "kelly". */
+  staking_mode?: "confidence_tiers" | "kelly";
+  /** [minimum probability, fraction of the bankroll]; the highest tier met applies. */
+  confidence_tiers?: [number, number][];
 }
 
 export interface ConfigSections {

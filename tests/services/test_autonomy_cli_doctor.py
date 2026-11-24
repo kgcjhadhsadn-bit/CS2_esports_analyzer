@@ -137,15 +137,16 @@ def test_doctor_telegram_check() -> None:
 def test_backtest_writes_the_confidence_guard(tmp_path: Path) -> None:
     from types import SimpleNamespace
 
-    from cs2bot.cli import _save_confidence_guard
     from cs2bot.models.confidence import ConfidenceGuard
+    from cs2bot.services.backtesting import save_guard_from_report
 
     settings = Settings()
     settings.models.confidence_guard_file = tmp_path / "models" / "guard.json"
-    _save_confidence_guard(settings, SimpleNamespace(predictions=[]))
+    (tmp_path / "models").mkdir()
+    assert save_guard_from_report(settings, SimpleNamespace(predictions=[]))[0] is None
     assert not settings.models.confidence_guard_file.exists()  # nothing resolved: nothing written
     records = [SimpleNamespace(market_type="match_winner", p=0.8, y=i % 5 != 0) for i in range(50)]
-    _save_confidence_guard(settings, SimpleNamespace(predictions=records))
+    save_guard_from_report(settings, SimpleNamespace(predictions=records))
     guard = ConfidenceGuard.load(settings.models.confidence_guard_file)
     assert "match_winner" in guard.trust and not guard.is_trusted("match_winner")  # far too little history
 

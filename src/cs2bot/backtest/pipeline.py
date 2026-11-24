@@ -425,11 +425,14 @@ class PipelineTrainer:
         if cfg.use_ensemble and training.map_results:
             from cs2bot.features.store import FeatureStore
 
+            # the same inputs as the live store (services.registry.build_feature_store)
             store = FeatureStore.build(
                 training.map_results,
                 player_maps=training.player_maps,
                 rounds=training.rounds,
                 vetoes=training.vetoes,
+                team_demo_stats=training.team_demo_stats,
+                deep=training.deep,
             )
             ensemble = MapWinEnsemble(cfg.ensemble_config, settings=self.settings)
             ensemble.fit(training.map_results, store=store, rating_provider=ratings)

@@ -1,6 +1,6 @@
 # CS2 Esports Analyzer & Betclic Auto-Bettor — Project Plan
 
-> Status: **planning, all decisions settled** · Last updated: 2026-11-22 (runtime moved to owner's PC)
+> Status: **built; decisions settled** · Last updated: 2026-11-24 (VPS runtime, confidence-only rule, final review Lens C)
 > This document is the single source of truth for scope, architecture and build order.
 > Change it before changing direction in code.
 
@@ -18,7 +18,9 @@
 | Bet rule | **Confidence only, odds ignored** (owner decision 2026-11-24, replaces the break-even guard): bet when the calibrated probability is >= 75%, whatever the odds (`decision.min_ev = -1.0` disables the EV check). Owner informed that at low odds the 12% stake tax makes some of these bets lose money on average |
 | Staking | **Tiered by confidence**, not Kelly: 75-85% sure = 1% of bankroll, 85-92% = 1.5%, 92%+ = 2%; per-match 4%, daily -5% and weekly -10% limits unchanged |
 | Data sources | **HLTV (+ demos) is the primary source; PandaScore is optional** (its terms forbid odds-related use and its stats plans exclude betting customers); runs fully without a token |
-| Staking | **¼ Kelly + hard caps**, loss limits, kill switch |
+| Staking (superseded) | ~~¼ Kelly + hard caps~~ - replaced on 2026-11-24 by the confidence tiers above (Kelly stays available as `bankroll.staking_mode = "kelly"`); loss limits and kill switch unchanged |
+| Price floor (final review, 2026-11-24) | Odds stay ignored, except that a **win must pay back more than the stake** (`decision.require_profitable_win`, default on): with the 12% stake tax that means odds >= 1.137 (1.28 still passes). Owner to confirm or switch off |
+| Confidence guard (final review, 2026-11-24) | Probabilities above 75% pass through the backtest's high-confidence calibration before the 75% check and the stake tier (`decision.use_confidence_guard`, on); without history they keep half of their excess over 75%. Refreshed weekly by a scheduled backtest |
 | Execution | **Fully automatic** bet placement on the **owner's own Betclic.pl account** |
 | Runtime | **Cloud: a Polish VPS, fully autonomous, no human interaction** (decided 2026-11-24; replaces "owner's PC"). The Windows-PC install stays as an alternative |
 | Interface | **Telegram bot** (every bet, daily P&L, alerts, /status /pause /resume /stop) + **web dashboard** over HTTPS with a password |
@@ -72,7 +74,7 @@ Python 3.12 monorepo, running **entirely on the owner's PC** (Windows assumed):
                                |                         ^
                      Claude context layer (news flags, rationale)
                                |
-         Pricing engine (all markets) -> Decision engine (confidence+EV) -> Bankroll (1/4 Kelly + caps)
+         Pricing engine (all markets) -> Confidence guard -> Decision (confidence) -> Bankroll (tiers + caps)
                                |
                      Betclic executor (Playwright) -> Bet ledger
                                |
@@ -199,6 +201,12 @@ Every model is trained and evaluated **walk-forward** (only data available befor
 | Entity matching | high-confidence link between Betclic event and model match |
 
 At `p = 0.75` this needs odds of about **1.52** or higher, so expect **few bets**. That is by design.
+
+> **Superseded (owner decision 2026-11-24, see section 0):** the EV row above is off (`min_ev = -1`,
+> odds ignored except the "a win must pay back more than the stake" floor of 1.137) and stakes follow
+> the confidence tiers (75-85% = 1%, 85-92% = 1.5%, 92%+ = 2% of the bankroll) instead of ¼ Kelly. The
+> caps and loss limits below still apply; loss-limit pauses lift automatically at the next Warsaw day /
+> week when autonomy is on (VPS). The text below is the original design, kept for reference.
 
 **Staking: ¼ Kelly with hard caps.**
 - `b = o_eff − 1`, `f* = (b·p − (1 − p)) / b`, stake = `0.25 × f* × bankroll`

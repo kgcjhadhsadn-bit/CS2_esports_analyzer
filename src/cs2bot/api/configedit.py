@@ -22,7 +22,13 @@ from sqlalchemy.orm import Session
 
 from cs2bot.api.formatting import utc
 from cs2bot.api.schemas import ConfigIn, ConfigOut, ConfigSections
-from cs2bot.config import BankrollSettings, DecisionSettings, MarketThresholds, Settings
+from cs2bot.config import (
+    BankrollSettings,
+    DecisionSettings,
+    MarketThresholds,
+    Settings,
+    confidence_tiers_problem,
+)
 from cs2bot.db import state
 from cs2bot.db.models import SystemState
 from cs2bot.domain.markets import MarketType
@@ -81,6 +87,11 @@ def _check_odds_range(model: DecisionSettings) -> str | None:
     return None
 
 
+def _check_tiers(model: BankrollSettings) -> str | None:
+    """Confidence tiers against the merged section (also when only ``max_stake_fraction`` changes)."""
+    return confidence_tiers_problem(model)
+
+
 def _check_currency(model: BankrollSettings) -> str | None:
     return None if _CURRENCY.match(model.currency) else "must be a 3-letter currency code (e.g. PLN)"
 
@@ -116,7 +127,9 @@ _BANKROLL_CHECKS: dict[str, list[Check]] = {
     ],
     "currency": [_check_currency],
     "kelly_fraction": [_between("kelly_fraction", 0, 1, lo_open=True)],
-    "max_stake_fraction": [_between("max_stake_fraction", 0, 1, lo_open=True)],
+    "max_stake_fraction": [_between("max_stake_fraction", 0, 1, lo_open=True), _check_tiers],
+    "confidence_tiers": [_check_tiers],
+    "staking_mode": [_check_tiers],
     "max_match_exposure_fraction": [_between("max_match_exposure_fraction", 0, 1, lo_open=True)],
     "daily_loss_limit_fraction": [_between("daily_loss_limit_fraction", 0, 1, lo_open=True)],
     "weekly_loss_limit_fraction": [_between("weekly_loss_limit_fraction", 0, 1, lo_open=True)],

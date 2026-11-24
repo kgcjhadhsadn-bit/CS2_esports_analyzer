@@ -78,15 +78,31 @@ class BrowserStartError(ExecutorError):
     """Chromium (persistent profile) could not be started."""
 
 
+#: Prefix of the ``PlacementResult.message`` of a FAILED placement that never reached Betclic because the
+#: executor itself is unusable (Chromium cannot start, the profile is locked by another process, the
+#: executor could not be created). ``services.betting`` stops the cycle on it and - with autonomy - pauses
+#: with ``executor_unavailable``, which the auto-resume service lifts after a passing health check
+#: (final review, Lens C: before, every cycle wrote one FAILED bet per accepted outcome, each re-trying
+#: to start the browser).
+EXECUTOR_UNAVAILABLE_PREFIX = "executor unavailable: "
+
+
+def is_executor_unavailable(message: str) -> bool:
+    """True for the message of a placement refused because the executor itself is unusable."""
+    return message.startswith(EXECUTOR_UNAVAILABLE_PREFIX)
+
+
 class LoginRequiredError(ExecutorError):
     """The Betclic session expired; the owner must log in again (``open_login_window``)."""
 
 
 __all__ = [
+    "EXECUTOR_UNAVAILABLE_PREFIX",
     "AccountExecutor",
     "AutoLoginExecutor",
     "BetExecutor",
     "BookmakerBetRecord",
     "BookmakerBetStatus",
     "HaltCheck",
+    "is_executor_unavailable",
 ]

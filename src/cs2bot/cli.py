@@ -676,79 +676,38 @@ def backtest(
     ),
     output: Path | None = typer.Option(None, help="Also write the Markdown report to this file"),
 ) -> None:
-    """Walk-forward backtest over stored history and Betclic odds; stored in model_runs (kind backtest)."""
-    from cs2bot.backtest import BacktestConfig, PipelineConfig, run_db_backtest
-    from cs2bot.db.models import ModelRun
-    from cs2bot.domain.enums import JobStatus
-    from cs2bot.services.registry import load_rating_config
-    from cs2bot.utils.time import utcnow
+    """Walk-forward backtest over stored history and Betclic odds; stored in model_runs (kind backtest).
+
+    Also rewrites the high-confidence guard (``models.confidence_guard_file``) from its resolved
+    predictions - the betting cycle applies it (``decision.use_confidence_guard``).
+    """
+    from cs2bot.services.backtesting import run_backtest_with_guard
 
     s = _settings()
-    # the live model uses the `models tune` result: so does the backtest (it was tuned on a holdout that
-    # may overlap the backtest window - a mild optimism, stated in the report notes)
-    rating_config = load_rating_config(s)
     since, until = _parse_day(date_from, "--from"), _parse_day(date_to, "--to")
     if until <= since:
         raise CLIError("--to must be after --from")
-    started = utcnow()
-    with _factory(s)() as session:
-        report = run_db_backtest(
-            session,
-            settings=s,
-            since=since,
-            until=until,
-            config=BacktestConfig(retrain_every=timedelta(days=7)),
-            pipeline_config=PipelineConfig(
-                simulate=True, n_sims=sims, use_ensemble=ensemble, rating_config=rating_config
-            ),
-        )
-        if rating_config is not None:
-            report.warnings.append(
-                "rating model: the tuned configuration of `cs2bot models tune` (tuned on a holdout that may "
-                "overlap this window)"
-            )
-        session.add(
-            ModelRun(
-                kind="backtest",
-                model_version=f"bt{started:%Y%m%dT%H%M%S}",
-                status=JobStatus.SUCCESS,
-                started_at=started,
-                finished_at=utcnow(),
-                params={
-                    "from": date_from,
-                    "to": date_to,
-                    "sims": sims,
-                    "ensemble": ensemble,
-                    "rating_config": "tuned" if rating_config is not None else "default",
-                },
-                metrics=json.loads(report.model_dump_json()),
-            )
-        )
-        session.commit()
-    text = report.to_markdown()
+    result = run_backtest_with_guard(
+        _factory(s),
+        s,
+        since=since,
+        until=until,
+        sims=sims,
+        ensemble=ensemble,
+        retrain_every=timedelta(days=7),
+    )
+    text = result.report.to_markdown()
     typer.echo(text)
     if output is not None:
         output.write_text(text, encoding="utf-8")
         typer.echo(f"written to {output}")
-    _save_confidence_guard(s, report)
-
-
-def _save_confidence_guard(s: Settings, report: Any) -> None:
-    """Persist deep_data's per-market confidence guard (trusted flags) from the backtest's resolved
-    predictions to ``models.confidence_guard_file``; ``decision.require_trusted_calibration`` reads it."""
-    predictions = list(getattr(report, "predictions", None) or [])
-    if not predictions:
+    if result.written:
+        typer.echo(
+            f"confidence guard written to {result.path}; trusted market types: "
+            f"{', '.join(result.trusted) or 'none yet'}"
+        )
+    else:
         typer.echo("confidence guard not updated: the backtest resolved no predictions")
-        return
-    from cs2bot.models.confidence import ConfidenceGuard
-    from cs2bot.utils.paths import resolve_path
-
-    guard = ConfidenceGuard.from_predictions(predictions)
-    path = guard.save(resolve_path(s.models.confidence_guard_file))
-    trusted = sorted(m for m in guard.trust if m != "*" and guard.is_trusted(m))
-    typer.echo(
-        f"confidence guard written to {path}; trusted market types: {', '.join(trusted) or 'none yet'}"
-    )
 
 
 # -------------------------------------------------------------------------------------------- executor

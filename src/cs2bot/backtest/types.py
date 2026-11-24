@@ -140,12 +140,19 @@ class TrainingSet:
     rounds: tuple[RoundRecord, ...] = ()
     player_maps: tuple[PlayerMapRecord, ...] = ()
     matches: tuple[BacktestMatch, ...] = ()
+    #: demo team stats (``datasets.TeamDemoMapRecord``) and deep_data's ``DeepData`` cut at the cutoff
+    #: (final review, Lens C: the backtest's feature store gets the same inputs as the live one)
+    team_demo_stats: tuple[Any, ...] = ()
+    deep: Any = None
 
     def __post_init__(self) -> None:
         if self.cutoff.tzinfo is None:
             raise ValueError("TrainingSet.cutoff must be timezone-aware")
-        for name in ("map_results", "vetoes", "rounds", "player_maps"):
+        for name in ("map_results", "vetoes", "rounds", "player_maps", "team_demo_stats"):
             assert_no_leakage(getattr(self, name), self.cutoff, what=f"TrainingSet.{name}")
+        if self.deep is not None:
+            for name in ("clutches", "duels"):
+                assert_no_leakage(getattr(self.deep, name, ()), self.cutoff, what=f"TrainingSet.deep.{name}")
         for m in self.matches:
             end = m.end_time or m.start_time
             if ensure_utc(end) >= ensure_utc(self.cutoff):
@@ -158,7 +165,7 @@ class TrainingSet:
         """The latest ``played_at`` in the set (None when empty)."""
         times = [
             _time_of(r)
-            for coll in (self.map_results, self.vetoes, self.rounds, self.player_maps)
+            for coll in (self.map_results, self.vetoes, self.rounds, self.player_maps, self.team_demo_stats)
             for r in coll
         ]
         return max(times, default=None)
@@ -180,6 +187,9 @@ class HistoricalData:
     player_maps: Sequence[PlayerMapRecord] = ()
     matches: Sequence[BacktestMatch] = ()
     result_delay: timedelta = timedelta(hours=1)
+    #: demo team stats (visible like the map results) and ``DeepData`` (cut at each cutoff)
+    team_demo_stats: Sequence[Any] = ()
+    deep: Any = None
     _visible: dict[int, datetime] = field(default_factory=dict, init=False, repr=False)
     _index: dict[str, tuple[list[Any], list[datetime]]] = field(default_factory=dict, init=False, repr=False)
     _ends: list[tuple[datetime, BacktestMatch]] = field(default_factory=list, init=False, repr=False)
@@ -197,7 +207,7 @@ class HistoricalData:
             if m.end_time is not None:
                 end = ensure_utc(m.end_time)
                 self._visible[m.match_id] = max(self._visible.get(m.match_id, end), end)
-        for name in ("map_results", "vetoes", "rounds", "player_maps"):
+        for name in ("map_results", "vetoes", "rounds", "player_maps", "team_demo_stats"):
             keyed = sorted(
                 ((self.visible_at(r), _time_of(r), i, r) for i, r in enumerate(getattr(self, name))),
                 key=lambda x: (x[0], x[1], x[2]),
@@ -237,6 +247,8 @@ class HistoricalData:
             rounds=self._visible_prefix("rounds", t),
             player_maps=self._visible_prefix("player_maps", t),
             matches=tuple(m for end, m in self._ends if end < t),
+            team_demo_stats=self._visible_prefix("team_demo_stats", t),
+            deep=self.deep.cut(t) if self.deep is not None else None,
         )
 
 

@@ -4,7 +4,10 @@ A pre-match analyzer for **Counter-Strike 2 Tier 1/2 matches** that prices every
 **Betclic.pl** with a statistical / simulation model and bets automatically - only when the model
 is confident. Since 2026-11-24 the owner's rule is **confidence only, odds ignored**: a pick is bet when
 the calibrated probability is at least 75%, whatever the odds (`decision.min_ev = -1.0`; set `0.0` for a
-break-even guard after the Polish 12% stake tax).
+break-even guard after the Polish 12% stake tax) - except that a win must pay back more than the stake
+(odds of at least 1.137 after the 12% tax; a 1.28 favourite is bet). Stakes follow the confidence:
+75-85% sure = 1% of the bankroll, 85-92% = 1.5%, 92%+ = 2%, after a conservative high-confidence
+calibration fitted on the backtest.
 
 The main runtime is a **Polish VPS, fully autonomous** (Docker, Chromium on an Xvfb display, Caddy
 HTTPS for the dashboard; see [docs/VPS_SETUP.md](docs/VPS_SETUP.md)): it logs in to Betclic by itself,
@@ -24,7 +27,7 @@ http://127.0.0.1:8000) still works.
 - **Prices every Betclic market** (match / map winners, handicaps, totals, rounds, pistols, player
   kills, ...) and compares the model with the odds, after tax.
 - **Bets on confidence:** probability, uncertainty and data-quality thresholds (the EV check is off by
-  default, odds are ignored); stakes with hard caps, daily / weekly loss limits, a kill switch,
+  default, odds are ignored); stakes by confidence tier with hard caps, daily / weekly loss limits, a kill switch,
   pause / resume with structured reasons that lift themselves when resolved, dry run.
 - **Runs unattended:** auto-login (stops at SMS / 2FA), auto-resume with a circuit breaker, Telegram
   notifications (every bet, settlements, daily P&L, pauses, errors) and commands (`/status`, `/pause`,
@@ -60,7 +63,7 @@ http://127.0.0.1:8000) still works.
                                    |                     ^
                        Claude context layer (news flags, rationale)
                                    |
-   pricing (every market) -> decision rules -> bankroll (1/4 Kelly, caps, loss limits)
+   pricing (every market) -> confidence guard -> decision rules -> stake by confidence tier (caps, loss limits)
                                    |
    Betclic executor (Playwright, visible window, dry run)    API + React dashboard (127.0.0.1)
 ```

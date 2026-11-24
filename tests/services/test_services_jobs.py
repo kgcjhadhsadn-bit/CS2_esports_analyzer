@@ -165,6 +165,11 @@ def test_pandascore_jobs_need_a_token(world: World) -> None:
 def test_retrain_job_swaps_the_active_bundle(world: World) -> None:
     rt = _runtime(world)
     before = rt.registry.get()
+    assert before is not None
+    # the scheduled retrain skips a bundle younger than 2 h (final review, Lens C): make it older
+    from datetime import timedelta
+
+    before.trained_at = before.trained_at - timedelta(hours=3)
     job = next(j for j in build_jobs(rt) if j.name == "models_retrain")
     sched = Scheduler([job], world.factory, tick_s=0.01)
     assert sched.run_job(job)

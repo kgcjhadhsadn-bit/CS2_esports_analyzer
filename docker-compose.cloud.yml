@@ -103,6 +103,9 @@ services:
       CS2BOT_API__SESSION_SECRET: ${CS2BOT_API__SESSION_SECRET:?set CS2BOT_API__SESSION_SECRET in .env}
       # Domain / IP of the dashboard: the entrypoint derives the API's Host allow-list and https origin.
       CS2BOT_PUBLIC_HOST: ${CS2BOT_PUBLIC_HOST:?set CS2BOT_PUBLIC_HOST (domain or IP) in .env}
+      # Trust X-Forwarded-For / -Proto from Caddy only (its fixed address below): the login rate limit
+      # and the audit log see the real client, the session cookie is Secure (final review, Lens C).
+      CS2BOT_API__FORWARDED_ALLOW_IPS: '["${CADDY_IPV4:-172.30.250.10}"]'
       # Visible Betclic browser on the Xvfb display started by the entrypoint (less bot-like).
       CS2BOT_EXECUTOR__HEADLESS: ${CS2BOT_EXECUTOR__HEADLESS:-false}
       DISPLAY: ":99"
@@ -136,7 +139,8 @@ services:
       interval: 30s
       timeout: 10s
       retries: 5
-      start_period: 15m
+      # the API answers right after the migrations (the first training runs in the background)
+      start_period: 5m
     # `cs2bot up` needs up to ~90 s for a clean shutdown (running jobs, browser, scheduler).
     stop_grace_period: 2m
     logging: *default-logging
@@ -161,7 +165,9 @@ services:
     security_opt:
       - no-new-privileges:true
     networks:
-      - frontend
+      frontend:
+        # fixed, so the app can trust exactly this proxy's forwarding headers
+        ipv4_address: ${CADDY_IPV4:-172.30.250.10}
     stop_grace_period: 30s
     logging: *default-logging
 
@@ -169,7 +175,12 @@ networks:
   # The database network has no route to the internet and no published ports.
   backend:
     internal: true
-  frontend: {}
+  frontend:
+    # A fixed subnet for Caddy's fixed address. Change FRONTEND_SUBNET / CADDY_IPV4 in .env only if it
+    # collides with another network on the VPS (after a change: `docker compose down`, then deploy.sh).
+    ipam:
+      config:
+        - subnet: ${FRONTEND_SUBNET:-172.30.250.0/24}
 
 volumes:
   pgdata:

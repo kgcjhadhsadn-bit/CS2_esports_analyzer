@@ -9,7 +9,9 @@ Lanes (one thread each, jobs of a lane run one at a time in definition order):
 * ``hltv``  - everything that drives the HLTV browser profile (pages, rankings, news, demo downloads),
   so that profile is only ever opened by one thread at a time (Playwright is thread-bound).
 * ``train`` - the nightly retrain (``Daily`` at ``scheduler.retrain_cron``), so a long fit never
-  delays odds or HLTV syncs.
+  delays odds or HLTV syncs, and ``confidence_guard_refresh`` (daily slot ``scheduler.guard_refresh_cron``;
+  it runs a backtest and rewrites the high-confidence guard only when ``models.guard_refresh_days`` have
+  passed and enough priced finished matches exist - :mod:`cs2bot.services.backtesting`).
 * ``notify`` - Telegram notifications (``telegram_notify``, new events from the database) and the daily
   P&L report (``telegram_daily_report`` at ``telegram.daily_report_time``, Warsaw).
 * ``telegram`` - the Telegram command poller (``telegram_commands``: one long-polling session of
@@ -306,16 +308,31 @@ def _triage(rt: Runtime, tracker: JobTracker) -> None:
     }
 
 
+#: The scheduled retrain skips when the active bundle is younger (e.g. the start-up training just ran).
+RETRAIN_SKIP_IF_NEWER_THAN = timedelta(hours=2)
+
+
 def _retrain(rt: Runtime, tracker: JobTracker) -> None:
     try:
-        report = rt.registry.retrain(rt.session_factory)
+        report = rt.registry.retrain_unless_fresh(rt.session_factory, max_age=RETRAIN_SKIP_IF_NEWER_THAN)
     except NotEnoughDataError as exc:
         tracker.partial_error = str(exc)
+        return
+    if report is None:
+        tracker.details = {"skipped": "the active model bundle is fresh (trained less than 2 h ago)"}
         return
     tracker.add(report.n_map_results)
     tracker.details = report.as_dict()
     if report.warnings:
         tracker.details["warnings"] = report.warnings
+
+
+def _guard_refresh(rt: Runtime, tracker: JobTracker) -> None:
+    from cs2bot.services.backtesting import refresh_confidence_guard
+
+    report = refresh_confidence_guard(rt.session_factory, rt.settings)
+    tracker.add(report.items)
+    tracker.details = report.as_dict()
 
 
 def _demos(rt: Runtime, tracker: JobTracker) -> None:
@@ -460,4 +477,12 @@ def build_jobs(rt: Runtime) -> list[Job]:
         ),
         # train lane
         Job("models_retrain", lambda t: _retrain(rt, t), parse_daily_cron(sch.retrain_cron, tz), lane=TRAIN),
+        # weekly (when due) backtest -> high-confidence guard; the betting cycle reads the file
+        Job(
+            "confidence_guard_refresh",
+            lambda t: _guard_refresh(rt, t),
+            parse_daily_cron(sch.guard_refresh_cron, tz),
+            lane=TRAIN,
+            enabled=s.models.guard_refresh_days > 0,
+        ),
     ]

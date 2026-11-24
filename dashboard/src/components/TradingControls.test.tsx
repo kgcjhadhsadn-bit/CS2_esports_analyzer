@@ -95,4 +95,38 @@ describe("DecisionRuleNote", () => {
     render(<DecisionRuleNote config={configOut} />);
     expect(screen.getByRole("note")).toHaveTextContent("EV at least 5.0%");
   });
+
+  it("explains the profitable-win floor, the confidence guard and the staking tiers", () => {
+    const cfg = {
+      ...configOut,
+      effective: {
+        decision: { ...configOut.effective.decision, min_ev: -1, require_profitable_win: true, use_confidence_guard: true },
+        bankroll: {
+          ...configOut.effective.bankroll,
+          staking_mode: "confidence_tiers" as const,
+          confidence_tiers: [
+            [0.85, 0.015],
+            [0.75, 0.01],
+            [0.92, 0.02],
+          ] as [number, number][],
+        },
+      },
+    };
+    render(<DecisionRuleNote config={cfg} />);
+    const note = screen.getByRole("note");
+    expect(note).toHaveTextContent("1.137");
+    expect(note).toHaveTextContent("confidence guard");
+    expect(note).toHaveTextContent("75%-85% sure = 1.0% of the bankroll");
+    expect(note).toHaveTextContent("85%-92% sure = 1.5% of the bankroll");
+    expect(note).toHaveTextContent("92%+ sure = 2.0% of the bankroll");
+  });
+
+  it("describes Kelly staking when it is configured", () => {
+    const cfg = {
+      ...configOut,
+      effective: { ...configOut.effective, bankroll: { ...configOut.effective.bankroll, staking_mode: "kelly" as const } },
+    };
+    render(<DecisionRuleNote config={cfg} />);
+    expect(screen.getByRole("note")).toHaveTextContent("20% Kelly");
+  });
 });

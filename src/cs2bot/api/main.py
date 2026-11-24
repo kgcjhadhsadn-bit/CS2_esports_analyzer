@@ -187,6 +187,13 @@ def create_app(
         max_age=600,
     )
     app.add_middleware(LocalSecurityMiddleware, allowed_hosts=allowed_hosts, api_prefix=API_PREFIX)
+    if api.forwarded_allow_ips:
+        # outermost: behind Caddy (VPS) the real client address and https scheme reach the login rate
+        # limit, the audit log and the cookie's Secure flag. Only the configured proxy is trusted; any
+        # other peer's X-Forwarded-* headers are ignored. The Host header is never rewritten.
+        from uvicorn.middleware.proxy_headers import ProxyHeadersMiddleware
+
+        app.add_middleware(ProxyHeadersMiddleware, trusted_hosts=list(api.forwarded_allow_ips))
 
     for unavailable in (OperationalError, InterfaceError, PoolTimeoutError):
         app.add_exception_handler(unavailable, _db_unavailable)
@@ -230,7 +237,9 @@ def make_server(
         host=settings.api.host,
         port=settings.api.port,
         log_level=_uvicorn_log_level(log_level or settings.log_level),
-        proxy_headers=False,  # no reverse proxy: never trust X-Forwarded-For (login rate limiting)
+        # forwarding headers are handled by create_app (only from settings.api.forwarded_allow_ips);
+        # uvicorn's own handling would trust 127.0.0.1 by default
+        proxy_headers=False,
         server_header=False,
         access_log=True,
     )

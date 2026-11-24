@@ -80,6 +80,9 @@ class ModelBundle:
     metrics: dict[str, Any] = field(default_factory=dict)
     model_run_id: int | None = None
     store_max_age: timedelta = timedelta(minutes=30)
+    #: runtime only (not saved): the settings the live feature store is built with (sharp feed);
+    #: set by :func:`train_models` and :class:`ModelRegistry`
+    settings: Settings | None = field(default=None, repr=False, compare=False)
     # runtime state (not saved)
     _store: Any = field(default=None, repr=False)
     _store_built_at: datetime | None = field(default=None, repr=False)
@@ -133,9 +136,8 @@ class ModelBundle:
         with self._lock:
             fresh = self._store_built_at is not None and now - self._store_built_at < self.store_max_age
             if self._store is None or not fresh:
-                from cs2bot.features import FeatureStore
-
-                self._store = FeatureStore.from_session(session, until=now)
+                # the same inputs as training (build_feature_store): team demo stats + deep data
+                self._store = build_feature_store(session, self.settings, until=now)
                 self._store_built_at = now
             return self._store
 
@@ -192,6 +194,49 @@ class TrainReport:
 
 class NotEnoughDataError(RuntimeError):
     """There is not a single usable map result before ``as_of``: nothing to train on."""
+
+
+def build_feature_store(
+    session: Session,
+    settings: Settings | None,
+    *,
+    until: datetime | None,
+    map_results: Any = None,
+    player_maps: Any = None,
+    rounds: Any = None,
+    vetoes: Any = None,
+) -> Any:
+    """The ensemble's :class:`~cs2bot.features.FeatureStore` with EVERY input, for training and live alike.
+
+    Final review (Lens C): training used to build its store from map results, player lines, rounds and
+    vetoes only, while the live store (``FeatureStore.from_session``) also had the demo team stats and
+    deep_data's :class:`~cs2bot.datasets.DeepData` (match metadata - stage, venue, schedule - demo duels
+    and clutches, coach changes, Betclic market history, the optional sharp feed). The ensemble only
+    knows the columns it was trained with, so the deep factors never reached a prediction (all-NaN in
+    training) and the demo-stat columns were a train / live skew. One builder for both paths keeps them
+    identical. Records already loaded by the caller are reused; everything is cut at ``until``.
+    """
+    from cs2bot.features import FeatureStore
+
+    def get(pre: Any, loader: Any) -> list[Any]:
+        return list(pre) if pre is not None else loader(session, until=until)
+
+    sharp = None
+    if settings is not None:
+        try:
+            from cs2bot.odds.sharp import sharp_source_from_settings
+
+            sharp = sharp_source_from_settings(settings)
+        except Exception:  # an optional benchmark feed must never stop training or predictions
+            log.warning("sharp odds source unavailable; its features stay empty", exc_info=True)
+    return FeatureStore.build(
+        get(map_results, datasets.load_map_results),
+        player_maps=get(player_maps, datasets.load_player_map_records),
+        rounds=get(rounds, datasets.load_round_records),
+        vetoes=get(vetoes, datasets.load_veto_records),
+        team_demo_stats=datasets.load_team_demo_stats(session, until=until),
+        deep=datasets.DeepData.from_session(session, until=until, sharp=sharp),
+    )
 
 
 def _new_version(root: Path, as_of: datetime) -> str:
@@ -291,9 +336,15 @@ def train_models(
         store = None
         ensemble_metrics: dict[str, Any] | None = None
         if want_ensemble:
-            from cs2bot.features import FeatureStore
-
-            store = FeatureStore.build(map_results, player_maps=player_maps, rounds=rounds, vetoes=vetoes)
+            store = build_feature_store(
+                session,
+                settings,
+                until=as_of,
+                map_results=map_results,
+                player_maps=player_maps,
+                rounds=rounds,
+                vetoes=vetoes,
+            )
             ensemble = MapWinEnsemble(cfg, settings=settings)
             fit_report = ensemble.fit(map_results, store=store, rating_provider=ratings, as_of=as_of)
             ensemble_metrics = fit_report.model_dump(mode="json")
@@ -324,6 +375,7 @@ def train_models(
             ensemble=ensemble,
             metrics=metrics,
             model_run_id=run.id if run is not None else None,
+            settings=settings,
         )
         if store is not None:
             bundle.set_feature_store(store, as_of)
@@ -444,7 +496,9 @@ def load_latest(settings: Settings) -> ModelBundle | None:
     """The newest bundle that loads cleanly, or None (a corrupt newest bundle falls back to older ones)."""
     for _, directory in list_bundles(settings):
         try:
-            return load_bundle(directory)
+            bundle = load_bundle(directory)
+            bundle.settings = settings
+            return bundle
         except Exception as exc:
             log.error("could not load model bundle %s: %s", directory, exc)
     return None
@@ -473,13 +527,15 @@ class ModelRegistry:
         self.settings = settings
         self._bundle = bundle
         self._lock = threading.Lock()
-        self._train_lock = threading.Lock()
+        self._train_lock = threading.RLock()  # re-entered by retrain_unless_fresh -> retrain
 
     def get(self) -> ModelBundle | None:
         with self._lock:
             return self._bundle
 
     def swap(self, bundle: ModelBundle) -> ModelBundle | None:
+        if bundle.settings is None:
+            bundle.settings = self.settings
         with self._lock:
             old, self._bundle = self._bundle, bundle
         log.info("active model bundle: %s (was %s)", bundle.version, old.version if old else None)
@@ -512,3 +568,18 @@ class ModelRegistry:
                 self.swap(report.bundle)
             prune_bundles(self.settings, keep=keep)
             return report
+
+    def retrain_unless_fresh(
+        self, session_factory: sessionmaker[Session], *, max_age: timedelta, keep: int = 5
+    ) -> TrainReport | None:
+        """:meth:`retrain`, or None when the active bundle was trained less than ``max_age`` ago.
+
+        Checked inside the train lock, so the scheduler's retrain job that waited for the start-up
+        training does not train the same data a second time right after it (final review, Lens C).
+        """
+        with self._train_lock:
+            current = self.get()
+            if current is not None and utcnow() - ensure_utc(current.trained_at) < max_age:
+                log.info("retrain skipped: bundle %s is fresh", current.version)
+                return None
+            return self.retrain(session_factory, keep=keep)

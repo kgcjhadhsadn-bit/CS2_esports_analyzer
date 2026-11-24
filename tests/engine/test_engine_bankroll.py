@@ -35,7 +35,7 @@ from cs2bot.engine.ev import TaxModel, kelly_fraction
 from tests.engine.engine_factories import add_bet, add_match, make_decision, make_outcome
 
 BETCLIC = BetclicSettings()
-BANKROLL = BankrollSettings()
+BANKROLL = BankrollSettings(staking_mode="kelly")
 
 
 def utc(*args: int) -> datetime:
@@ -430,7 +430,10 @@ def test_size_stake(
     first: str | None,
 ) -> None:
     stake, reasons = size_stake(
-        make_decision(**decision_kw), base_state(**state_kw), BankrollSettings(**settings_kw), BETCLIC
+        make_decision(**decision_kw),
+        base_state(**state_kw),
+        BankrollSettings(staking_mode="kelly", **settings_kw),
+        BETCLIC,
     )
     assert stake == Decimal(expected)
     if first is None:
@@ -450,7 +453,9 @@ def test_halted_lists_every_reason() -> None:
 
 def test_binding_caps_are_reported_as_notes() -> None:
     st = base_state(exposure_by_match={1: Decimal("35")}, balance=Decimal("4.20"))
-    stake, notes = size_stake(make_decision(kelly_full=0.3), st, BankrollSettings(**NO_GUARDS), BETCLIC)
+    stake, notes = size_stake(
+        make_decision(kelly_full=0.3), st, BankrollSettings(staking_mode="kelly", **NO_GUARDS), BETCLIC
+    )
     assert stake == Decimal("4.20")
     assert [n.split(" ->")[0] for n in notes] == [
         "capped: max_stake",
@@ -461,7 +466,7 @@ def test_binding_caps_are_reported_as_notes() -> None:
 
 def test_many_small_bets_hit_the_daily_guard(session: Session, settings: Settings) -> None:
     now = utc(2026, 1, 15, 10)
-    bankroll = BankrollSettings(max_bets_per_day=30)
+    bankroll = BankrollSettings(staking_mode="kelly", max_bets_per_day=30)
     ledger.ensure_initialized(session, settings, at=utc(2026, 1, 1))
     stakes: list[Decimal] = []
     last_reasons: list[str] = []
@@ -506,7 +511,7 @@ def test_worst_case_daily_loss_stays_within_the_limit_across_midnight(
     session: Session, settings: Settings
 ) -> None:
     """Bets placed just before and just after local midnight, all losing on the same day."""
-    bankroll = BankrollSettings(max_bets_per_day=50)
+    bankroll = BankrollSettings(staking_mode="kelly", max_bets_per_day=50)
     ledger.ensure_initialized(session, settings, at=utc(2026, 1, 1))
     evening = utc(2026, 1, 14, 22, 30)  # 23:30 Warsaw on the 14th
     after_midnight = utc(2026, 1, 14, 23, 10)  # 00:10 Warsaw on the 15th
@@ -533,7 +538,7 @@ def test_multi_day_worst_case_never_exceeds_the_daily_or_weekly_limit(
     session: Session, settings: Settings
 ) -> None:
     """Stake as much as allowed every day; every bet loses the day after it was placed."""
-    bankroll = BankrollSettings(max_bets_per_day=50)
+    bankroll = BankrollSettings(staking_mode="kelly", max_bets_per_day=50)
     ledger.ensure_initialized(session, settings, at=utc(2025, 12, 1))
     open_bets: list[Bet] = []
     week_loss = Decimal("0")
@@ -674,7 +679,7 @@ def test_size_decisions_reserves_each_stake_before_sizing_the_next() -> None:
 
 
 def test_size_decisions_respects_bets_per_day() -> None:
-    settings = BankrollSettings(max_bets_per_day=2, **NO_GUARDS)
+    settings = BankrollSettings(staking_mode="kelly", max_bets_per_day=2, **NO_GUARDS)
     decisions = [make_decision(match_id=m, kelly_full=0.04) for m in (1, 2, 3)]
     sized, after = size_decisions(decisions, base_state(), settings, BETCLIC)
     assert [d.stake for d in sized] == [Decimal("10.00"), Decimal("10.00"), Decimal("0")]
@@ -742,7 +747,7 @@ def test_property_stake_never_exceeds_any_cap(
         kill_switch=halted == "kill",
         paused=halted == "pause",
     )
-    cfg = BankrollSettings(kelly_fraction=kelly_fraction_, stake_step=step)
+    cfg = BankrollSettings(staking_mode="kelly", kelly_fraction=kelly_fraction_, stake_step=step)
     decision = make_decision(match_id=1, kelly_full=kelly_full, odds=str(odds), p_win=p_win)
     stake, messages = size_stake(decision, state, cfg, BETCLIC)
 
@@ -793,6 +798,7 @@ def test_crossing_the_winnings_tax_threshold_is_never_worse_than_staying_below_i
         if kelly <= 0:
             continue
         cfg = BankrollSettings(
+            staking_mode="kelly",
             kelly_fraction=rng.choice([0.25, 0.5, 1.0]),
             max_stake_fraction=rng.choice([0.02, 0.05, 0.2]),
             max_match_exposure_fraction=1.0,

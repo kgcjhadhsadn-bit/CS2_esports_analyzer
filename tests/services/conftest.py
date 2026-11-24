@@ -46,6 +46,13 @@ def make_settings(root: Path, *, dry_run: bool = True) -> Settings:
     s.decision.min_probability = 0.55
     s.decision.max_sigma = 0.25
     s.decision.min_ev = 0.02
+    # the synthetic universe's probabilities (55-75 %) are below the confidence tiers: these service
+    # tests exercise the cycle mechanics with Kelly sizing (the tier rule has its own tests in
+    # tests/services/test_services_final_review_lens_c.py and tests/engine)
+    s.bankroll.staking_mode = "kelly"
+    # the tests price the synthetic odds from the raw model probabilities (EV targets); the
+    # high-confidence guard is tested on its own (test_services_final_review_lens_c.py)
+    s.decision.use_confidence_guard = False
     s.data_dir = root / "data"
     return s
 

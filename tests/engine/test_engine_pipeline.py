@@ -68,7 +68,8 @@ def test_full_engine_pipeline(session: Session, settings: Settings) -> None:
     state = bankroll.compute_state(session, settings, now=NOW)
     bankroll_settings = db_state.effective_bankroll_settings(session, settings)
     sized = bankroll.size_decision(decisions[0], state, bankroll_settings, settings.betclic)
-    assert sized.accepted and sized.stake == Decimal("20.00")  # 2% cap of the 1000 PLN bankroll
+    # confidence tiers (odds ignored): p 0.785 -> the 75 % tier = 1 % of the 1000 PLN bankroll
+    assert sized.accepted and sized.stake == Decimal("10.00")
 
     # the integration layer creates the bet row, places it, then records the stake
     quote = sized.priced.quote
@@ -93,11 +94,11 @@ def test_full_engine_pipeline(session: Session, settings: Settings) -> None:
     session.add(bet)
     session.flush()
     ledger.record_stake(session, bet)
-    assert bet.tax == Decimal("2.40") and bet.potential_payout == Decimal("27.28")
+    assert bet.tax == Decimal("1.20") and bet.potential_payout == Decimal("13.64")
 
     state = bankroll.compute_state(session, settings, now=NOW + timedelta(minutes=1))
-    assert state.exposure_by_match == {match.id: Decimal("20.00")}
-    assert state.balance == Decimal("980.00") and state.bankroll_reference == Decimal("1000.00")
+    assert state.exposure_by_match == {match.id: Decimal("10.00")}
+    assert state.balance == Decimal("990.00") and state.bankroll_reference == Decimal("1000.00")
     again = decision.evaluate(
         fav,
         match=decision.load_match_decision_info(
@@ -115,13 +116,13 @@ def test_full_engine_pipeline(session: Session, settings: Settings) -> None:
     bet.status, bet.payout, bet.pnl, bet.settled_at = BetStatus.WON, payout, pnl, settled_at
     ledger.record_payout(session, bet, payout)
     session.flush()
-    assert (payout, pnl) == (Decimal("27.28"), Decimal("7.28"))
+    assert (payout, pnl) == (Decimal("13.64"), Decimal("3.64"))
     final = bankroll.compute_state(session, settings, now=settled_at + timedelta(minutes=5))
-    assert final.balance == final.bankroll_reference == Decimal("1007.28")
-    assert final.realized_pnl_today == Decimal("7.28") and final.exposure_by_match == {}
+    assert final.balance == final.bankroll_reference == Decimal("1003.64")
+    assert final.realized_pnl_today == Decimal("3.64") and final.exposure_by_match == {}
     assert bankroll.check_loss_limits(session, final, settings, now=settled_at) is False
     reconciled = ledger.reconcile(
-        session, Decimal("1007.28"), tolerance=settings.executor.reconcile_tolerance
+        session, Decimal("1003.64"), tolerance=settings.executor.reconcile_tolerance
     )
     assert not reconciled.flagged and reconciled.entry_id is None
 
@@ -149,7 +150,9 @@ def test_pipeline_with_placement_results_and_local_settlement(session: Session, 
     assert [d.accepted for d in decisions] == [True, True, True]
 
     state = bankroll.compute_state(session, settings, now=NOW)
-    sized, projected = bankroll.size_decisions(decisions, state, settings.bankroll, settings.betclic)
+    # this flow exercises Kelly sizing (the loosened 55 % rule is below every confidence tier)
+    kelly = settings.bankroll.model_copy(update={"staking_mode": "kelly"})
+    sized, projected = bankroll.size_decisions(decisions, state, kelly, settings.betclic)
     # winner: 2 % cap = 20.00; map 3: f* = (0.584 x 0.26 - 0.14) / (0.584 x 0.4) = 0.0507, a quarter of
     # it on 1000 PLN = 12.67 -> 12.60; total maps: quarter Kelly is 1.19 PLN, below Betclic's minimum
     assert [d.stake for d in sized] == [Decimal("20.00"), Decimal("12.60"), Decimal("0")]

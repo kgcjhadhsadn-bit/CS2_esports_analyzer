@@ -1,4 +1,4 @@
-"""Bankroll state, stake sizing (fractional Kelly + hard caps) and loss limits.
+"""Bankroll state, stake sizing (confidence tiers or fractional Kelly, + hard caps) and loss limits.
 
 State (:func:`compute_state`), from the ledger and the ``bets`` table; dry-run bets are excluded
 from all money and limits:
@@ -19,9 +19,17 @@ from all money and limits:
   makes the very first day work (the initial deposit is the day-start bankroll, not 0) and it is
   conservative after a withdrawal (the limit shrinks with the bankroll).
 
-Stake sizing (:func:`size_stake`), PLAN.md section 6:
+Stake sizing (:func:`size_stake`), PLAN.md section 0 / 6. The base stake depends on
+``BankrollSettings.staking_mode``:
 
-``stake = kelly_fraction x kelly_full x bankroll_reference``, then capped by
+* ``"confidence_tiers"`` (default, owner decision 2026-11-24 - "bet on confidence, odds ignored"):
+  ``stake = tier fraction x bankroll_reference`` where the tier is the highest entry of
+  ``confidence_tiers`` whose minimum probability is met by ``p(win | settled)`` of the decision's
+  (confidence-guarded) outcome - by default 75-85 % -> 1 %, 85-92 % -> 1.5 %, 92 %+ -> 2 %. The odds
+  play no part; a probability below every tier stakes nothing (``below_tier``);
+* ``"kelly"``: ``stake = kelly_fraction x kelly_full x bankroll_reference`` (0 without an edge);
+
+then, in both modes, capped by
 
 * ``max_stake_fraction x bankroll_reference``;
 * the match exposure cap ``max_match_exposure_fraction x bankroll_reference - open stakes on the
@@ -36,7 +44,8 @@ Stake sizing (:func:`size_stake`), PLAN.md section 6:
 * the weekly guard (same with the week numbers);
 * ``max_bets_per_day`` and the free ``balance``;
 * the 10 % winnings tax: when the stake would push the winning above 2,280 PLN, the stake is held
-  at the tax-free limit unless the larger, taxed stake has a higher expected log-growth;
+  at the tax-free limit unless the larger, taxed stake has a higher expected log-growth (Kelly: the
+  fractional-Kelly stake for the taxed odds; tiers: the tier stake itself);
 
 rounded DOWN to ``stake_step`` (never above any cap); below Betclic's ``min_stake`` it becomes 0 with
 a reason. A halted bot (kill switch / pause) never gets a stake.
@@ -47,9 +56,10 @@ either recompute the state after each bet row is created, or size a whole batch 
 
 Loss limits (:func:`check_loss_limits`): when the realized loss of the day (week) reaches
 ``daily_loss_limit_fraction x day_start_bankroll`` (weekly likewise) the bot is paused with a clear
-reason. Resuming is manual (dashboard); a limit pauses only once per period, so a manual resume is
-not undone by the next scheduler tick (the daily/weekly guards still block new stakes until the
-period rolls over).
+reason (structured ``loss_limit_daily`` / ``loss_limit_weekly``). With ``autonomy.enabled`` the
+auto-resume service lifts it at the next Warsaw midnight / Monday; otherwise resuming is manual. A
+limit pauses only once per period, so a resume is not undone by the next scheduler tick (the
+daily/weekly guards still block new stakes until the period rolls over).
 """
 
 from __future__ import annotations
@@ -409,17 +419,37 @@ def size_stake(
         reasons.append(
             f"bets_per_day: {state.bets_placed_today} bets placed today (max {settings.max_bets_per_day})"
         )
-    kelly_full = decision.priced.kelly_full
-    if not math.isfinite(kelly_full) or kelly_full <= 0:
-        reasons.append(f"no_edge: full Kelly fraction {kelly_full:.4f} <= 0")
     bankroll = state.bankroll_reference
+    base_fraction: float | None = None
+    base_note: str | None = None
+    if settings.staking_mode == "kelly":
+        kelly_full = decision.priced.kelly_full
+        if not math.isfinite(kelly_full) or kelly_full <= 0:
+            reasons.append(f"no_edge: full Kelly fraction {kelly_full:.4f} <= 0")
+        else:
+            base_fraction = settings.kelly_fraction * kelly_full
+    else:
+        p_settled = decision.priced.outcome.p_win_given_settled
+        tier = confidence_tier(p_settled, settings.confidence_tiers)
+        if tier is None:
+            lowest = min((p for p, _ in settings.confidence_tiers), default=math.nan)
+            reasons.append(
+                f"below_tier: p(win | settled) {p_settled:.3f} is below the lowest confidence tier "
+                f"({lowest:.3f})"
+            )
+        else:
+            base_fraction = tier[1]
+            base_note = (
+                f"tier: p(win | settled) {p_settled:.3f} >= {tier[0]:.3f} -> {tier[1]:.2%} of bankroll "
+                f"{_money(bankroll)} (odds ignored)"
+            )
     if bankroll <= 0:
         reasons.append(f"no_bankroll: bankroll reference is {_money(bankroll)}")
-    if reasons:
+    if reasons or base_fraction is None:
         return _ZERO, reasons
 
     status = loss_limit_status(state, settings)
-    kelly_stake = D(settings.kelly_fraction) * D(kelly_full) * bankroll
+    base_stake = D(base_fraction) * bankroll
     caps: list[tuple[str, Decimal, str]] = [
         (
             "max_stake",
@@ -452,8 +482,8 @@ def size_stake(
     if exhausted:
         return _ZERO, exhausted
 
-    stake = kelly_stake
-    notes: list[str] = []
+    stake = base_stake
+    notes: list[str] = [base_note] if base_note else []
     for name, cap, detail in caps:
         if cap < stake:
             stake = cap
@@ -475,6 +505,25 @@ def size_stake(
     return stake, notes
 
 
+def confidence_tier(p_settled: float, tiers: Iterable[tuple[float, float]]) -> tuple[float, float] | None:
+    """The highest ``(minimum probability, bankroll fraction)`` tier whose minimum ``p_settled`` meets.
+
+    ``None`` when the probability is below every tier or not a finite number (never staked). Tiers are
+    validated (:func:`cs2bot.config.confidence_tiers_problem`, for ``.env`` and dashboard edits); this
+    function does not rely on it: any order works and a non-finite / non-positive tier is skipped. The
+    stake is still capped by ``max_stake_fraction`` in :func:`size_stake`.
+    """
+    if not math.isfinite(p_settled):
+        return None
+    best: tuple[float, float] | None = None
+    for p_min, fraction in tiers:
+        if not (math.isfinite(p_min) and math.isfinite(fraction) and fraction > 0):
+            continue  # unusable tier (only possible with unvalidated settings): never staked from
+        if p_settled >= p_min and (best is None or p_min > best[0]):
+            best = (float(p_min), float(fraction))
+    return best
+
+
 def _respect_winnings_tax(
     decision: BetDecision,
     stake: Decimal,
@@ -486,9 +535,10 @@ def _respect_winnings_tax(
 
     Above the threshold 10 % of the whole winning is withheld, so the net odds drop from
     ``b = o_eff - 1`` to ``b' = o_eff (1 - r) - 1`` and a stake just above the limit is strictly
-    worse than the limit itself. Candidates: the limit (net odds ``b``) and the fractional-Kelly
-    stake for ``b'`` (if it lies above the limit); the one with the higher expected log-growth of
-    the bankroll wins.
+    worse than the limit itself. Candidates: the limit (net odds ``b``) and - above the limit - the
+    fractional-Kelly stake for ``b'`` (Kelly mode) or the capped tier stake (confidence tiers); the one
+    with the higher expected log-growth of the bankroll wins (with odds ignored and a negative EV the
+    smaller, tax-free stake always wins).
     """
     model = TaxModel.from_settings(betclic)
     odds = decision.priced.quote.odds
@@ -505,9 +555,12 @@ def _respect_winnings_tax(
     o_eff = float(effective_odds(odds, tax_rate=model.stake_tax_rate))
     b_free = o_eff - 1.0
     b_taxed = o_eff * (1.0 - float(model.big_win_rate)) - 1.0
-    taxed_full_kelly = max(0.0, kelly_for_net_odds(p_win, p_lose, b_taxed, **refunds))
-    # same fractional Kelly and the same caps (``stake`` already includes every cap)
-    taxed_stake = min(D(settings.kelly_fraction * taxed_full_kelly) * bankroll_reference, stake)
+    if settings.staking_mode == "kelly":
+        taxed_full_kelly = max(0.0, kelly_for_net_odds(p_win, p_lose, b_taxed, **refunds))
+        # same fractional Kelly and the same caps (``stake`` already includes every cap)
+        taxed_stake = min(D(settings.kelly_fraction * taxed_full_kelly) * bankroll_reference, stake)
+    else:  # confidence tiers: the candidate above the limit is the (capped) tier stake itself
+        taxed_stake = stake
     growth_limit = expected_log_growth(p_win, p_lose, b_free, float(limit) / bankroll, **refunds)
     if taxed_stake > limit:
         growth_taxed = expected_log_growth(p_win, p_lose, b_taxed, float(taxed_stake) / bankroll, **refunds)

@@ -76,6 +76,7 @@ from cs2bot.config import Settings
 from cs2bot.domain.betting import BetOrder, ExecutorHealth, PlacementResult, PlacementStatus
 from cs2bot.domain.control import LoginAttempt, LoginStatus
 from cs2bot.executor.base import (
+    EXECUTOR_UNAVAILABLE_PREFIX,
     BookmakerBetRecord,
     BookmakerBetStatus,
     BrowserStartError,
@@ -322,12 +323,18 @@ class BetclicExecutor:
                 page = self._session.ensure_page()
                 self._session.ensure_lock()
             except (BrowserStartError, ProfileLockedError) as exc:
-                return self._result(attempt, PlacementStatus.FAILED, str(exc), take_screenshot=False)
+                return self._result(
+                    attempt,
+                    PlacementStatus.FAILED,
+                    f"{EXECUTOR_UNAVAILABLE_PREFIX}{exc}",
+                    take_screenshot=False,
+                )
             except (OSError, PlaywrightError) as exc:  # e.g. the lock file cannot be created (Windows)
                 return self._result(
                     attempt,
                     PlacementStatus.FAILED,
-                    f"could not start the browser / take the profile lock: {_short_error(exc)}",
+                    f"{EXECUTOR_UNAVAILABLE_PREFIX}could not start the browser / take the profile lock: "
+                    f"{_short_error(exc)}",
                     take_screenshot=False,
                 )
             if not self._journal_compacted:  # we hold the profile lock: we are the journal's only writer

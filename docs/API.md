@@ -96,7 +96,10 @@ random per-process secret if unset), `HttpOnly`, `SameSite=Strict`, `Path=/`,
 `Max-Age=api.session_max_age_s` (12 h). Changing the username or password invalidates all sessions.
 `api.login_max_failures` (5) failed logins per client within `api.login_window_s` (300 s), or
 `api.login_global_max_failures` (20) overall, -> **429** with `Retry-After`. The OpenAPI schema and
-`/api/docs` are public too (they contain no data).
+`/api/docs` are public too (they contain no data). "Client" is the TCP peer, unless the peer is one of
+`api.forwarded_allow_ips` (a reverse proxy - Caddy on the VPS): then `X-Forwarded-For` gives the client
+and `X-Forwarded-Proto: https` makes the cookie `Secure`. Forwarding headers from any other peer are
+ignored; the `Host` header is never rewritten.
 
 ### `GET /api/auth/me`
 
@@ -808,12 +811,14 @@ switch. Response: the trading state (as `GET /api/control/state`).
     "decision": {
       "min_probability": 0.75, "min_ev": 0.05, "max_sigma": 0.05, "min_data_completeness": 0.95,
       "min_event_link_confidence": 0.9, "min_odds": "1.01", "max_odds": "15.0", "min_minutes_before_start": 10,
-      "max_hours_before_start": 48, "prefer_known_veto": true, "market_overrides": {}, "disabled_markets": []
+      "max_hours_before_start": 48, "prefer_known_veto": true, "market_overrides": {}, "disabled_markets": [],
+      "require_trusted_calibration": false, "require_profitable_win": true, "use_confidence_guard": true
     },
     "bankroll": {
       "starting_bankroll": "1000.00", "currency": "PLN", "kelly_fraction": 0.2, "max_stake_fraction": 0.02,
       "max_match_exposure_fraction": 0.04, "daily_loss_limit_fraction": 0.05, "weekly_loss_limit_fraction": 0.1,
-      "max_bets_per_day": 10, "stake_step": "0.10"
+      "max_bets_per_day": 10, "stake_step": "0.10", "staking_mode": "confidence_tiers",
+      "confidence_tiers": [[0.75, 0.01], [0.85, 0.015], [0.92, 0.02]]
     }
   },
   "defaults": {"decision": {"min_ev": -1.0, "...": "all fields"}, "bankroll": {"kelly_fraction": 0.25, "...": "all fields"}},
@@ -842,7 +847,11 @@ which would silently disable a threshold), and ranges: `min_probability` (0, 1);
 the same ranges; `disabled_markets` must be market types; `starting_bankroll` >= 0; `currency` 3
 capital letters; `kelly_fraction`, `max_stake_fraction`, `max_match_exposure_fraction`,
 `daily_loss_limit_fraction`, `weekly_loss_limit_fraction` (0, 1]; `max_bets_per_day` [0, 1000];
-`stake_step` (0, 1000]. Response: same as `GET`.
+`stake_step` (0, 1000]; `staking_mode` `confidence_tiers` | `kelly`; `confidence_tiers` a non-empty list
+of `[minimum probability, fraction]` pairs, probabilities strictly ascending in (0, 1), fractions
+non-decreasing in (0, `max_stake_fraction`] - checked also when only `max_stake_fraction` or
+`staking_mode` changes; `require_profitable_win`, `use_confidence_guard`,
+`require_trusted_calibration` booleans. Response: same as `GET`.
 
 ```json
 {"detail": [{"loc": ["body", "bankroll", "kelly_fraction"], "msg": "must be in (0, 1]", "type": "value_error"}]}

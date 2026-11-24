@@ -1,6 +1,6 @@
 # final_review: implementation report
 
-**Tests:** `.venv/bin/python -m pytest tests -q -n 2` - 3000 passed, 20 skipped (browser / PostgreSQL), 0 failed (after Lens B; Lens A: 2988 passed); Lens A regression tests: `tests/odds/test_odds_final_review.py` (4), `tests/services/test_services_final_review.py` (8), `tests/services/test_services_final_review_db.py` (3); Lens B regression tests: `tests/learning/test_learning_final_review.py` (5), `tests/services/test_services_final_review_lens_b.py` (7) - 12 passed, 0 failed; `ruff check src tests`, `ruff format --check src tests` and `mypy` clean; `tests/foundation` 37 passed; dashboard (unchanged) `npm run lint` clean, `npm test` 79 passed, `npm run build` OK.
+**Tests:** `.venv/bin/python -m pytest tests -n 2` - **3241 passed, 21 skipped (browser / PostgreSQL), 0 failed** (after Lens C; Lens B: 3000 passed; Lens A: 2988 passed); Lens C regression tests: `tests/engine/test_engine_final_review_lens_c.py` (42), `tests/services/test_services_final_review_lens_c.py` (12), `tests/api/test_api_final_review_lens_c.py` (10), `tests/learning/test_learning_final_review_lens_c.py` (4), `tests/services/test_telegram_service.py::test_watchdog_reports_a_stale_or_stuck_money_path_once_per_cooldown` (1) - 69 passed, 0 failed; Lens A regression tests: `tests/odds/test_odds_final_review.py` (4), `tests/services/test_services_final_review.py` (8), `tests/services/test_services_final_review_db.py` (3); Lens B regression tests: `tests/learning/test_learning_final_review.py` (5), `tests/services/test_services_final_review_lens_b.py` (7); `ruff check src tests`, `ruff format --check src tests` and `mypy` (203 files) clean; `tests/foundation` 37 passed; dashboard `npm run lint` clean, `npm test` 86 passed (2 new), `npm run build` OK; `docker compose -f docker-compose.cloud.yml config` renders; `bash -n` on the changed script.
 
 ## Summary
 
@@ -194,6 +194,132 @@ fix); new tests: `tests/learning/test_learning_final_review.py` (5) and
   every `cs2bot ...` command and option in the docs exists; every endpoint in API.md exists and every
   `/api` endpoint is documented.
 
+### Lens C (cloud autonomy, VPS deployment, deep data, the confidence rule)
+
+I followed the unattended loop on the VPS end to end - container start (entrypoint, Xvfb, migrations,
+`cs2bot up`), the first training, the scheduler lanes, odds -> prediction -> guard -> decision -> tier
+stake -> executor -> settlement, pauses / auto-resume / circuit breaker, auto-login, Telegram, the
+dashboard behind Caddy, backups - and checked that deep_data's features and the trusted-calibration
+verdict actually reach the decision. The user's own words set the rule: "I do not want anything
+'value', even a 1.28 wins!" (confidence only, odds ignored; PLAN.md section 0) - the computed task's
+"break-even guard" is the superseded variant. Every fix has a regression test; new tests:
+`tests/engine/test_engine_final_review_lens_c.py` (42), `tests/services/test_services_final_review_lens_c.py`
+(12), `tests/api/test_api_final_review_lens_c.py` (10), `tests/learning/test_learning_final_review_lens_c.py`
+(4), 1 in `tests/services/test_telegram_service.py`, 2 vitest tests; existing tests that encoded the old
+behaviour were adapted (Kelly-specific suites now pin `staking_mode="kelly"`).
+
+**High - fixed**
+
+1. **The owner's rule did not work end to end: stakes were still fractional Kelly.** The decision
+   accepted a 75%+ pick at any price, but `engine.bankroll.size_stake` staked 0 (`no_edge`) whenever the
+   EV after the 12% tax was not positive - a 1.28 favourite at 80% (EV -0.10) was accepted and never bet.
+   The confidence tiers required by the brief's addendum were configured but not implemented.
+   *Fix:* `size_stake` sizes by `bankroll.staking_mode`: `confidence_tiers` (default) stakes the highest
+   tier met by p(win | settled) - 75% -> 1%, 85% -> 1.5%, 92% -> 2% of the bankroll reference, odds
+   ignored - then applies every existing cap (max stake, per-match exposure, daily / weekly loss guards,
+   bets per day, free balance, the 2,280 PLN winnings-tax limit, stake step rounding down, Betclic
+   minimum); `kelly` keeps the old sizing. Tiers are validated (finite, strictly ascending, fractions
+   positive, non-decreasing, <= `max_stake_fraction`) for `.env` and every dashboard edit
+   (`config.confidence_tiers_problem`), deliberately not inside `BankrollSettings` (an override stored
+   before this update, e.g. a 1.5% max stake, must not make every cycle raise; the max-stake cap binds
+   anyway). Accepted outcomes of one match are sized most-confident first (EV order preferred long
+   prices). The backtest uses the same staker (the report's `settings_summary` records the mode and
+   tiers); dashboard, API, `.env.example`, OPERATIONS / VPS_SETUP / WINDOWS_SETUP / README / PLAN updated.
+2. **A "win" below odds 1.137 loses money even when it wins.** With the 12% stake tax a winning bet pays
+   `0.88 x odds` per 1 PLN staked: at 1.10 that is 0.968, so the bet loses whether it wins or loses. The
+   decision accepted p 0.89 at 1.10 (an existing test asserted exactly that). This is not a value rule -
+   the user wants a 1.28 win to be a win, and it is. *Fix:* `decision.require_profitable_win` (default
+   on) rejects odds below `engine.ev.min_profitable_odds` (1.137; 1.001 in a tax-free promo) with
+   `unprofitable_win`, and `min_acceptable_odds` never lets the executor accept a drop below it.
+   `false` ignores the odds completely. Recorded in PLAN.md section 0 for the owner to confirm.
+3. **deep_data's features never reached the model.** `services.registry.train_models` built the
+   ensemble's feature store without `DeepData` (match metadata - stage, venue, schedule -, demo duels and
+   clutches, coach changes, Betclic market history) and without the demo team stats, while the live
+   store (`FeatureStore.from_session`) had both. Every deep column was all-NaN in training (never split
+   on, so the 70+ new factors were dead weight live) and the demo-stat columns were a train / live skew.
+   The backtest pipeline had the same gap. *Fix:* one builder, `services.registry.build_feature_store`,
+   for training and live prediction (incl. the optional sharp feed); `HistoricalData` / `TrainingSet`
+   carry `team_demo_stats` and `deep` (cut at every training cutoff, leakage-asserted) into
+   `PipelineTrainer`.
+4. **The high-confidence guard was not applied, and nothing on the VPS would ever write it.**
+   cloud_autonomy left `guard.adjust` as a TODO; only a manual `cs2bot backtest` wrote
+   `confidence_guard.json`, which nobody runs on an unattended server. *Fix:* `engine.confidence`
+   applies the guard before pricing (`decision.use_confidence_guard`, default on): the 75% check, the
+   stake tier, the EV shown and the recorded decision use the adjusted p(win | settled) (refund mass
+   kept; never raises a probability; a failing guard yields NaN, i.e. no bet). The guard file is read
+   once per cycle; without one the no-history prior applies (half of the excess over 75% is kept, so a
+   0.75 pick stays bettable and only the tier is more cautious); a broken file falls back to the prior.
+   New scheduler job `confidence_guard_refresh` (train lane, daily slot, runs when the file is
+   `models.guard_refresh_days` (7) old and at least 40 finished matches have stored prices; attempts
+   remembered so an empty window is not retried daily) re-runs the walk-forward backtest over 180 days
+   (`services.backtesting`, shared with `cs2bot backtest`; the file is written atomically). `cs2bot doctor`
+   reports the guard; decisions carry a "confidence guard: p 0.950 -> 0.850" note; Telegram bet messages
+   show "confidence X% -> stake Y% of the bankroll".
+
+**Medium - fixed**
+
+5. **Guard: empty top bins escaped an over-confident history.** The shrinker's monotone running minimum
+   only lets higher bins cap lower ones; an empty 97.5-100% bin used the milder no-history prior, so with
+   97% picks winning 70% a 1.00 pick still counted as 0.87 and was bet at the 1.5% tier. *Fix*
+   (`HighConfidenceShrinker.fit`): a thin bin (< `min_bin_predictions`) above an over-confident bin
+   inherits at least that miscalibration; well-populated bins keep their own evidence.
+6. **An unusable executor produced one FAILED bet per accepted outcome every cycle.** Chromium missing or
+   the profile locked by another process returned FAILED; the cycle went on to the next outcome (another
+   browser start) and repeated every 3 minutes; the `executor_unavailable` pause code existed but had no
+   producer. *Fix:* such results carry `executor.base.EXECUTOR_UNAVAILABLE_PREFIX`; the cycle stops at the
+   first one and, with autonomy, pauses with `executor_unavailable` (lifted by the auto-resume service
+   after a passing health check; the circuit breaker bounds repeats). Without autonomy (the PC) it only
+   stops the cycle, as before.
+7. **The first training blocked the whole start.** It ran before the scheduler and the API: with a
+   backfilled history it can exceed the 15-minute healthcheck start period (container unhealthy,
+   `deploy.sh` timing out), no odds were collected meanwhile, and a `docker stop` during it hit a process
+   without signal handlers. The scheduled retrain (never run -> due at once) then trained the same data a
+   second time. *Fix:* the first training runs in a daemon thread (`run_up(train_in_background=True)`);
+   the retrain job uses `ModelRegistry.retrain_unless_fresh` (skips a bundle younger than 2 h, checked
+   inside the train lock); healthcheck start period 5 minutes.
+8. **Behind Caddy the login rate limit acted per proxy.** uvicorn ran with `proxy_headers=False`, so every
+   request came from Caddy's address: 5 wrong passwords from anyone on the internet locked the owner out
+   for 5 minutes, the audit log showed Caddy, and the session cookie was never `Secure`.
+   *Fix:* `APISettings.forwarded_allow_ips` (empty by default) adds uvicorn's `ProxyHeadersMiddleware`
+   trusting only those peers; `docker-compose.cloud.yml` pins Caddy to a fixed address
+   (`CADDY_IPV4` on `FRONTEND_SUBNET`) and sets `CS2BOT_API__FORWARDED_ALLOW_IPS` to it. Forwarding
+   headers from any other peer are ignored; Host is never rewritten.
+9. **Silent stops reached nobody.** Telegram reported failing jobs only; a lane that stopped running or a
+   job hanging in RUNNING (a stuck browser call blocks the whole fast lane: no odds, bets or settlement)
+   was visible only on a dashboard nobody watches. *Fix:* the notifier's watchdog uses the dashboard's
+   `job_health` and alerts once per cooldown when a money-path job (odds, predict, bet, settle) has not
+   succeeded for twice its interval + 10 min, or any job runs longer than 45 min.
+
+**Low - fixed**
+
+10. Docs out of step: PLAN.md still listed "¼ Kelly" and the EV row of section 6 as current; README,
+    CLAUDE.md (VPS files missing from "Where things are"), OPERATIONS (said tiers were not wired yet),
+    VPS_SETUP (first training blocks the API), WINDOWS_SETUP, ARCHITECTURE (no cloud deployment
+    paragraph, no deep_data / backtesting / guard), API.md and `.env.example` (no VPS block) updated.
+
+**Verified, no change needed**
+
+* *Docker start:* the entrypoint starts a supervised Xvfb on `:99`, retries `cs2bot db upgrade`, then
+  `cs2bot up` = scheduler + Betclic executor (headful on Xvfb through the `cs2bot-chromium` wrapper,
+  `effective_headless` cannot fall back because `DISPLAY` is set) + API on 0.0.0.0:8000 (password and
+  session secret enforced by compose, entrypoint and `Settings`; Host allow-list and CORS origin derived
+  from `CS2BOT_PUBLIC_HOST`); SIGTERM / SIGINT forwarded, Xvfb death -> exit 70 -> Docker restart;
+  `restart: unless-stopped` on every service; PostgreSQL only on the internal network; only Caddy's
+  80/443 published; VNC on the host's loopback only; `.env` never in the build context.
+* *Restart / crash recovery:* stale PENDING rows cancelled, PLACING never re-sent, placement journal +
+  profile lock, settlement reconciles from the Betclic history; auto-login blocks survive restarts
+  except "no credentials"; the Telegram update offset is persisted (no replayed `/go`).
+* *Auto-resume / circuit breaker:* never the kill switch or a manual pause; loss limits lift at the next
+  Warsaw day / week; pause writers lock the row; breaker 3 per 24 h per code, window restarts at the
+  owner's resume. The new `executor_unavailable` producer goes through the same `pause_trading` path
+  (audit -> Telegram).
+* *Secrets:* `SecretStr` everywhere; the Telegram token redacted from errors; credentials scrubbed from
+  browser errors; `.env` chmod 600 and excluded from the image; nothing new logs a secret.
+* *Backups:* daily verified `pg_dump`, retention, optional rclone; `restore.sh` ends with a manual pause.
+* *Trusted calibration:* `require_trusted_calibration` + the guard's per-market verdict reach
+  `engine.decision` (cloud_autonomy), fail safe when unknown; now read from the same per-cycle guard
+  object as the adjustment.
+
 ## Public API
 
 New or changed callables other packages / the owner use (everything else is unchanged):
@@ -282,6 +408,84 @@ with session_factory() as s:       # after replacing a participant of match 42 b
     s.commit()
 ```
 
+### Lens C: new or changed callables
+
+```python
+# cs2bot.config
+DecisionSettings.require_profitable_win: bool = True     # reject odds where a win pays back < stake
+DecisionSettings.use_confidence_guard: bool = True       # apply the high-confidence guard before deciding
+BankrollSettings.staking_mode: Literal["confidence_tiers", "kelly"] = "confidence_tiers"
+BankrollSettings.confidence_tiers: list[tuple[float, float]] = [(0.75, .01), (0.85, .015), (0.92, .02)]
+confidence_tiers_problem(bankroll: BankrollSettings) -> str | None   # None = usable (Settings + dashboard)
+ModelSettings.guard_refresh_days: float = 7.0            # 0 = no scheduled guard refresh
+ModelSettings.guard_backtest_days: int = 180; guard_backtest_sims: int = 1000
+ModelSettings.guard_backtest_retrain_days: int = 14; guard_min_priced_matches: int = 40
+SchedulerSettings.guard_refresh_cron: str = "30 6 * * *" # daily slot (runs only when due)
+APISettings.forwarded_allow_ips: list[str] = []          # trusted reverse proxies (Caddy on the VPS)
+
+# cs2bot.engine
+bankroll.size_stake(decision, state, settings, betclic) -> (Decimal, list[str])   # tiers or Kelly + caps;
+    # notes start with "tier: ..." / "capped: ...", reasons with "below_tier: ..." etc.
+bankroll.confidence_tier(p_settled: float, tiers) -> tuple[float, float] | None
+ev.min_profitable_odds(settings: Settings | BetclicSettings | TaxModel) -> Decimal  # 1.137 at 12 %
+decision.ReasonCode.UNPROFITABLE_WIN            # "unprofitable_win"
+decision.min_acceptable_odds(...)               # also floored at min_profitable_odds (when enabled)
+confidence.ProbabilityAdjuster = Callable[[str, float], float]        # (market type, p) -> p'
+confidence.guarded_outcome(outcome, market_type, adjuster) -> OutcomeProbability
+confidence.guard_pairs(pairs, adjuster) -> (pairs, {(spec_key, selection): (p_model, p_adjusted)})
+confidence.guard_note(p_model, p_adjusted) -> str
+
+# cs2bot.models.confidence
+HighConfidenceShrinker.fit(...)   # thin bins above an over-confident bin inherit its miscalibration
+
+# cs2bot.services
+registry.build_feature_store(session, settings, *, until, map_results=None, player_maps=None,
+                             rounds=None, vetoes=None) -> FeatureStore   # training AND live
+registry.ModelBundle.settings: Settings | None    # runtime only; set by train_models / the registry
+registry.ModelRegistry.retrain_unless_fresh(session_factory, *, max_age: timedelta, keep=5)
+    -> TrainReport | None
+backtesting.run_backtest_with_guard(session_factory, settings, *, since, until, sims=2000,
+    ensemble=True, retrain_every=timedelta(days=7), params=None) -> GuardRefreshReport
+backtesting.refresh_confidence_guard(session_factory, settings, *, now=None, force=False, runner=None)
+    -> GuardRefreshReport          # .ran .written .skipped .path .n_predictions .trusted .as_dict()
+backtesting.save_guard_from_report(settings, report) -> (Path | None, list[str], int)
+backtesting.priced_finished_matches(session, *, since, until) -> int
+backtesting.GUARD_STATE_KEY = "confidence_guard"   # system_state: last refresh attempt
+betting.trusted_markets(bundle, settings=None, *, guard=None) -> set[str] | None
+betting.run_betting_cycle(...)     # unchanged signature; guard -> decision -> tier sizing, most
+    # confident first; bets.extra gains "p_settled" and "stake_fraction"; an unusable executor stops
+    # the cycle (+ pause executor_unavailable with autonomy)
+doctor.check_confidence_guard(settings) -> Check
+telegram.WATCHED_JOB_KINDS, telegram.STUCK_JOB_AFTER   # watchdog alerts in TelegramNotifier.scan_once
+
+# cs2bot.executor.base
+EXECUTOR_UNAVAILABLE_PREFIX = "executor unavailable: "; is_executor_unavailable(message) -> bool
+
+# cs2bot.flows
+jobs: "confidence_guard_refresh" (train lane), RETRAIN_SKIP_IF_NEWER_THAN = timedelta(hours=2)
+supervisor.run_up(..., train_in_background: bool = True, ...)
+
+# cs2bot.backtest
+HistoricalData(..., team_demo_stats=(), deep=None); TrainingSet(..., team_demo_stats=(), deep=None)
+load_historical_data(session, *, ..., with_deep=False, sharp=None)   # run_db_backtest: with the ensemble
+```
+
+API: `GET/PUT /api/control/config` expose and validate `staking_mode`, `confidence_tiers`,
+`require_profitable_win`, `use_confidence_guard`, `require_trusted_calibration` (docs/API.md).
+Compose / `.env`: `CADDY_IPV4` (172.30.250.10), `FRONTEND_SUBNET` (172.30.250.0/24),
+`CS2BOT_API__FORWARDED_ALLOW_IPS` (set by the compose file).
+
+Wiring example (entry points unchanged; the scheduler runs the new job by itself):
+
+```python
+from cs2bot.services.backtesting import refresh_confidence_guard
+from cs2bot.services.betting import run_betting_cycle
+
+report = run_betting_cycle(session_factory, settings, executor, bundle)  # guard + tiers inside
+guard = refresh_confidence_guard(session_factory, settings, force=True)  # = `cs2bot backtest` + guard
+print(guard.as_dict())   # {"written": True, "trusted": [...], ...} or {"skipped": "only 12 finished ..."}
+```
+
 ## Known limitations
 
 Remaining risks found in this review but not changed (with why):
@@ -362,6 +566,64 @@ Lens B (data and model correctness), remaining:
     (`CS2BOT_BETCLIC__TOTALS_INCLUDE_OVERTIME`); review the entries marked unverified in
     `config\patches.yaml` (map-pool calendar).
 
+### Lens C (cloud runtime, deep data, the confidence rule), remaining
+
+- **Until the guard has history, the top tier is out of reach.** The no-history prior keeps half of the
+  excess over 75%: raw 0.75-0.95 -> the 1% tier, raw >= 0.95 -> 1.5%, and 92%+ (2%) is impossible. The
+  scheduled refresh needs >= 40 finished matches with stored Betclic prices (a few weeks after the first
+  start). Deliberate (a confident wrong probability is the costliest error); `decision.use_confidence_guard
+  = false` stakes on the raw probabilities instead.
+- **The backtest does not apply the guard** (it is fitted on the backtest's own predictions - applying it
+  there would be look-ahead), so backtest stakes use raw probabilities while live stakes are more
+  cautious. The backtest's feature store still stays at the last retrain cutoff between retrains (the
+  live store refreshes every 30 min); match metadata is treated as static pre-match information.
+- **Not run here:** the Docker image (no daemon; the CI `docker` job builds it and runs the smoke test,
+  which now also exercises the pinned Caddy address and the `Secure` cookie), a real VPS, Let's Encrypt,
+  live Betclic / HLTV / Telegram. `docker compose config` renders the new network / env settings.
+- **The 2,280 PLN winnings-tax rule in tier mode** compares log-growth with the (possibly negative-EV)
+  odds, so a tier stake that would push a win above 2,280 PLN is usually held at the tax-free limit -
+  relevant only above a ~100 000 PLN bankroll.
+- **The global login limit** (20 failures / 5 min) can still be exhausted by a distributed attacker
+  (dashboard locked for 5 min; Telegram unaffected). The per-IP limit now works behind Caddy.
+- **CLV** is still measured against Betclic's own close (deep_data's `closing_line_reference` with a
+  sharp feed is not wired into settlement; no sharp feed is configured).
+- **History backfill is manual** (side container, VPS_SETUP section 9); no scheduler job.
+- **Chromium flags** still come from the `cs2bot-chromium` wrapper (cloud_deploy FCR 2, not needed for
+  correctness).
+- `telegram.enabled` / `autonomy.auto_login` without a token / credentials do not stop the start-up
+  (doctor fails, the dashboard alerts, Telegram stays silent - by design the bot keeps working).
+- The default backup omits `data/browser` (Betclic session + placement journal); losing the disk loses
+  the journal - keep `BACKUP_INCLUDE_DATA=true` + `RCLONE_REMOTE` (checklist below).
+
+### What the owner must verify on the VPS before going live (Lens C)
+
+1. `deploy/linux/deploy.sh --selftest` passes; `deploy/linux/status.sh --doctor` shows no FAIL. The
+   "confidence guard" line is a warning until the first weekly backtest - expected.
+2. The dashboard opens over HTTPS and logs in. After five wrong passwords from your phone's mobile
+   network (not from the PC) the PC can still log in (the rate limit sees real clients). If `deploy.sh`
+   fails with "Pool overlaps with other one on this address space", set `FRONTEND_SUBNET` / `CADDY_IPV4`
+   in `.env`, `docker compose down` (never `-v`), `deploy.sh`.
+3. Dashboard > Settings shows the bet rule: confidence only, odds 1.137 or more, the three stake tiers.
+   Decide whether you keep `CS2BOT_DECISION__REQUIRE_PROFITABLE_WIN=true` (recommended: below 1.137 a
+   win pays back less than the stake) and `CS2BOT_DECISION__USE_CONFIDENCE_GUARD=true` (recommended:
+   stakes start at 1% / 1.5% until the backtest shows the model deserves more).
+4. First start on an empty model: the dashboard answers at once; the log shows "models: trained ..."
+   before any prediction / bet. After the backfill: `docker compose exec app cs2bot models train`, then
+   `docker compose restart app`.
+5. Telegram: `docker compose exec app cs2bot telegram test`; send `/status`. During the dry-run days you
+   receive "DRY RUN bet ... confidence X% -> stake Y% of the bankroll" messages; a "has not succeeded for
+   too long" / "stuck?" message means a lane stopped - restart the app and look at the logs.
+6. Stop Chromium once on purpose (e.g. `docker compose exec app pkill -f chrome` during a dry run): the
+   next placement may fail, the bot pauses with `executor_unavailable` (Telegram) and resumes itself
+   after the next health check.
+7. After a few weeks of stored prices: Telegram / `cs2bot doctor` shows the guard written (trusted market
+   types listed). Optionally then `CS2BOT_DECISION__REQUIRE_TRUSTED_CALIBRATION=true`.
+8. Backups: `BACKUP_INCLUDE_DATA=true` and an off-site `RCLONE_REMOTE`; run `deploy/linux/backup.sh` once
+   and check `logs/backup.log`. A restore ends with a manual pause - compare "Moje zakłady" first.
+9. Everything from the Windows checklist that is not PC-specific still applies (dry-run screenshots,
+   quick-bet mode off, minimum-stake live bets, CONFIRMED links' `teams_swapped`, the server clock - NTP
+   is set by `provision.sh`).
+
 ## Foundation change requests
 
 None open. Applied in this review (I could edit any file): `src/cs2bot/db/models.py` (unique ledger
@@ -382,8 +644,20 @@ settings; no behaviour change); code in `models/ensemble.py`, `llm/store.py` (+ 
 for players (time-aware roles); the veto publication time (to replay veto timing in the backtest); a
 `calibrated` marker on `MatchPrediction` so `engine.decision` can require calibration if the owner wants it.
 
+Lens C: none open (I could edit any file). Applied: `src/cs2bot/config.py` (decision / bankroll / model /
+scheduler / API fields, `confidence_tiers_problem`), `src/cs2bot/executor/base.py` + `betclic.py` +
+`threaded.py` (unavailable prefix), `src/cs2bot/models/confidence.py`, `src/cs2bot/backtest/*`,
+`src/cs2bot/api/main.py` + `configedit.py`, services / flows / CLI, the dashboard, `Dockerfile`,
+`docker-compose.cloud.yml`, `deploy/linux/deploy.sh`, docs (PLAN.md, README.md, CLAUDE.md, ARCHITECTURE,
+OPERATIONS, VPS_SETUP, WINDOWS_SETUP, API, `.env.example`, STATUS). cloud_deploy FCR 1 (proxy headers),
+3 (`.env.example` VPS block) and 4 (docs) and deep_data FCR 1-3 (training store, guard in the decision,
+guard written by a job) are done; still suggested: cloud_deploy FCR 2 (`chromium_args` instead of the
+wrapper), FCR 5 (a resumable backfill job), deep_data FCR 4 (CLV against `closing_line_reference`).
+
 ## New dependency requests
 
 None.
 
 Lens B: none.
+
+Lens C: none (uvicorn's `ProxyHeadersMiddleware` is part of the existing uvicorn dependency).

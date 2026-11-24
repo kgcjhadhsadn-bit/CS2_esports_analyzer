@@ -32,7 +32,7 @@ a second bot; `update.ps1` and `restore-db.ps1` hold the same lock while they wo
 The built-in scheduler runs jobs in **lanes**: each lane is one thread running its jobs one at a
 time, so a slow data download never delays odds collection or betting. The lanes are `fast` (the
 money path), `sync` (PandaScore and other HTTP / database work), `hltv` (everything that uses the
-HLTV browser profile), `train` (the nightly retrain), `notify` (Telegram notifications and the daily
+HLTV browser profile), `train` (the nightly retrain and the weekly confidence-guard backtest), `notify` (Telegram notifications and the daily
 report) and `telegram` (the Telegram command poller). Intervals come from the
 `CS2BOT_SCHEDULER__*` settings (defaults below); every run is recorded in the `job_runs` table and
 shown on **Dashboard > Health** (the exact job names are listed there and at `GET /api/jobs`).
@@ -41,13 +41,14 @@ shown on **Dashboard > Health** (the exact job names are listed there and at `GE
 |---|---|---|---|---|
 | Betclic odds collection | every 3 min | `ODDS_POLL_S=180` | fast | Loads Betclic's CS2 pages, stores prices (only when they change), links events to matches, maps market names. |
 | Predictions | every 15 min | `PREDICT_MIN=15` | fast | For in-scope matches inside the betting window: veto distribution, per-map estimates, simulations, Claude context, priced outcomes. Re-predicts when the veto, line-up, news flags or model version changed. |
-| Betting | every 3 min, right after the odds pass | `ODDS_POLL_S=180` | fast | Price -> EV after tax -> decision rules -> stake (1/4 Kelly + caps) -> place (or dry run). Checks the kill switch / pause before every placement and the loss limits every cycle. |
+| Betting | every 3 min, right after the odds pass | `ODDS_POLL_S=180` | fast | Price -> confidence guard -> decision rules (p >= 75 %, odds ignored except "a win must pay back more than the stake") -> stake by confidence tier (+ caps) -> place (or dry run), most confident outcome first. Checks the kill switch / pause before every placement and the loss limits every cycle. |
 | Settlement | every 30 min | `SETTLE_MIN=30` | fast | Settles finished bets (Betclic's bet history is the source of truth for money), closing odds and CLV, ledger, balance reconciliation. |
 | Upcoming matches | every 30 min | `UPCOMING_SYNC_MIN=30` | sync (PandaScore, scope refresh), hltv (HLTV) | PandaScore + HLTV schedules, line-ups, vetoes once published. |
 | Results | every 60 min | `RESULTS_SYNC_MIN=60` | sync (PandaScore), hltv (HLTV) | Finished matches, map scores, player stats, demo links. |
 | News | every 30 min | `NEWS_POLL_MIN=30` | hltv (HLTV news), sync (Claude triage) | HLTV news; Claude Haiku triages them, Claude Opus turns relevant ones into bounded context flags. |
 | Demo processing | every 60 min | `DEMO_PROCESS_MIN=60` | hltv | Downloads + parses pending demos (rounds, kills, economy, positions), then deletes the raw files and rebuilds the position / duel aggregates and player roles when anything new was parsed. |
-| Nightly retrain | daily 05:00 Warsaw | `RETRAIN_CRON="0 5 * * *"` (only `M H * * *`) | train | Refits ratings, veto, round, kill and ensemble models on data up to that moment and swaps them in. |
+| Nightly retrain | daily 05:00 Warsaw | `RETRAIN_CRON="0 5 * * *"` (only `M H * * *`) | train | Refits ratings, veto, round, kill and ensemble models (the ensemble with every deep factor: schedule, travel, stakes, economy, clutches, duels, coach, market movement) on data up to that moment and swaps them in. Skipped when the active bundle is less than 2 h old (e.g. the start-up training just ran). |
+| Confidence guard (`confidence_guard_refresh`) | daily slot 06:30 Warsaw, runs at most every 7 days | `GUARD_REFRESH_CRON="30 6 * * *"`, `CS2BOT_MODELS__GUARD_REFRESH_DAYS=7` (0 = off) | train | Walk-forward backtest over the last 180 days of stored Betclic prices; rewrites `data/models/confidence_guard.json` (the high-confidence calibration the betting cycle applies). Waits until at least 40 finished matches have stored prices. |
 | HLTV rankings | every 12 h | - | hltv | Current HLTV ranking (the top-50 scope rule) and the rank history. |
 | Executor health | every 15 min | - | fast | Login state, balance and selector checks of the Betclic browser (shown on Health). |
 | Auto-resume (`autonomy_check`) | every 5 min | `CS2BOT_AUTONOMY__CHECK_INTERVAL_MIN=5` (only with `AUTONOMY__ENABLED=true`) | fast | Checks every automatic pause reason and lifts the resolved ones; auto-login when logged out; circuit breaker. See [Autonomous operation](#autonomous-operation-vps). |
@@ -101,21 +102,51 @@ CS2BOT_TELEGRAM__ENABLED=true          # with BOT_TOKEN (@BotFather) and CHAT_ID
 **The bet rule** (owner decision 2026-11-24): confidence only, odds ignored - a pick is bet when the
 calibrated probability is at least `decision.min_probability` (75%), whatever the odds (even 1.28).
 `decision.min_ev = -1.0` switches the EV check off; set `0.0` for a break-even guard after the 12% tax.
-Until the confidence-tier staking (`bankroll.staking_mode = "confidence_tiers"`) is wired into the stake
-sizing (final review), stakes are still sized with fractional Kelly, which stakes nothing on a pick
-whose EV after tax is not positive - so in practice those picks are recorded but not bet yet.
+One price rule stays on by default (final review, `decision.require_profitable_win`): a **win must pay
+back more than the stake** - with the 12% stake tax that needs odds of at least 1.137 (a winning bet at
+1.10 pays 0.968 per 1 PLN staked, so it loses money whatever happens). Set it to `false` to ignore the
+odds completely.
+
+**Stakes by confidence** (`bankroll.staking_mode = "confidence_tiers"`, the default): 75-85% sure = 1% of
+the bankroll, 85-92% = 1.5%, 92%+ = 2% (`bankroll.confidence_tiers`; the highest tier met applies). The
+per-bet cap (2%), the per-match cap (4%), the daily (-5%) and weekly (-10%) loss guards, bets per day,
+the free balance, the stake step (rounded down) and Betclic's minimum stake all still apply. Several
+picks on one match are sized most-confident first. `staking_mode = "kelly"` restores fractional Kelly.
+
+**Confidence guard** (`decision.use_confidence_guard`, on): before the 75% check and the stake tier,
+every probability above 75% is passed through the high-confidence calibration fitted on the backtest
+(`data/models/confidence_guard.json`): where 90% picks historically won only 84%, a 90% pick counts as
+84%; an over-confident range can fall below 75% and is then not bet. **Without a backtest yet** a
+probability keeps half of its excess over 75% (0.95 counts as 0.85): every 75%+ pick stays bettable,
+but stakes stay in the lower tiers until the history shows the model deserves more. The guard never
+raises a probability. The `confidence_guard_refresh` job rewrites the file weekly from a fresh backtest
+(also `cs2bot backtest --from ... --to ...` by hand); `cs2bot doctor` shows its state.
 
 **Trusted calibration (optional):** `CS2BOT_DECISION__REQUIRE_TRUSTED_CALIBRATION=true` bets a market
 type only when the calibration check of its backtest history trusts it (enough resolved predictions,
-calibrated above 75%). `cs2bot backtest` writes that verdict to `data/models/confidence_guard.json`
-(`models.confidence_guard_file`) and prints the trusted market types. With the setting on and no such
-file, nothing is bet (an unknown verdict is not "trusted").
+calibrated above 75%). `cs2bot backtest` and the weekly `confidence_guard_refresh` job write that
+verdict to `data/models/confidence_guard.json` (`models.confidence_guard_file`). With the setting on and
+no such file, nothing is bet (an unknown verdict is not "trusted"). It needs weeks of stored Betclic
+prices before any market type is trusted, so it is off by default (the guard above already makes the
+stakes cautious).
 
 **Browser on the server:** the Betclic executor runs a *visible* Chromium (`CS2BOT_EXECUTOR__HEADLESS=false`)
 on the Xvfb virtual display of the container (`DISPLAY=:99`) - less bot-like than headless. Without
 any display it falls back to headless (`CS2BOT_EXECUTOR__HEADLESS_WITHOUT_DISPLAY=true`, a warning is
 logged). The odds collector and HLTV use headless browsers. A crashed Chromium is started again by the
-next job (same profile, same session). `cs2bot doctor` checks the display.
+next job (same profile, same session). `cs2bot doctor` checks the display. If the executor cannot work
+at all (Chromium does not start, the profile is locked by another process), the betting cycle stops at
+the first refused order and - with autonomy on - pauses with `executor_unavailable`, which lifts itself
+after the next passing health check.
+
+**First start:** without a saved model the first training runs in the background; the dashboard
+answers and odds are collected meanwhile, predictions and bets start once the log says
+"models: trained ...".
+
+**Dashboard behind Caddy:** the app trusts the forwarding headers of Caddy's fixed address only
+(`CS2BOT_API__FORWARDED_ALLOW_IPS`, set by `docker-compose.cloud.yml`), so the login rate limit counts
+per real client (an attacker's wrong passwords no longer lock you out) and the session cookie is
+`Secure`.
 
 ### Pause reasons and when they lift
 
@@ -161,7 +192,7 @@ Messages (each can be switched off with `CS2BOT_TELEGRAM__NOTIFY_*`):
 
 | Message | Meaning / what to do |
 |---|---|
-| `Bet placed: A vs B` (`DRY RUN bet` in dry-run mode) | market, selection, odds, stake, model probability `p` and EV |
+| `Bet placed: A vs B` (`DRY RUN bet` in dry-run mode) | market, selection, odds, stake, model probability `p` and EV, and `confidence X% -> stake Y% of the bankroll` (the tier after the confidence guard) |
 | `Bet WON / LOST / VOID` | settlement with payout and P&L |
 | `Daily report` | P&L today / this week, bets placed and settled, balance, pause state |
 | `PAUSED by system [code]` | an automatic pause; with autonomy on it lifts itself (see the table) |
@@ -173,6 +204,9 @@ Messages (each can be switched off with `CS2BOT_TELEGRAM__NOTIFY_*`):
 | `Balance mismatch: ...` | money moved that the bot does not know (deposit, withdrawal, a bet placed by hand); booked automatically |
 | `Unconfirmed placement (UNCERTAIN)` | check "Moje zakłady"; settlement reconciles it |
 | `Job ... failed: ...` | a data job fails (at most one message per job every 6 h); see the Health page / logs |
+| `Job ... has not succeeded for too long` | a money-path job (odds, predictions, betting, settlement) has not run successfully for more than twice its interval + 10 min - its lane may have died; check the logs, restart the app (`docker compose restart app`) if it persists |
+| `Job ... has been running for N min - stuck?` | a job hangs for more than 45 min and blocks its lane (no odds / bets while it is the fast lane); restart the app |
+| `PAUSED by system [executor_unavailable]` | Chromium could not start or the browser profile is locked; lifts itself after the next passing health check (with autonomy) |
 | `cs2bot started` / `cs2bot is stopping` | the process started / stops (deploys, reboots) |
 
 Commands (only from the numeric `CHAT_ID` - an `@channel` id gets notifications but no commands, and
@@ -267,11 +301,16 @@ Main knobs (PLAN.md section 6):
 |---|---|---|
 | `decision.min_probability` | 0.75 | bet only on outcomes the model is surer about |
 | `decision.min_ev` | -1.0 (odds ignored) | 0.0 = break-even guard after the 12% tax; higher = demand an edge (fewer bets) |
+| `decision.require_profitable_win` | true | (false) also bet odds below 1.137, where a win pays back less than the stake |
+| `decision.use_confidence_guard` | true | (false) bet and stake on the raw model probabilities |
+| `decision.require_trusted_calibration` | false | (true) only market types whose backtest calibration is trusted |
+| `bankroll.staking_mode` | confidence_tiers | `kelly` = fractional Kelly (stakes nothing without an edge) |
+| `bankroll.confidence_tiers` | [[0.75, 0.01], [0.85, 0.015], [0.92, 0.02]] | (lower the fractions) smaller stakes; sorted, each fraction <= `max_stake_fraction` |
 | `decision.max_sigma` | 0.05 | (lower it) skip outcomes with uncertain estimates |
 | `decision.min_data_completeness` | 0.95 | skip matches with missing line-ups / history |
 | `decision.market_overrides` | - | stricter thresholds for one market type (e.g. player kills) |
 | `decision.disabled_markets` | - | switch market types off completely |
-| `bankroll.kelly_fraction` | 0.25 | (lower it) smaller stakes |
+| `bankroll.kelly_fraction` | 0.25 | (lower it) smaller stakes - only with `staking_mode = kelly` |
 | `bankroll.max_stake_fraction` / `max_match_exposure_fraction` | 0.02 / 0.04 | (lower it) cap risk per bet / per match |
 | `bankroll.max_bets_per_day` | 10 | (lower it) fewer bets, less bot-like |
 

@@ -30,7 +30,12 @@ from typing import TypeVar
 
 from cs2bot.domain.betting import BetOrder, ExecutorHealth, PlacementResult, PlacementStatus
 from cs2bot.domain.control import LoginAttempt, LoginStatus
-from cs2bot.executor.base import AccountExecutor, BookmakerBetRecord, ExecutorClosedError
+from cs2bot.executor.base import (
+    EXECUTOR_UNAVAILABLE_PREFIX,
+    AccountExecutor,
+    BookmakerBetRecord,
+    ExecutorClosedError,
+)
 from cs2bot.utils.logging import get_logger
 from cs2bot.utils.time import utcnow
 
@@ -106,7 +111,10 @@ class ThreadBoundExecutor:
                     return refusal
             return PlacementResult(
                 status=PlacementStatus.FAILED,
-                message=f"the bet executor could not be created ({type(exc).__name__}: {detail})",
+                message=(
+                    f"{EXECUTOR_UNAVAILABLE_PREFIX}the bet executor could not be created "
+                    f"({type(exc).__name__}: {detail})"
+                ),
                 at=utcnow(),
             )
         return self._call(lambda ex: ex.place(order))

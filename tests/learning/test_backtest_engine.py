@@ -275,10 +275,12 @@ def test_engine_decider_and_staker_bet_a_clear_edge(world, settings: Settings) -
     )
     assert report.n_bets == 2
     first, second = report.bets
-    assert first.stake == Decimal("20.00")  # quarter Kelly is far above the 2% cap of 1000 PLN
-    assert second.stake == (Decimal("0.02") * (Decimal("1000") + first.pnl)).quantize(
+    # the live rule (confidence tiers, odds ignored): p 0.90 -> the 85 % tier = 1.5 % of 1000 PLN
+    assert first.stake == Decimal("15.00")
+    assert second.stake == (Decimal("0.015") * (Decimal("1000") + first.pnl)).quantize(
         Decimal("0.1"), "ROUND_DOWN"
     )
+    assert report.settings_summary["staking_mode"] == "confidence_tiers"
     assert all(bet.ev > settings.decision.min_ev for bet in report.bets)
 
 

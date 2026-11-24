@@ -34,12 +34,15 @@ export const DECISION_FIELDS: FieldSpec[] = [
   { key: "min_minutes_before_start", label: "Min minutes before start", kind: "int", min: 0, max: 10080, step: "1", hint: "No bet closer to the start than this" },
   { key: "max_hours_before_start", label: "Max hours before start", kind: "int", min: 0, max: 720, minOpen: true, step: "1", hint: "No bet earlier than this before the start" },
   { key: "prefer_known_veto", label: "Prefer known veto", kind: "bool", hint: "Wait for the published veto for map-level markets when possible" },
+  { key: "require_profitable_win", label: "A win must be a win", kind: "bool", hint: "Skip odds below 1.137: after the 12% stake tax such a win pays back less than the stake" },
+  { key: "use_confidence_guard", label: "Confidence guard", kind: "bool", hint: "Shrink probabilities above 75% where the backtest shows over-confidence (without history: half of the excess over 75%)" },
+  { key: "require_trusted_calibration", label: "Require trusted calibration", kind: "bool", hint: "Bet a market type only when the backtest marks its calibration as trusted" },
 ];
 
 export const BANKROLL_FIELDS: FieldSpec[] = [
   { key: "starting_bankroll", label: "Starting bankroll", kind: "decimal", min: 0, max: 1_000_000_000, step: "0.01", hint: "Used when the ledger has no deposit yet (PLN)" },
   { key: "currency", label: "Currency", kind: "currency", hint: "3-letter code (PLN)" },
-  { key: "kelly_fraction", label: "Kelly fraction", kind: "float", min: 0, max: 1, minOpen: true, step: "0.05", percent: true, hint: "Share of full Kelly that is staked" },
+  { key: "kelly_fraction", label: "Kelly fraction", kind: "float", min: 0, max: 1, minOpen: true, step: "0.05", percent: true, hint: "Share of full Kelly that is staked (only with staking mode kelly)" },
   { key: "max_stake_fraction", label: "Max stake per bet", kind: "float", min: 0, max: 1, minOpen: true, step: "0.005", percent: true, hint: "Of the bankroll" },
   { key: "max_match_exposure_fraction", label: "Max exposure per match", kind: "float", min: 0, max: 1, minOpen: true, step: "0.005", percent: true, hint: "All open stakes on one match, of the bankroll" },
   { key: "daily_loss_limit_fraction", label: "Daily loss limit", kind: "float", min: 0, max: 1, minOpen: true, step: "0.01", percent: true, hint: "The bot pauses itself when reached (Warsaw day)" },
@@ -165,6 +168,8 @@ export function buildSection(
   const errors: Record<string, string> = {};
   const body: Record<string, unknown> = {};
   for (const spec of FIELDS[section]) {
+    // a setting the server does not report (an older API) is never sent: it would be rejected as unknown
+    if (!(spec.key in defaults)) continue;
     const parsed = parseField(spec, form[spec.key] ?? "");
     if (parsed.error) {
       errors[spec.key] = parsed.error;

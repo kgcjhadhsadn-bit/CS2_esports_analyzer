@@ -315,16 +315,19 @@ function SectionForm({ section, config }: { section: Section; config: ConfigOut 
 
 /** The bet rule in one sentence: confidence only (odds ignored) unless an EV guard is configured. */
 export function DecisionRuleNote({ config }: { config: ConfigOut }) {
-  const minEv = Number(config.effective.decision.min_ev);
-  const minP = Number(config.effective.decision.min_probability);
+  const decision = config.effective.decision;
+  const minEv = Number(decision.min_ev);
+  const minP = Number(decision.min_probability);
   const oddsIgnored = Number.isFinite(minEv) && minEv <= -1;
+  const profitableWin = decision.require_profitable_win !== false;
   return (
     <div className="alert alert-info" role="note" aria-label="Bet rule">
       <strong>Bet rule:</strong>{" "}
       {oddsIgnored ? (
         <>
           confidence only, <strong>odds ignored</strong> (EV check off). A pick is bet when the calibrated probability is at
-          least {formatPct(minP, 0)}, whatever the odds - even 1.28.
+          least {formatPct(minP, 0)}, whatever the odds - even 1.28
+          {profitableWin ? ", as long as a win pays back more than the stake after the 12% tax (odds 1.137 or more)" : ""}.
         </>
       ) : (
         <>
@@ -332,6 +335,38 @@ export function DecisionRuleNote({ config }: { config: ConfigOut }) {
           {minEv === 0 ? " (break-even guard)" : ""}.
         </>
       )}
+      {decision.use_confidence_guard ? (
+        <> Probabilities above 75% are first shrunk by the confidence guard where the history shows over-confidence.</>
+      ) : null}
+      <StakingNote config={config} />
+    </div>
+  );
+}
+
+/** How stakes are sized: confidence tiers (the owner's rule) or fractional Kelly. */
+export function StakingNote({ config }: { config: ConfigOut }) {
+  const bank = config.effective.bankroll;
+  if (bank.staking_mode === "kelly") {
+    return (
+      <div className="small" style={{ marginTop: "0.35rem" }}>
+        <strong>Staking:</strong> {formatPct(Number(bank.kelly_fraction), 0)} Kelly, capped at{" "}
+        {formatPct(Number(bank.max_stake_fraction), 1)} of the bankroll per bet.
+      </div>
+    );
+  }
+  const tiers = [...(bank.confidence_tiers ?? [])].sort((a, b) => a[0] - b[0]);
+  if (!tiers.length) return null;
+  return (
+    <div className="small" style={{ marginTop: "0.35rem" }} aria-label="Staking tiers">
+      <strong>Staking by confidence:</strong>{" "}
+      {tiers
+        .map(([p, f], i) => {
+          const next = tiers[i + 1];
+          const range = next ? `${formatPct(p, 0)}-${formatPct(next[0], 0)}` : `${formatPct(p, 0)}+`;
+          return `${range} sure = ${formatPct(f, 1)} of the bankroll`;
+        })
+        .join(", ")}{" "}
+        (per-match, daily and weekly caps still apply; tiers are set with <code>CS2BOT_BANKROLL__CONFIDENCE_TIERS</code>).
     </div>
   );
 }

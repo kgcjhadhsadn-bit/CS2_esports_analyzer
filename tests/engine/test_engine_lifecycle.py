@@ -50,7 +50,7 @@ def test_three_weeks_of_random_betting_never_break_the_books_or_the_limits(
     session: Session, settings: Settings, seed: int
 ) -> None:
     rng = random.Random(seed)
-    cfg = BankrollSettings(max_bets_per_day=6)
+    cfg = BankrollSettings(staking_mode="kelly", max_bets_per_day=6)
     ledger.ensure_initialized(session, cfg, at=START - timedelta(days=1))
     matches = [add_match(session).id for _ in range(40)]
 

@@ -20,7 +20,7 @@ from cs2bot.backtest import (
 )
 from cs2bot.backtest.synthetic import SeriesTruth, played_order
 from cs2bot.backtest.types import HistoricalData, MatchQuery
-from cs2bot.config import DecisionSettings, Settings
+from cs2bot.config import BankrollSettings, DecisionSettings, Settings
 from cs2bot.domain.enums import MatchFormat
 from cs2bot.domain.predictions import MatchPrediction
 from cs2bot.models.ensemble import EnsembleConfig
@@ -28,7 +28,11 @@ from cs2bot.testing.synthetic import SynthUniverse, generate_universe
 
 # Lower probability gate than the live default (0.75) so the oracle also bets underdogs it knows
 # are mispriced; EV gate, tax, 1/4 Kelly and every cap stay the engine's.
-BACKTEST_SETTINGS = Settings(decision=DecisionSettings(min_probability=0.25, min_ev=0.02, max_sigma=0.2))
+# a value-betting experiment (EV rule on, low probabilities): Kelly staking, not the owner's confidence tiers
+BACKTEST_SETTINGS = Settings(
+    decision=DecisionSettings(min_probability=0.25, min_ev=0.02, max_sigma=0.2),
+    bankroll=BankrollSettings(staking_mode="kelly"),
+)
 MONTHLY = BacktestConfig(retrain_every=timedelta(days=30))
 
 

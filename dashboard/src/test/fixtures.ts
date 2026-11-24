@@ -503,6 +503,9 @@ export const configOut: ConfigOut = {
       prefer_known_veto: true,
       market_overrides: {},
       disabled_markets: [],
+      require_trusted_calibration: false,
+      require_profitable_win: true,
+      use_confidence_guard: true,
     },
     bankroll: {
       starting_bankroll: "1000.00",
@@ -514,6 +517,12 @@ export const configOut: ConfigOut = {
       weekly_loss_limit_fraction: 0.1,
       max_bets_per_day: 10,
       stake_step: "0.10",
+      staking_mode: "confidence_tiers",
+      confidence_tiers: [
+        [0.75, 0.01],
+        [0.85, 0.015],
+        [0.92, 0.02],
+      ],
     },
   },
   defaults: {
@@ -530,6 +539,9 @@ export const configOut: ConfigOut = {
       prefer_known_veto: true,
       market_overrides: {},
       disabled_markets: [],
+      require_trusted_calibration: false,
+      require_profitable_win: true,
+      use_confidence_guard: true,
     },
     bankroll: {
       starting_bankroll: "1000.00",
@@ -541,6 +553,12 @@ export const configOut: ConfigOut = {
       weekly_loss_limit_fraction: 0.1,
       max_bets_per_day: 10,
       stake_step: "0.10",
+      staking_mode: "confidence_tiers",
+      confidence_tiers: [
+        [0.75, 0.01],
+        [0.85, 0.015],
+        [0.92, 0.02],
+      ],
     },
   },
   overrides: { decision: { min_ev: 0.05 }, bankroll: { kelly_fraction: 0.2 } },

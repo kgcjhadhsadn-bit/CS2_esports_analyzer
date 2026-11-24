@@ -20,6 +20,10 @@ thresholds can be overridden per market type through ``market_overrides[<MarketT
 * ``EV < min_ev`` (per-unit EV after the stake tax, see :mod:`cs2bot.engine.ev`). A ``min_ev`` of -1
   or lower disables the check - the owner's rule since 2026-11-24 is "confidence only, odds ignored"
   (``DecisionSettings.min_ev = -1.0``); set 0.0 for a break-even guard;
+* ``require_profitable_win`` (default on) and odds at which a WIN would pay back less than the gross
+  stake after the stake tax (below 1.137 with 12 %; :func:`cs2bot.engine.ev.min_profitable_odds`):
+  such a bet loses money whether it wins or loses. This is not an EV / value rule - a 1.28 favourite
+  at 80 % still passes (final review, Lens C);
 * ``require_trusted_calibration`` and a market type the calibration layer does not trust (only when
   the caller passes ``trusted_markets``; ``None`` = not known, no check);
 * ``sigma > max_sigma``, where the pricing sigma (an uncertainty of the *unconditional* ``p_win``)
@@ -55,7 +59,7 @@ from cs2bot.domain.betting import BetDecision, PricedOutcome
 from cs2bot.domain.enums import BetStatus, LinkStatus, MatchStatus
 from cs2bot.domain.markets import MarketSpec, MarketType
 from cs2bot.domain.predictions import MatchPrediction, OutcomeProbability
-from cs2bot.engine.ev import ODDS_STEP, min_odds_for_ev
+from cs2bot.engine.ev import ODDS_STEP, min_odds_for_ev, min_profitable_odds
 from cs2bot.utils.time import ensure_utc, utcnow
 
 #: Link statuses that allow automatic betting.
@@ -94,6 +98,7 @@ class ReasonCode(StrEnum):
     INVALID_NUMBERS = "invalid_numbers"
     MATCH_NOT_SCHEDULED = "match_not_scheduled"
     UNTRUSTED_CALIBRATION = "untrusted_calibration"
+    UNPROFITABLE_WIN = "unprofitable_win"
 
 
 def make_reason(code: ReasonCode, detail: str) -> str:
@@ -304,6 +309,16 @@ def evaluate(
         )
     if ev_check_enabled(th.min_ev) and not priced.ev >= th.min_ev:
         reasons.append(make_reason(ReasonCode.LOW_EV, f"EV {priced.ev:+.4f} < {th.min_ev:.4f}"))
+    if settings.require_profitable_win:
+        floor = min_profitable_odds(betclic)
+        if quote.odds < floor:
+            reasons.append(
+                make_reason(
+                    ReasonCode.UNPROFITABLE_WIN,
+                    f"odds {_fmt_odds(quote.odds)} < {_fmt_odds(floor)}: after the stake tax a win would pay "
+                    "back less than the stake",
+                )
+            )
     if (
         settings.require_trusted_calibration
         and trusted_markets is not None
@@ -386,6 +401,8 @@ def min_acceptable_odds(
     * the odds at which the EV equals the market's ``min_ev`` (:func:`cs2bot.engine.ev.min_odds_for_ev`)
       - skipped when the EV rule is disabled (``min_ev <= -1``, odds ignored),
     * ``settings.min_odds``,
+    * with ``require_profitable_win``: the lowest odds at which a win still pays back more than the
+      stake (:func:`cs2bot.engine.ev.min_profitable_odds`),
 
     rounded UP to three decimals. For an outcome that should not be bet at all (no chance to win, or
     an EV already below the threshold) the result is not below the quoted odds, so nothing worse than
@@ -396,12 +413,15 @@ def min_acceptable_odds(
     quoted = priced.quote.odds
     floor = (quoted * (Decimal(1) - Decimal(repr(odds_tolerance)))).quantize(ODDS_STEP, rounding=ROUND_UP)
     th = thresholds_for(priced.quote.spec.market_type, settings)
+    base = max(floor, settings.min_odds.quantize(ODDS_STEP, rounding=ROUND_UP))
+    if settings.require_profitable_win:
+        base = max(base, min_profitable_odds(betclic))
     if not ev_check_enabled(th.min_ev):
-        return max(floor, settings.min_odds.quantize(ODDS_STEP, rounding=ROUND_UP))
+        return base
     edge_floor = min_odds_for_ev(priced.outcome, betclic, min_ev=th.min_ev)
     if edge_floor is None:
-        return max(quoted, settings.min_odds)
-    return max(floor, edge_floor, settings.min_odds.quantize(ODDS_STEP, rounding=ROUND_UP))
+        return max(quoted, base)
+    return max(base, edge_floor)
 
 
 def evaluate_all(

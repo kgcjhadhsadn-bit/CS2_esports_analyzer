@@ -286,6 +286,23 @@ ODDS_STEP = Decimal("0.001")
 _MAX_MEANINGFUL_ODDS = 1e6
 
 
+def min_profitable_odds(settings: TaxSource) -> Decimal:
+    """Lowest decimal odds (three decimals) at which a WIN pays back more than the gross stake.
+
+    A win pays ``(1 - t) x odds`` per unit of gross stake, so it is a real win only for
+    ``odds > 1 / (1 - t)``: 1.137 with the 12 % stake tax, 1.001 in a "bez podatku" promo. Below it a
+    bet loses money even when it wins - the decision's ``unprofitable_win`` rule (final review, Lens C).
+    The stake-dependent winnings tax above 2,280 PLN is ignored here (it never applies to winnings
+    that small relative to the stake at such odds).
+    """
+    model = TaxModel.from_settings(settings)
+    keep = Decimal(1) - model.stake_tax_rate
+    odds = (Decimal(1) / keep).quantize(ODDS_STEP, rounding=ROUND_UP)
+    while odds * keep <= Decimal(1):
+        odds += ODDS_STEP
+    return odds
+
+
 def min_odds_for_ev(
     outcome: OutcomeProbability, settings: TaxSource, *, min_ev: float = 0.0
 ) -> Decimal | None:

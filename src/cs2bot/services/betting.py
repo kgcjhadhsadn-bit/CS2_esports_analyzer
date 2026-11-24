@@ -13,9 +13,12 @@ One cycle (:func:`run_betting_cycle`):
    ``bankroll.starting_bankroll``); ``engine.bankroll.compute_state`` + ``check_loss_limits`` (a loss
    limit pauses the bot).
 3. **Per match** with a fresh latest prediction (``match_analyses``, same model version as the active
-   bundle, not older than ``max_prediction_age``) and fresh quotes: price every quote, ``ev.price``,
+   bundle, not older than ``max_prediction_age``) and fresh quotes: price every quote, apply the
+   high-confidence guard (``decision.use_confidence_guard``, :mod:`cs2bot.engine.confidence`; the
+   guard file is read once per cycle), ``ev.price``,
    ``decision.evaluate`` (all PLAN.md section 6 checks), then two extra rules: never two selections of
-   the same market (existing bets included) and outcomes in descending EV order, each sized with
+   the same market (existing bets included) and outcomes in descending confidence order (EV order
+   with Kelly staking), each sized with
    ``bankroll.size_decision`` against the state that already contains the previous bets, so the
    per-bet, per-match exposure, daily and bets-per-day caps hold. Every decision is written to
    ``bet_decisions`` (rejections with their reasons; unchanged rejections are not repeated within an
@@ -78,6 +81,7 @@ from cs2bot.domain.control import PauseCode
 from cs2bot.domain.enums import BetStatus, MatchFormat, MatchStatus
 from cs2bot.domain.predictions import MatchPrediction
 from cs2bot.engine import bankroll, decision, ledger
+from cs2bot.engine.confidence import ProbabilityAdjuster, guard_note, guard_pairs
 from cs2bot.engine.decision import NON_BLOCKING_BET_STATUSES, ReasonCode, make_reason
 from cs2bot.engine.ev import price_all
 from cs2bot.engine.pricing import price_quotes
@@ -571,7 +575,19 @@ class _Cycle:
     stop_reason: str | None = None
     #: market types with trusted calibration (``decision.require_trusted_calibration``); None = unknown
     trusted_markets: set[str] | None = None
+    #: the persisted confidence guard (None = no backtest wrote one yet: the no-history prior applies)
+    guard: Any | None = None
     _t0: float = field(default_factory=time.monotonic)
+
+    def adjuster(self) -> ProbabilityAdjuster:
+        """``guard.adjust`` of the persisted guard, else of an empty guard (the skeptical no-history
+        prior: half of the excess over 0.75 is kept, so a 0.75 pick stays bettable)."""
+        if self.guard is None:
+            from cs2bot.models.confidence import ConfidenceGuard
+
+            self.guard = ConfidenceGuard()
+        adjust: ProbabilityAdjuster = self.guard.adjust
+        return adjust
 
     def now(self) -> datetime:
         return self.start + timedelta(seconds=max(0.0, time.monotonic() - self._t0))
@@ -620,6 +636,7 @@ def run_betting_cycle(
         report.notes.append("another betting cycle is running in this process")
         return report
     try:
+        guard = load_confidence_guard(settings)
         _run_cycle(
             session_factory,
             settings,
@@ -627,7 +644,10 @@ def run_betting_cycle(
             bundle,
             report,
             cycle=_Cycle(
-                start=now, should_stop=should_stop, trusted_markets=trusted_markets(bundle, settings)
+                start=now,
+                should_stop=should_stop,
+                trusted_markets=trusted_markets(bundle, settings, guard=guard),
+                guard=guard,
             ),
             dry=dry,
             analyzer=analyzer,
@@ -755,6 +775,11 @@ def _bet_match(
         pairs = price_quotes(
             prediction, quotes, sigma_floor=settings.models.sigma_floor, betclic=settings.betclic
         )
+        guarded: dict[tuple[str, str], tuple[float, float]] = {}
+        if dec_settings.use_confidence_guard:
+            # conservative high-confidence calibration BEFORE pricing: the confidence check, the stake
+            # tier and the recorded decision all use the adjusted probability (final review, Lens C)
+            pairs, guarded = guard_pairs(pairs, cycle.adjuster())
         priced = price_all(pairs, settings)
         by_event: dict[int, list[PricedOutcome]] = defaultdict(list)
         for p in priced:
@@ -783,6 +808,8 @@ def _bet_match(
                     trusted_markets=trusted,
                 )
             )
+        if guarded:
+            decisions = [_with_guard_note(d, guarded) for d in decisions]
         bet_specs: dict[str, set[str]] = defaultdict(set)
         blocked: set[tuple[str, str]] = set()
         for b in _blocking_bets(session, match_id, include_dry_run=dry):
@@ -793,7 +820,9 @@ def _bet_match(
         report.decisions += len(decisions)
 
         rejected = [d for d in decisions if not d.accepted]
-        accepted = sorted((d for d in decisions if d.accepted), key=lambda d: d.priced.ev, reverse=True)
+        accepted = sorted(
+            (d for d in decisions if d.accepted), key=_placement_priority(bank_settings), reverse=True
+        )
         for dec in rejected:
             if write_decision(session, dec, now=now, extra={"dry_run": dry}) is not None:
                 report.decisions_written += 1
@@ -852,6 +881,26 @@ def _bet_match(
                 session, analysis, prediction, placed_decisions, settings, analyzer=analyzer, now=now
             )
             session.commit()
+
+
+def _placement_priority(bank_settings: Any) -> Callable[[BetDecision], tuple[float, float]]:
+    """Order in which the accepted outcomes of one match are sized (the caps favour the first ones).
+
+    Confidence tiers (odds ignored): the most confident outcome first, EV only as a tie-break;
+    Kelly: the highest EV first (final review, Lens C - with odds ignored, EV order would prefer the
+    long prices the owner's rule does not care about).
+    """
+    if getattr(bank_settings, "staking_mode", "kelly") == "confidence_tiers":
+        return lambda d: (d.priced.outcome.p_win_given_settled, d.priced.ev)
+    return lambda d: (d.priced.ev, d.priced.outcome.p_win_given_settled)
+
+
+def _with_guard_note(dec: BetDecision, guarded: dict[tuple[str, str], tuple[float, float]]) -> BetDecision:
+    """Add the confidence-guard note (model vs adjusted probability) to a decision it changed."""
+    hit = guarded.get((dec.priced.outcome.spec_key, dec.priced.outcome.selection))
+    if hit is None:
+        return dec
+    return dec.model_copy(update={"notes": [*dec.notes, guard_note(*hit)]})
 
 
 def _raised_before_sending(exc: BaseException) -> bool:
@@ -927,6 +976,8 @@ def _place_one(
         "market_external_id": quote.market_external_id,
         "selection_external_id": quote.selection_external_id,
         "p_win": dec.priced.outcome.p_win,
+        "p_settled": dec.priced.outcome.p_win_given_settled,
+        "stake_fraction": dec.kelly_fraction_used,
         "ev": dec.priced.ev,
         "model_odds_captured_at": quote.captured_at.isoformat(),
         # the orientation the bet was priced in: settlement refuses to resolve "team1" against other teams
@@ -1033,6 +1084,12 @@ def _place_one(
     if status is BetStatus.FAILED:
         bet.error = f"{result.status.value}: {result.message}"[:2000]
         report.failed += 1
+        if _executor_unusable(result):
+            executor_unavailable = True
+            if settings.autonomy.enabled:
+                # lifted by services.autonomy once a fresh health check passes (owner not needed)
+                pause_reason = f"Betclic executor unavailable: {result.message}"[:500]
+                pause_code = PauseCode.EXECUTOR_UNAVAILABLE
     elif status is BetStatus.PLACING:
         report.uncertain += 1
         db_state.audit(
@@ -1088,7 +1145,18 @@ def _place_one(
     return _sizing_state(session, settings, now=now, dry=dry)
 
 
-def trusted_markets(bundle: Any, settings: Settings | None = None) -> set[str] | None:
+def _executor_unusable(result: PlacementResult) -> bool:
+    """A FAILED placement refused because the executor itself cannot work (Chromium / profile lock)."""
+    try:
+        from cs2bot.executor.base import is_executor_unavailable
+    except Exception:  # pragma: no cover - the executor package is part of the install
+        return False
+    return result.status is PlacementStatus.FAILED and is_executor_unavailable(result.message)
+
+
+def trusted_markets(
+    bundle: Any, settings: Settings | None = None, *, guard: Any | None = None
+) -> set[str] | None:
     """Market types whose calibration is trusted, or ``None`` when unknown (decision: no check).
 
     Source, in this order: deep_data's confidence guard (``cs2bot.models.confidence.ConfidenceGuard``,
@@ -1099,10 +1167,10 @@ def trusted_markets(bundle: Any, settings: Settings | None = None) -> set[str] |
     then an unknown set means "nothing trusted" (see ``_bet_match``). A malformed guard file is logged
     and ignored (never aborts a cycle).
     """
-    if settings is not None:
+    if guard is None and settings is not None:
         guard = load_confidence_guard(settings)
-        if guard is not None:
-            return {str(m) for m in guard.trust if guard.is_trusted(str(m))}
+    if guard is not None:
+        return {str(m) for m in guard.trust if guard.is_trusted(str(m))}
     trust = getattr(bundle, "market_trust", None)
     if not isinstance(trust, dict):
         return None

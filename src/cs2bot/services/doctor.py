@@ -206,6 +206,40 @@ def _calibration_status(bundle_dir: Path) -> str | None:
     return None
 
 
+def check_confidence_guard(settings: Settings) -> Check:
+    """The high-confidence guard the betting cycle applies (final review, Lens C)."""
+    from cs2bot.models.confidence import POOLED, ConfidenceGuard
+
+    path = resolve_path(settings.models.confidence_guard_file)
+    if not settings.decision.use_confidence_guard:
+        return Check(
+            "confidence guard", "warn", "off (decision.use_confidence_guard=false): raw probabilities"
+        )
+    if not path.is_file():
+        return Check(
+            "confidence guard",
+            "warn",
+            "no backtest yet: the cautious no-history prior applies (probabilities above 75% keep half of "
+            "their excess; stakes stay in the lower tiers) - the weekly confidence_guard_refresh job or "
+            "`cs2bot backtest` writes it once Betclic prices of finished matches are stored",
+        )
+    try:
+        guard = ConfidenceGuard.load(path)
+    except Exception as exc:
+        return Check(
+            "confidence guard", "fail", f"{path.name} unreadable ({type(exc).__name__}): prior applies"
+        )
+    trusted = sorted(m for m in guard.trust if m != POOLED and guard.is_trusted(m))
+    pooled = guard.trust.get(POOLED)
+    n = pooled.n if pooled is not None else 0
+    ok = bool(trusted) or not settings.decision.require_trusted_calibration
+    return Check(
+        "confidence guard",
+        "ok" if ok else "warn",
+        f"{n} resolved predictions; trusted market types: {', '.join(trusted) or 'none yet'}",
+    )
+
+
 def check_dashboard(settings: Settings) -> Check:
     dist = resolve_path(settings.api.dashboard_dist_dir)
     if (dist / "index.html").is_file():
@@ -360,6 +394,7 @@ def run_checks(
     checks.append(_guard("rar tool", check_archive_tool))
     checks.append(_guard("disk space", lambda: check_disk(settings)))
     checks.append(_guard("models", lambda: check_models(settings)))
+    checks.append(_guard("confidence guard", lambda: check_confidence_guard(settings)))
     checks.append(_guard("dashboard build", lambda: check_dashboard(settings)))
     checks.append(_guard("browser display", lambda: check_display(settings)))
     checks.append(_guard("telegram", lambda: check_telegram(settings, probe=telegram_probe)))

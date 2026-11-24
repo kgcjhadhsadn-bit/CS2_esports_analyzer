@@ -118,8 +118,9 @@ VOLUME ["/app/data", "/app/logs"]
 EXPOSE 8000
 
 # /api/ping is the API's unauthenticated liveness probe (/api/health needs the dashboard password).
-# The long start period covers the first model training, which runs before the API starts.
-HEALTHCHECK --interval=30s --timeout=10s --start-period=15m --retries=5 \
+# The API starts within seconds of the migrations (the first model training runs in the background);
+# the start period covers a slow database start (db upgrade retries) with room to spare.
+HEALTHCHECK --interval=30s --timeout=10s --start-period=5m --retries=5 \
     CMD curl -fsS --max-time 8 http://127.0.0.1:8000/api/ping || exit 1
 
 ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/cs2bot-entrypoint"]

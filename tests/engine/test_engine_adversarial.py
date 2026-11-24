@@ -41,7 +41,7 @@ WARSAW = ZoneInfo("Europe/Warsaw")
 START = datetime(2026, 10, 19, 4, 0, tzinfo=UTC)  # Monday; clocks go back on Sunday 2026-10-25
 TICK = timedelta(hours=2)
 N_TICKS = 12 * 12
-CFG = BankrollSettings(max_bets_per_day=14)
+CFG = BankrollSettings(staking_mode="kelly", max_bets_per_day=14)
 NORMAL = BetclicSettings(void_refunds_stake_tax=False)
 PROMO = BetclicSettings(void_refunds_stake_tax=False, tax_free_promo=True)
 STEP = CFG.stake_step

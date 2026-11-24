@@ -7,7 +7,8 @@
 # 2. docker compose build app   (pulls newer base images of the pinned tags)
 # 3. --selftest: runs the image self-test (Chromium on Xvfb, dashboard, tools) before switching over
 # 4. docker compose up -d --remove-orphans (only containers whose image/config changed are recreated)
-# 5. waits until the bot is healthy (first start: migrations + first model training can take minutes)
+# 5. waits until the bot is healthy (first start: migrations; the first model training runs in the
+#    background, so the API answers right away)
 # 6. shows the status and the dashboard address
 # Idempotent: running it again with nothing changed leaves the running containers alone.
 set -euo pipefail

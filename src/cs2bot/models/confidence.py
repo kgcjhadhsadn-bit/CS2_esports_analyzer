@@ -1,7 +1,8 @@
 """Calibration for the confidence rule (bet when the calibrated probability is >= 75%).
 
-The owner bets on confidence (PLAN.md section 0): any price that is at least break-even after the
-12% stake tax is taken when ``p >= 0.75``. A confident *wrong* probability is therefore the costliest
+The owner bets on confidence (PLAN.md section 0): any price is taken when ``p >= 0.75`` (odds
+ignored; only a win that would pay back less than the stake after the 12% stake tax is skipped), and
+the stake grows with the confidence tier. A confident *wrong* probability is therefore the costliest
 error, and the high-probability end of the reliability diagram matters more than the average
 calibration. This module provides three things:
 
@@ -20,8 +21,10 @@ calibration. This module provides three things:
    higher bin also caps the bins below it) and never above ``p``. With no history (``n_b = 0``) a
    probability keeps only ``lambda`` of its excess over ``t`` (0.95 -> 0.85 with the defaults); a
    well-populated, well-calibrated bin converges back to ``p``; an over-confident bin is pulled down to
-   its observed rate - possibly below the threshold, which then blocks the bet. It never raises a
-   probability (under-confident bins are left alone: being too cautious only costs bets).
+   its observed rate - possibly below the threshold, which then blocks the bet. A thin bin (fewer than
+   ``min_bin_predictions``) above an over-confident bin carries that bin's miscalibration upward (final
+   review, Lens C: otherwise the empty top bins fell back to the milder no-history prior). It never
+   raises a probability (under-confident bins are left alone: being too cautious only costs bets).
    ``p == t`` is adjusted too (review round 1: it used to pass unchanged, so a probability of exactly
    the threshold escaped an over-confident first bin), and a probability below ``t`` is capped at the
    adjusted value of ``t`` so the map stays monotone (``p < t`` is never bet anyway).
@@ -36,9 +39,12 @@ calibration. This module provides three things:
 ``(market_type, p, y)`` triples, e.g. the backtest's :class:`~cs2bot.backtest.report.PredictionRecord`
 list) plus a pooled fallback for market types without own history; it is JSON-serialisable.
 
-Integration (done by the decision-layer owner, see docs/dev/reports/deep_data.md): before the
-``min_probability`` check use ``guard.adjust(market_type, p)`` instead of ``p`` and, when
-``require_trusted`` is configured, reject markets where ``guard.is_trusted(market_type)`` is False.
+Integration (final review, Lens C): ``services.betting`` reads the guard file once per cycle and
+:mod:`cs2bot.engine.confidence` applies ``guard.adjust(market_type, p)`` to every outcome before the
+``min_probability`` check and the stake tier (``decision.use_confidence_guard``, default on; without a
+guard file the no-history prior applies); ``decision.require_trusted_calibration`` rejects markets where
+``guard.is_trusted(market_type)`` is False. The ``confidence_guard_refresh`` job rewrites the file
+weekly from a fresh backtest.
 """
 
 from __future__ import annotations
@@ -206,8 +212,14 @@ class HighConfidenceShrinker:
         for b in self.bins:
             m = b.mean_predicted if b.count else (b.lower + b.upper) / 2.0
             rate = (cfg.prior_strength * self._skeptic(m) + b.hits) / (cfg.prior_strength + b.count)
+            offset = min(0.0, rate - m)
+            if offsets and b.count < cfg.min_bin_predictions:
+                # final review (Lens C): a thin bin above an over-confident one inherits at least that
+                # miscalibration - picks at 97 % that won 70 % say nothing good about 99 % picks, and
+                # the no-history prior alone would let a 1.00 pick through at 0.87
+                offset = min(offset, offsets[-1])
             centers.append(m)
-            offsets.append(min(0.0, rate - m))
+            offsets.append(offset)
         self._centers, self._offsets = centers, offsets
         return self
 

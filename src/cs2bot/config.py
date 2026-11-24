@@ -14,6 +14,7 @@ stored in the ``system_state`` table (key ``config_overrides``) and merged by
 
 from __future__ import annotations
 
+import math
 from datetime import date, time
 from decimal import Decimal
 from functools import lru_cache
@@ -182,6 +183,15 @@ class ModelSettings(BaseModel):
     # deep_data: per-market high-confidence guard written by the backtest (cs2bot.models.confidence);
     # the decision layer may require ``trusted`` markets (see docs/dev/reports/deep_data.md).
     confidence_guard_file: Path = Path("data/models/confidence_guard.json")
+    # Final review (Lens C): the unattended refresh of that file (scheduler job
+    # ``confidence_guard_refresh``, train lane, at ``scheduler.guard_refresh_cron``): a walk-forward
+    # backtest over the last ``guard_backtest_days`` once the file is ``guard_refresh_days`` old and at
+    # least ``guard_min_priced_matches`` finished matches have stored Betclic prices. 0 days = off.
+    guard_refresh_days: float = 7.0
+    guard_backtest_days: int = 180
+    guard_backtest_sims: int = 1000
+    guard_backtest_retrain_days: int = 14
+    guard_min_priced_matches: int = 40
 
 
 class MarketThresholds(BaseModel):
@@ -213,6 +223,17 @@ class DecisionSettings(BaseModel):
     # tolerance in the 0.75-1.0 range) before betting a market type. Only enforced when the caller
     # passes the trusted set to ``engine.decision.evaluate`` (see docs/dev/reports/cloud_autonomy.md).
     require_trusted_calibration: bool = False
+    # Final review (Lens C): the odds are not a criterion, but a WIN must pay back more than the
+    # stake. With the 12 % stake tax a winning bet at odds below 1/(1 - 0.12) = 1.137 returns less
+    # than it cost (e.g. 1.10 pays 0.968 per 1 PLN staked), so such bets lose money whatever happens.
+    # True rejects them (``unprofitable_win``); a 1.28 bet still passes. False = odds fully ignored.
+    require_profitable_win: bool = True
+    # Final review (Lens C): apply the high-confidence guard (cs2bot.models.confidence, written by
+    # ``cs2bot backtest`` to ``models.confidence_guard_file``) to every probability before the
+    # confidence check and the stake tier: probabilities above 0.75 are shrunk where the history shows
+    # over-confidence, and - without any history - keep half of their excess over 0.75 (a 0.75 pick
+    # stays bettable, only the stake tier is more cautious). Never raises a probability.
+    use_confidence_guard: bool = True
 
 
 class BankrollSettings(BaseModel):
@@ -229,9 +250,41 @@ class BankrollSettings(BaseModel):
     # a fraction of the bankroll chosen by the calibrated probability; "kelly" is fractional Kelly.
     staking_mode: Literal["confidence_tiers", "kelly"] = "confidence_tiers"
     # (minimum probability, fraction of bankroll); the highest tier whose minimum is met applies.
+    # The probability is p(win | settled) after the confidence guard (decision.use_confidence_guard).
     confidence_tiers: list[tuple[float, float]] = Field(
         default_factory=lambda: [(0.75, 0.01), (0.85, 0.015), (0.92, 0.02)]
     )
+
+
+def confidence_tiers_problem(bankroll: BankrollSettings) -> str | None:
+    """Why ``bankroll.confidence_tiers`` is not usable, or None (final review, Lens C).
+
+    Tiers: finite, minimum probabilities strictly ascending in (0, 1), fractions positive,
+    non-decreasing and within ``max_stake_fraction``. Checked for the ``.env`` settings
+    (:class:`Settings`) and for every dashboard edit (``api.configedit``). Deliberately NOT a validator
+    of :class:`BankrollSettings` itself: the effective settings are re-merged from the stored dashboard
+    overrides on every cycle, and an override saved before an upgrade (e.g. a lower max stake) must not
+    make that merge raise. ``engine.bankroll.size_stake`` copes with any tier list (highest tier met,
+    still capped by ``max_stake_fraction``).
+    """
+    tiers = bankroll.confidence_tiers
+    if bankroll.staking_mode == "confidence_tiers" and not tiers:
+        return "bankroll.confidence_tiers must not be empty with staking_mode=confidence_tiers"
+    previous_p, previous_f = 0.0, 0.0
+    for p, f in tiers:
+        if not (math.isfinite(p) and math.isfinite(f)):
+            return "bankroll.confidence_tiers must contain finite numbers"
+        if not 0.0 < p < 1.0:
+            return f"confidence tier minimum probability {p} must be in (0, 1)"
+        if p <= previous_p:
+            return "bankroll.confidence_tiers must be sorted by strictly ascending probability"
+        if not 0.0 < f <= bankroll.max_stake_fraction:
+            limit = bankroll.max_stake_fraction
+            return f"confidence tier fraction {f} must be in (0, max_stake_fraction={limit}]"
+        if f < previous_f:
+            return "a higher confidence tier must not stake a smaller fraction than a lower one"
+        previous_p, previous_f = p, f
+    return None
 
 
 class ExecutorSettings(BaseModel):
@@ -283,6 +336,11 @@ class APISettings(BaseModel):
     session_max_age_s: int = 60 * 60 * 12
     cors_origins: list[str] = Field(default_factory=lambda: ["http://localhost:5173"])
     allowed_hosts: list[str] = Field(default_factory=list)  # extra Host-header names (non-loopback)
+    # Final review (Lens C): IP addresses / networks of a reverse proxy whose X-Forwarded-For and
+    # X-Forwarded-Proto are trusted (Caddy on the VPS: docker-compose.cloud.yml pins its address). Then
+    # the login rate limit and the audit log see the real client and the session cookie is ``Secure``.
+    # Empty (default, the PC install) = never trust forwarding headers.
+    forwarded_allow_ips: list[str] = Field(default_factory=list)
     login_max_failures: int = 5
     login_global_max_failures: int = 20
     login_window_s: float = 300.0
@@ -381,6 +439,8 @@ class SchedulerSettings(BaseModel):
     settle_min: int = 30
     demo_process_min: int = 60
     retrain_cron: str = "0 5 * * *"
+    # daily slot of the confidence-guard refresh (it only runs when due: models.guard_refresh_days)
+    guard_refresh_cron: str = "30 6 * * *"
 
 
 class Settings(BaseSettings):
@@ -420,6 +480,9 @@ class Settings(BaseSettings):
             raise ValueError("bankroll.kelly_fraction must be in (0, 1]")
         if not 0 < self.decision.min_probability < 1:
             raise ValueError("decision.min_probability must be in (0, 1)")
+        tier_problem = confidence_tiers_problem(self.bankroll)
+        if tier_problem:
+            raise ValueError(tier_problem)
         if not self.api.is_loopback and (self.api.password is None or self.api.session_secret is None):
             raise ValueError(
                 "The API listens on a non-loopback address: set CS2BOT_API__PASSWORD and "

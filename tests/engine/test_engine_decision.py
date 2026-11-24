@@ -644,24 +644,56 @@ def test_a_live_bookmaker_event_is_never_a_pre_match_bet(session: Session) -> No
 
 def test_ev_rule_is_off_by_default_odds_are_ignored() -> None:
     """Owner decision 2026-11-24 ("even a 1.28 wins"): a confident pick is accepted whatever the odds,
-    also when the 12% stake tax makes its EV negative; the price floor is only the odds tolerance."""
+    also when the 12% stake tax makes its EV negative. The only price rule left is that a WIN must pay
+    back more than the stake (final review, Lens C: below 1.137 a winning bet loses money)."""
     assert DecisionSettings().min_ev == -1.0
-    low_odds = Case(priced_kw={"p_win": 0.89, "odds": "1.10"}).run()  # EV = 0.89 * 0.968 - 1 < 0
-    assert low_odds.priced.ev < 0
-    assert low_odds.accepted and low_odds.reasons == []
+    favourite = Case(priced_kw={"p_win": 0.80, "odds": "1.28"}).run()  # EV = 0.80 * 1.1264 - 1 < 0
+    assert favourite.priced.ev < 0
+    assert favourite.accepted and favourite.reasons == []
     # a per-market override can still turn a break-even guard on for one market type
     guarded = DecisionSettings(market_overrides={"match_winner": MarketThresholds(min_ev=0.0)})
     assert codes(
         Case(
-            priced_kw={"p_win": 0.89, "odds": "1.10"},
+            priced_kw={"p_win": 0.80, "odds": "1.28"},
             settings_kw={"market_overrides": guarded.market_overrides},
         ).run()
     ) == ["low_ev"]
-    priced = make_priced(p_win=0.89, odds="1.10")
+    priced = make_priced(p_win=0.80, odds="1.28")
     floor = min_acceptable_odds(
         priced, settings=DecisionSettings(), betclic=BetclicSettings(), odds_tolerance=0.02
     )
-    assert floor == Decimal("1.078")  # 1.10 x 0.98, no EV floor
+    assert floor == Decimal("1.255")  # 1.28 x 0.98, no EV floor
+
+
+def test_a_win_that_pays_back_less_than_the_stake_is_never_bet() -> None:
+    """Final review (Lens C): at 1.10 a WIN pays 0.88 x 1.10 = 0.968 per 1 PLN staked - the bet loses
+    money whatever happens. ``require_profitable_win`` (default on) rejects it; the floor is 1.137 with
+    the 12 % stake tax and 1.001 in a tax-free promo; the executor never accepts a drop below it."""
+    low = Case(priced_kw={"p_win": 0.89, "odds": "1.10"}).run()
+    assert codes(low) == [ReasonCode.UNPROFITABLE_WIN.value]
+    assert not low.accepted
+    assert codes(Case(priced_kw={"p_win": 0.89, "odds": "1.136"}).run()) == ["unprofitable_win"]
+    assert Case(priced_kw={"p_win": 0.89, "odds": "1.137"}).run().accepted
+    # tax-free promo: the stake is fully in play, 1.10 is a real win
+    assert Case(priced_kw={"p_win": 0.89, "odds": "1.10"}, betclic_kw={"tax_free_promo": True}).run().accepted
+    # the owner can switch the guard off (odds fully ignored)
+    off = Case(priced_kw={"p_win": 0.89, "odds": "1.10"}, settings_kw={"require_profitable_win": False}).run()
+    assert off.accepted
+    # the executor's floor never goes below the profitable-win odds (1.15 x 0.98 = 1.127 < 1.137)
+    floor = min_acceptable_odds(
+        make_priced(p_win=0.89, odds="1.15"),
+        settings=DecisionSettings(),
+        betclic=BetclicSettings(),
+        odds_tolerance=0.02,
+    )
+    assert floor == Decimal("1.137")
+    no_guard = min_acceptable_odds(
+        make_priced(p_win=0.89, odds="1.15"),
+        settings=DecisionSettings(require_profitable_win=False),
+        betclic=BetclicSettings(),
+        odds_tolerance=0.02,
+    )
+    assert no_guard == Decimal("1.127")
 
 
 def test_untrusted_calibration_rule() -> None:

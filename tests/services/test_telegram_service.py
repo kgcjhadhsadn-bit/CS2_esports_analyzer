@@ -631,3 +631,44 @@ def test_run_up_sends_startup_and_shutdown_messages(tmp_path: Path) -> None:
 
 def test_now_is_aware() -> None:
     assert utcnow().tzinfo is UTC and datetime.now(UTC) - utcnow() < timedelta(seconds=5)
+
+
+@respx.mock
+def test_watchdog_reports_a_stale_or_stuck_money_path_once_per_cooldown(
+    session_factory: sessionmaker[Session],
+) -> None:
+    """Final review (Lens C): a lane that silently stopped (no failures, just no runs) or a job hanging
+    in RUNNING reached nobody on the unattended VPS."""
+    route = respx.post(SEND_URL).mock(return_value=ok())
+    settings = full_settings(error_alert_cooldown_min=60)
+    notifier = TelegramNotifier(session_factory, settings, TelegramClient(settings.telegram))
+    t0 = utcnow()
+    notifier.scan_once(now=t0)
+    with session_factory() as s:
+        # the odds collector last succeeded 2 h ago (stale after 2 x 180 s + 10 min)
+        s.add(
+            JobRun(
+                job_name="odds_collect",
+                status=JobStatus.SUCCESS,
+                started_at=t0 - timedelta(hours=2),
+                finished_at=t0 - timedelta(hours=2) + timedelta(seconds=20),
+            )
+        )
+        # the betting cycle hangs since 1 h
+        s.add(JobRun(job_name="bet_run", status=JobStatus.RUNNING, started_at=t0 - timedelta(hours=1)))
+        # a slow HLTV job is nobody's business here (not the money path)
+        s.add(
+            JobRun(
+                job_name="ingest_results_hltv",
+                status=JobStatus.SUCCESS,
+                started_at=t0 - timedelta(days=3),
+                finished_at=t0 - timedelta(days=3),
+            )
+        )
+        s.commit()
+    assert notifier.scan_once(now=t0 + timedelta(seconds=30)) == 2
+    texts = sent_texts(route)
+    assert any(t.startswith("Job odds_collect has not succeeded for too long") for t in texts)
+    assert any(t.startswith("Job bet_run has been running for 60 min") for t in texts)
+    assert notifier.scan_once(now=t0 + timedelta(minutes=5)) == 0  # cooldown
+    assert notifier.scan_once(now=t0 + timedelta(minutes=70)) == 2  # still broken an hour later

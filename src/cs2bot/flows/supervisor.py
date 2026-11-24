@@ -3,8 +3,10 @@
 Start-up order (:func:`run_up`):
 
 1. database reachable and migrations at head (else exit code 2 with the fix in the message);
-2. models: the newest saved bundle, else a first training run (no data yet -> the bot still starts;
-   prediction and betting jobs wait for the first successful retrain);
+2. models: the newest saved bundle, else a first training run in a background thread (final review,
+   Lens C: the scheduler and the API start at once - odds are collected and the container is healthy
+   while it trains; no data yet -> the bot still starts; prediction and betting jobs wait for the first
+   successful training);
 3. the Betclic executor (``executor.create_betclic_executor``; the browser starts lazily on the first
    call, in the executor's own thread). A :class:`~cs2bot.executor.FakeExecutor` is never created
    here: tests inject one through ``executor_factory``;
@@ -103,25 +105,52 @@ def _install_signal_handlers(stop: threading.Event) -> Callable[[], None]:
 
 
 def _load_or_train(
-    registry: ModelRegistry, session_factory: sessionmaker[Session], train_if_missing: bool
-) -> None:
+    registry: ModelRegistry,
+    session_factory: sessionmaker[Session],
+    train_if_missing: bool,
+    *,
+    background: bool = False,
+) -> threading.Thread | None:
+    """Load the newest bundle; without one, train (in a background thread when ``background``).
+
+    Final review (Lens C): the first training used to run before the scheduler and the API started.
+    With a backfilled history it can take longer than the container's healthcheck start period
+    (15 min on the VPS), and meanwhile no odds were collected and the dashboard did not answer; a
+    ``docker stop`` during it also killed the process before any signal handler existed. Now it runs
+    in a daemon thread (the registry's train lock keeps the nightly job from training at the same time;
+    prediction and betting jobs skip until the bundle is there).
+    """
     bundle = registry.load_latest()
     if bundle is not None:
         log.info("models: using bundle %s (trained %s)", bundle.version, bundle.trained_at.isoformat())
-        return
+        return None
     if not train_if_missing:
         log.warning(
             "models: no saved bundle; predictions wait for `cs2bot models train` or the nightly retrain"
         )
-        return
+        return None
+    if background:
+        thread = threading.Thread(
+            target=_first_training,
+            args=(registry, session_factory),
+            name="cs2bot-first-training",
+            daemon=True,
+        )
+        thread.start()
+        return thread
+    _first_training(registry, session_factory)
+    return None
+
+
+def _first_training(registry: ModelRegistry, session_factory: sessionmaker[Session]) -> None:
     log.info("models: no saved bundle - training now (this can take a few minutes)")
     try:
         report = registry.retrain(session_factory)
         log.info("models: trained %s on %d maps", report.version, report.n_map_results)
     except NotEnoughDataError as exc:
-        log.warning("models: %s; the bot starts without a model", exc)
+        log.warning("models: %s; the bot runs without a model until the next retrain", exc)
     except Exception:
-        log.exception("models: first training failed; the bot starts without a model")
+        log.exception("models: first training failed; the bot runs without a model until the next retrain")
 
 
 def _start_api(server: Any) -> threading.Thread:
@@ -157,6 +186,7 @@ def run_up(
     runtime_overrides: dict[str, Any] | None = None,
     check_migrations: bool = True,
     train_if_missing: bool = True,
+    train_in_background: bool = True,
     start_api: bool = True,
     stop_event: threading.Event | None = None,
     on_started: Callable[[UpHandles], None] | None = None,
@@ -181,8 +211,8 @@ def run_up(
 
     registry = ModelRegistry(settings)
     try:
-        _load_or_train(registry, session_factory, train_if_missing)
-    except KeyboardInterrupt:  # Ctrl+C during the first training: a normal, deliberate stop
+        _load_or_train(registry, session_factory, train_if_missing, background=train_in_background)
+    except KeyboardInterrupt:  # Ctrl+C during a foreground first training: a normal, deliberate stop
         echo("Ctrl+C received during start-up - stopped.")
         if engine is not None:
             engine.dispose()
