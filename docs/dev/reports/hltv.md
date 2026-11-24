@@ -2,7 +2,7 @@
 
 > Written by the engineer who implemented the package. Reviewers update it when the public API changes.
 
-**Tests:** `.venv/bin/python -m pytest tests/ingest/hltv -q` - 154 passed, 0 failed (lint/type clean: True; after review round 1)
+**Tests:** `.venv/bin/python -m pytest tests/ingest/hltv -q` - 166 passed, 0 failed (lint/type clean: True; after review round 1, second pass)
 
 ## Summary
 
@@ -28,7 +28,7 @@ HLTVFetcher(settings: HLTVSettings, *, page_loader: PageLoader | Callable[[str],
             rng: random.Random | None = None)
   .get(path_or_url: str, *, max_age_minutes: int | None = None) -> str   # max_age 0 = force refresh
   .url_for(path_or_url: str) -> str          # = hltv_url(base_url, ...); ValueError for non-HLTV hosts
-  .ttl_minutes(url: str, cached_html: str | None = None) -> int
+  .ttl_minutes(url: str, cached_html: str | None = None, fetched_at: datetime | None = None) -> int
   .cached(path_or_url: str) -> CachedPage | None   # .invalidate(path_or_url) -> None
   .prune_cache(older_than: timedelta | None = None) -> int   # maintenance job; default = long TTL
   .blocked_until -> datetime | None ; .stats: FetchStats ; .base_url: str
@@ -40,7 +40,8 @@ HLTVFetcher(settings: HLTVSettings, *, page_loader: PageLoader | Callable[[str],
   - `HLTVNotFoundError` on 404/410.
   - `HLTVFetchError` on other failures. Connection errors are retried once.
   - All three subclass `HLTVError`. `HLTVParseError` (also `ValueError`) is raised by the parsers.
-- **Settings are the source of truth**: `FetchOptions.from_settings(settings, **overrides)` takes `challenge_wait_s`, `cooldown_base_s` (doubles per repeat block), `cooldown_max_s`, `block_resources` and `browser_profile_dir` (default `data/browser/hltv`, a persistent Chromium profile) from `HLTVSettings`; the remaining knobs are `challenge_poll_s=1.0, transport_retries=1, transport_retry_delay_s=10.0, locale='en-US'`. A directly constructed `FetchOptions()` (tests) has the same defaults but `browser_profile_dir=None`.
+- **Settings are the source of truth**: `FetchOptions.from_settings(settings, **overrides)` takes `challenge_wait_s`, `cooldown_base_s` (doubles per repeat block), `cooldown_max_s`, `block_resources` and `browser_profile_dir` (default `data/browser/hltv`, a persistent Chromium profile) from `HLTVSettings`; the remaining knobs are `challenge_poll_s=1.0, transport_retries=1, transport_retry_delay_s=10.0, locale='en-US', finished_match_settle_hours=48.0`.
+- **TTL policy:** mapstats pages, news articles, past dated rankings and past archive months use the long TTL. A "Match over" page only gets it once it is final (it shows a `/download/demo/` link, or the match started `finished_match_settle_hours` before the page was fetched); "Match deleted" pages are final at once; everything else uses `cache_ttl_minutes`. A page that fails to parse is dropped from the cache by the sync (`invalidate`). A directly constructed `FetchOptions()` (tests) has the same defaults but `browser_profile_dir=None`.
 - `detect_challenge(html: str) -> str | None`; `hltv_url(base_url, path_or_url) -> str` (same-site absolute URLs incl. `hltv.org` vs `www.hltv.org` are rewritten onto `base_url`, other hosts raise `ValueError`).
 - `browser_launch_kwargs(settings, *, headless)` / `browser_context_kwargs(settings, *, locale)` (shared by the fetcher and the manual check).
 
@@ -69,7 +70,7 @@ parse_news_list(html: str, *, base_url: str = HLTV_BASE_URL, now: datetime | Non
 parse_news_article(html: str, url: str) -> NewsArticle
 ```
 - Orientation inside the models is HLTV's page orientation (team1 = left).
-- **`ResultRow`**: `hltv_match_id`, `url`, `team1`/`team2: TeamRef(name, hltv_id)`, `team1_score`/`team2_score`, `winner: TeamSlot`, `event`, `stars`, `played_at`, `format`, `map_name` (BO1 only), `is_forfeit`, `format_hint`.
+- **`ResultRow`**: `hltv_match_id`, `url`, `team1`/`team2: TeamRef(name, hltv_id)`, `team1_score`/`team2_score`, `winner: TeamSlot`, `event`, `stars`, `played_at`, `played_at_is_date_only` (no start time on the row: `played_at` is the day headline at 00:00 UTC), `format`, `map_name` (BO1 only), `is_forfeit`, `format_hint`.
 - **`UpcomingRow`**: `hltv_match_id`, `url`, `team1`/`team2` (None if TBD), `scheduled_at`, `format`, `event: EventRef(name, hltv_id)`, `stars`, `is_live`, `is_lan`, `title`, `map_names`, `has_teams`.
 - **`MatchPage`**:
   - Header: `team1`/`team2`, `team1_rank`/`team2_rank`, `rank_date`, `scheduled_at`, `status` (`HLTVMatchStatus`: scheduled/live/finished/postponed/deleted; `.to_match_status()`; deleted maps to CANCELED), `status_text`, `best_of`, `format`, `is_lan`, `event`, `stage`, `notes`.
@@ -92,7 +93,8 @@ parse_news_article(html: str, url: str) -> NewsArticle
 ```python
 sync_match(session, fetcher: PageSource, hltv_match_id: int, *, settings: Settings, with_mapstats: bool = True,
            max_age_minutes: int | None = None, options: HLTVSyncOptions | None = None, url_hint: str | None = None,
-           hints: Mapping[str, Any] | None = None, expect_finished: bool = False) -> SyncReport
+           hints: Mapping[str, Any] | None = None, expect_finished: bool = False,
+           now: datetime | None = None) -> SyncReport
 sync_mapstats(session, fetcher, mapstats_id: int, *, settings: Settings | None = None, match: Match | None = None,
               map_number: int | None = None, options: HLTVSyncOptions | None = None) -> SyncReport
 sync_results(session, fetcher, *, settings: Settings, since: datetime, max_pages: int = 50, in_scope_only: bool = True,
@@ -108,7 +110,7 @@ hltv_round_records(session, map_played: MapPlayed) -> list[RoundRecord]   # fall
 ```
 - **`PageSource`** is a Protocol requiring only `get(path_or_url, *, max_age_minutes=None) -> str`. `HLTVFetcher` satisfies it.
 - **`SyncReport`** (dataclass): `job`, `created`, `updated`, `skipped`, `failed`, `fetched_pages`, `blocked`, `errors`, `warnings`, `match_ids`, `details`; plus `.ok`, `.items`, `.merge()`, `.as_dict()` (for `JobTracker.details`). Sync functions never raise for one bad page or row. If `report.blocked` is set, stop and commit the partial work.
-- **`HLTVSyncOptions`** defaults: `listing_ttl_minutes=20, upcoming_match_ttl_minutes=120, near_start_window_minutes=120, near_start_ttl_minutes=10, match_link_window_hours=12.0, write_round_rows=True, max_news_articles=100, min_ranking_rows_for_cleanup=30, commit_every=None`.
+- **`HLTVSyncOptions`** defaults: `listing_ttl_minutes=20, upcoming_match_ttl_minutes=120, near_start_window_minutes=120, near_start_ttl_minutes=10, match_link_window_hours=12.0, write_round_rows=True, max_news_articles=100, min_ranking_rows_for_cleanup=30, commit_every=None, finalize_after_hours=48.0, current_rank_max_age_days=21`.
 - **What `sync_match` writes:**
   - Match, matched by `hltv_id`, else `find_match` within 12 h (keeping a PandaScore match's orientation and schedule).
   - Tournament (`hltv_event_id`, `is_lan`).
@@ -118,11 +120,13 @@ hltv_round_records(session, map_played: MapPlayed) -> list[RoundRecord]   # fall
   - Rounds (`source=DataSource.HLTV`) from a complete map stats round history; upserted by round number, never written when the map already has rows from another source (DEMO).
   - PlayerMapStats (source HLTV, `ct_kills`/`ct_deaths`/`t_kills`/`t_deaths`).
   - Demo rows (PENDING, one per `/download/demo/{id}`).
-  - TeamRanking and `Team.hltv_rank` from the dated rank link on the match page.
+  - TeamRanking from the dated rank link on the match page; `Team.hltv_rank` only when that ranking is at most `current_rank_max_age_days` old (relative to `now`), so a backfill never gives a team its rank from years ago as the current rank.
+  - `Match.extra['hltv']['complete']` (later `sync_results` runs skip complete matches): finished/deleted, every played map's stats page synced, and final - HLTV shows the demo link and every map's stats link, or the match started `finalize_after_hours` before `now`, or it was deleted. Until then the match is re-synced, so demo rows published after "Match over" are still picked up.
+  - `Match.status`: FINISHED never regresses, CANCELED only moves to FINISHED, LIVE never moves back to SCHEDULED.
   - `Match.in_scope` is OR-ed with the scope rule. It uses `cs2bot.ingest.scope.is_in_scope` when that module exists, else the fallback: tier S/A/B or a team in the top N.
 - **Relevance** for results/upcoming: already in scope, or `stars >= 1`, or a top-N team *at match time* (`ingest.scope.team_rank_as_of`: current rank for recent matches, ranking history for older ones), or an in-scope match between the same teams nearby. Run `sync_rankings` first; a backfill needs dated rankings (match pages record them) for old unstarred matches.
 - **`sync_upcoming`** skips live and TBD matches and anything beyond `settings.scope.max_hours_ahead`. Matches starting within 120 min are re-fetched with a 10-minute TTL.
-- **`sync_results`** stops at rows older than `since`, after `max_pages`, or at the first page holding only already-complete matches. Use `stop_when_nothing_new=False` (and a large `max_pages`) for the backfill CLI. `query` lets the CLI filter, e.g. `{"startDate": ..., "endDate": ...}`.
+- **`sync_results`** stops at rows older than `since` (a date-only row only once its whole day is older), after `max_pages`, or at the first page holding only already-complete matches. Use `stop_when_nothing_new=False` (and a large `max_pages`) for the backfill CLI. `query` lets the CLI filter, e.g. `{"startDate": ..., "endDate": ...}`.
 - **`sync_news`** upserts `NewsItem(source="hltv")` by URL. `team_ids`/`player_ids` come from article links plus conservative name matching (`MentionIndex`).
 - **`Match.extra['hltv']`**: `status`, `status_text`, `best_of`, `event_id`, `event_name`, `scheduled_at`, `team1_rank`/`team2_rank` (our orientation), `rank_date`, `forfeit`, `forfeit_note`, `forfeit_winner_team_id`, `forfeited_maps`, `notes`, `has_veto`, `has_lineups`, `stars`, `complete`, `synced_at`.
 - **`MapPlayed.extra['hltv']`**: `raw_name`, `halves` (`[{team1, team2, team1_side, overtime}]`), `mapstats_url`, `mapstats_id`, `rating_version`, `rounds_complete`, `team1_rating`/`team2_rating`, `team1_first_kills`/`team2_first_kills`, `team1_clutches`/`team2_clutches`, and `rounds` (`[{round, winner: 'team1'|'team2', winner_side, team1_side, end_reason, score: [t1, t2]}]`, our orientation).
@@ -195,3 +199,23 @@ Independent review against docs/dev/briefs/hltv.md incl. the Addendum. Checks re
 - Results rows without `data-zonedgrouping-entry-unix` fall back to the sublist date at 00:00 UTC; with such rows a `since` inside that day could stop the walk a few hours early.
 - The browser profile can only be open in one browser: the HLTV fetcher, the demo `BrowserDownloader` and the manual check must not run at the same time on the same profile (the scheduler lane must serialise them).
 - `open_browser_for_manual_check` has no real-browser test (needs a display); it is covered with a fake Playwright only.
+
+## Review round 1 - second reviewer
+
+An independent second pass over the brief (incl. Addendum), the code and the first review. Checks re-run: `pytest tests/ingest/hltv` (166 passed, ~12 s with `-n 2`), ruff check / format and mypy clean on the package, `tests/foundation`, `tests/ingest/pandascore` and `tests/ingest/demos` still pass.
+
+**Verified (no change needed):** every brief item and Addendum item is implemented (fetcher modes, cache/TTL, rate limiter only on network fetches, challenge wait + exponential persisted cool-down, no solving; all parsers incl. BO1/BO5/overtime/forfeits/postponed/deleted; sync of matches, map stats, results, upcoming, rankings, news; `open_browser_for_manual_check`; HLTV round rows never overwriting DEMO rows). Re-derived: orientation mapping of scores, side splits, start sides, round winners/sides/scores and veto/pick team ids (`is_swapped`); CT/T split arithmetic from the breakdown row (left/right team, both halves); round-history side inference from the outcome icons (`stopwatch`/`bomb_defused` = CT, `bomb_exploded` = T); MR12 overtime counts; foreign-host refusal of scraped links (demo URLs are rebuilt from the id); proxy credentials never logged.
+
+**Issues found and fixed:**
+- (major) A finished match was marked `complete` (skipped by every later `sync_results`) and its "Match over" page cached for 30 days as soon as the result was up - but HLTV publishes the GOTV demo link (and sometimes the map stats links) only later. A match synced shortly after it ended therefore never got its `Demo` rows (the demo pipeline's only source) nor late map stats. Now `complete` also requires the page to be final (demo link and every stats link present, or `finalize_after_hours`=48 h since the start, or "Match deleted"), and the fetcher only gives a "Match over" page the long TTL once it is final (`FetchOptions.finished_match_settle_hours`). `sync_match(now=...)` added. Tests: incomplete without demo then complete once the demo appears (Demo rows created), final after the settle time, missing stats link, `sync_results` revisits non-final matches, TTL policy.
+- (major) Ranks shown on old match pages (backfill) and explicitly dated old rankings set `Team.hltv_rank` - the *current* rank used for scope (`team_rank_as_of`) and by consumers - for teams without a newer ranking, e.g. a team ranked #5 in 2024 and unranked today, until the next weekly ranking sync. `record_team_rank(current_max_age_days=, now=)` now only moves the current rank for rankings at most `current_rank_max_age_days`=21 days old (the latest `sync_rankings` always does); the dated `team_rankings` row is always stored. Tests for both paths.
+- (minor) `sync_results` stopped the walk at a results row without a start time whose day headline (00:00 UTC) was before `since` although the match itself was after it (the first review's remaining concern). `ResultRow.played_at_is_date_only` added; such rows only count as older once their whole day is. Test.
+- (minor) A LIVE match (e.g. set by PandaScore) was moved back to SCHEDULED by a match page cached shortly before kick-off. `_merge_status` no longer does that. Test.
+- (minor) A page that failed to parse (truncated / error page served with HTTP 200) stayed in the cache - for map stats pages and news articles for 30 days, blocking that data. The sync now drops the cached copy on a parse error (`invalidate` when the source has it). Test with the real fetcher.
+- (minor) A corrupt cool-down file (valid JSON but not an object) crashed the fetcher's constructor, a huge `consecutive_blocks` overflowed the cool-down arithmetic (`OverflowError` instead of `HLTVBlockedError`), and a failed cool-down write (disk full) replaced the block error with an `OSError` that escaped the sync's error handling. All three fixed. Tests.
+
+**Remaining concerns:**
+- Selectors/fixtures are still replicas built from open-source scrapers; the first live run on the owner's PC must be smoke-tested (`selectors.py`, incl. the new `MATCH_HEADER_UNIX_RE` / `DEMO_LINK_HTML_RE` used by the cache policy - if they do not match, a finished page simply keeps the normal TTL).
+- Matches that never get a demo are re-synced (one cached-or-6-hourly match page fetch per run) for up to 48 h after their start; acceptable traffic, tunable via `finalize_after_hours`.
+- `_merge_status` lets HLTV move a PandaScore LIVE match to POSTPONED; PandaScore's own sync rules are not coordinated with HLTV's beyond that.
+- One profile = one browser: the HLTV fetcher, the demo `BrowserDownloader` and the manual check must be serialised by the scheduler.

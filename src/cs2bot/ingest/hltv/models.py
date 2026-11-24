@@ -72,6 +72,9 @@ class ResultRow(BaseModel):
     event: EventRef | None = None
     stars: int = 0
     played_at: datetime | None = None
+    # True when the row had no start time and ``played_at`` is the day headline at 00:00 UTC (the day
+    # is in HLTV's display time zone, so the real start can be up to a day later)
+    played_at_is_date_only: bool = False
     format: MatchFormat | None = None
     map_name: str | None = None  # BO1 only
     is_forfeit: bool = False

@@ -70,7 +70,16 @@ def sync_rankings(
                     continue
                 seen.add(team.id)
                 report.updated += 1  # one team_rankings row upserted
-                if record_team_rank(session, team, row.rank, ranked_on, row.points):
+                if record_team_rank(
+                    session,
+                    team,
+                    row.rank,
+                    ranked_on,
+                    row.points,
+                    # the latest ranking always is the current one; an explicitly dated (old) one
+                    # must not hand a team that is unranked today its rank from back then
+                    current_max_age_days=None if ranking_date is None else opts.current_rank_max_age_days,
+                ):
                     report.details["current_rank_updates"] = report.details.get("current_rank_updates", 0) + 1
             is_latest = ranking_date is None
             if is_latest and len(rows) >= opts.min_ranking_rows_for_cleanup:

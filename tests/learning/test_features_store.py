@@ -121,7 +121,7 @@ def test_form_schedule_h2h_and_side_features_on_a_tiny_history():
     # nothing round-level / demo / player / veto was provided
     for name in ("pistol_win_pct_180d", "trade_kill_share_180d", "pl_kpr_mean", "map_ban_rate_180d"):
         assert math.isnan(f[name])
-    assert f["pl_known"] != f["pl_known"] or f["pl_known"] == 0  # NaN without player data
+    assert f["pl_known"] == 0  # no lineup player has data (the same value a store with stat lines gives)
 
     # a window boundary: match 2 was played exactly 30 days before day 50 + 0 -> still inside [t-30d, t)
     g = store.team_features(1, "mirage", T0 + 50 * DAY)
@@ -511,3 +511,29 @@ def test_excluded_match_cuts_every_query_at_its_start():
         exclude_match_id=10,
     )
     assert same_features(direct, row_late.iloc[0].to_dict()) == []
+
+
+def test_player_count_is_the_same_for_a_store_without_stat_lines_and_one_cut_before_them():
+    """Review round 1: ``pl_known`` was NaN for a store without any stat line but 0 for a store whose
+    stat lines all lie after ``as_of`` - a walk-forward store cut early disagreed with the full one."""
+    maps = [_rec(1, 0, 1, 2, (13, 5), lineup1=(11,), lineup2=(21,)), _rec(2, 10, 1, 2, (13, 9))]
+    line = PlayerMapRecord(
+        match_id=2,
+        map_number=1,
+        map_name="mirage",
+        played_at=T0 + 10 * DAY,
+        player_id=11,
+        team_id=1,
+        opponent_team_id=2,
+        kills=20,
+        deaths=10,
+        rounds_played=22,
+    )
+    bare = FeatureStore.build(maps, patch_timeline=None)
+    full = FeatureStore.build(maps, player_maps=[line], patch_timeline=None)
+    at = T0 + 5 * DAY
+    a = bare.team_features(1, "mirage", at, lineup=(11,))
+    b = full.team_features(1, "mirage", at, lineup=(11,))
+    assert a["pl_known"] == b["pl_known"] == 0.0
+    assert same_features(a, b) == []
+    assert full.team_features(1, "mirage", T0 + 11 * DAY, lineup=(11,))["pl_known"] == 1.0

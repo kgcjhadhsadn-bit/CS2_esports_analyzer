@@ -133,7 +133,8 @@ def _parse_result_row(con: Tag, base_url: str) -> ResultRow | None:
     event_name = text_of(con.select_one(ResultsSel.EVENT_NAME)) or (
         attr(con.select_one(ResultsSel.EVENT_LOGO), "alt") or ""
     )
-    played_at = unix_ms(attr(con, ResultsSel.ROW_UNIX_ATTR)) or _sublist_date(con)
+    exact = unix_ms(attr(con, ResultsSel.ROW_UNIX_ATTR))
+    played_at = exact or _sublist_date(con)
     return ResultRow(
         hltv_match_id=match_id,
         url=strip_fragment(absolute_url(href, base_url)),
@@ -145,6 +146,7 @@ def _parse_result_row(con: Tag, base_url: str) -> ResultRow | None:
         event=EventRef(name=clean_text(event_name)) if clean_text(event_name) else None,
         stars=len(con.select(ResultsSel.STARS)),
         played_at=played_at,
+        played_at_is_date_only=exact is None and played_at is not None,
         format=BEST_OF_TO_FORMAT.get(best_of) if best_of else None,
         map_name=map_name,
         is_forfeit=forfeit,

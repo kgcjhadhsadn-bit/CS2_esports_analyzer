@@ -16,7 +16,7 @@ import {
   signClass,
 } from "../../lib/format";
 import { BetStatusBadge } from "../badges";
-import { Badge, Empty } from "../ui";
+import { Badge, Empty, toggleRowProps } from "../ui";
 import type { BadgeTone } from "../ui";
 
 /** "p_win 0.45 < 0.75" or a structured reason -> display text. */
@@ -143,8 +143,7 @@ export function MarketsTable({
                     )}
                     <tr
                       className={`clickable ${isOpen ? "expanded" : ""}`}
-                      onClick={() => setExpanded(isOpen ? null : key)}
-                      aria-expanded={isOpen}
+                      {...toggleRowProps(() => setExpanded(isOpen ? null : key), isOpen)}
                     >
                       <td>{row.label}</td>
                       <td className="num" title={row.p_win !== null ? `unconditional p_win ${formatPct(row.p_win)}` : undefined}>
@@ -187,6 +186,11 @@ export function MarketsTable({
               })}
             </tbody>
           </table>
+        </div>
+      )}
+      {visible.length !== rows.length && (
+        <div className="small muted">
+          Showing {visible.length} of {rows.length} outcomes (filter &quot;Show&quot; / &quot;Market&quot;).
         </div>
       )}
     </div>

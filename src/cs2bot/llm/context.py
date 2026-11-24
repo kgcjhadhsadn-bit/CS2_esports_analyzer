@@ -103,6 +103,7 @@ _MAX_FLAGS = 10
 _MAX_CANDIDATES_PER_ITEM = 15
 _IRRELEVANT_MAX_RELEVANCE = 0.2
 _NEWS_REF = re.compile(r"^(?:news)?[\s:_#-]*(\d+)$", re.IGNORECASE)
+_SPLIT = re.compile(r"[,;]+|\s+(?:and|&)\s+|\s+")
 _CONTEXT_TOKENS = {"context", "match_context", "match context", "match-context"}
 _EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
 # Situations that can only hurt the team they are about (see LLMTuning.enforce_adverse_direction).
@@ -238,17 +239,33 @@ def resolve_evidence(raw: Sequence[str], index: Mapping[str, str], *, limit: int
     """
     resolved: list[str] = []
     for entry in raw:
-        token = " ".join(str(entry).split()).strip("\"'[]() ").casefold()
-        target: str | None = None
-        if token in _CONTEXT_TOKENS:
-            target = CONTEXT_EVIDENCE
-        elif (match := _NEWS_REF.match(token)) is not None:
-            target = index.get(prompts.news_ref(int(match.group(1))))
-        else:
-            target = index.get(token)
-        if target is not None and target not in resolved:
-            resolved.append(target)
+        target = _resolve_token(entry, index)
+        # One string citing several items ("news-1, news-3") is split into its parts; only explicit
+        # "news-<n>" references, "context" and supplied URLs count there ("2 outlets" is not news-2).
+        targets = (
+            [target]
+            if target is not None
+            else [
+                _resolve_token(part, index)
+                for part in _SPLIT.split(str(entry))
+                if part.strip("\"'[]() ").casefold().startswith(("news", "context", "http"))
+            ]
+        )
+        for found in targets:
+            if found is not None and found not in resolved:
+                resolved.append(found)
     return resolved[:limit]
+
+
+def _resolve_token(entry: object, index: Mapping[str, str]) -> str | None:
+    token = " ".join(str(entry).split()).strip("\"'[]() ").casefold()
+    if not token:
+        return None
+    if token in _CONTEXT_TOKENS:
+        return CONTEXT_EVIDENCE
+    if (match := _NEWS_REF.match(token)) is not None:
+        return index.get(prompts.news_ref(int(match.group(1))))
+    return index.get(token)
 
 
 def _parse_expiry(raw: str | None, now: datetime) -> datetime | None:

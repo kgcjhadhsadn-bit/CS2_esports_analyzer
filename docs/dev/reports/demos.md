@@ -1,6 +1,6 @@
 # demos: implementation report
 
-**Tests:** `.venv/bin/python -m pytest tests/ingest/demos -q` - 311 passed, 0 failed, 14 skipped (after review round 1) (the 14 are the opt-in real-demo checks, which pass when the demos are downloaded: 14 passed) (lint/type clean: True)
+**Tests:** `.venv/bin/python -m pytest tests/ingest/demos -q` - 313 passed, 0 failed, 14 skipped (after review round 1, second pass) (the 14 are the opt-in real-demo checks, which pass when the demos are downloaded: 14 passed) (lint/type clean: True)
 
 ## Summary
 
@@ -130,7 +130,7 @@ Definitions (the full list with reasons is in the module docstring of `parse.py`
 - **Real rounds only:** warmup, knife round, rounds before the final match restart and rounds replayed after a backup restore are dropped. Numbers come from `total_rounds_played`, so pistol rounds (1, 13) and overtime (25+, no pistol round) are right even when a demo starts late.
 - **Buy type:** per-player average equipment value at freeze end; below 1500 eco, below 3800 force, else full (the same thresholds as `models.round_model.classify_buy`).
 - **Trade:** the killer dies to a teammate of his victim within `settings.trade_window_s` (inclusive); kills on the same tick count in either event order.
-- **Bomb blast / world deaths** (`NON_KILL_WEAPONS`: `planted_c4`, `c4`, `world`, `trigger_hurt`) are deaths but nobody's kill (no kill, opening or trade credit), whoever the event names as attacker.
+- **Bomb blast / world deaths** (`NON_KILL_WEAPONS`: `planted_c4`, `c4`, `world`, `worldspawn`, `trigger_hurt`) are deaths but nobody's kill (no kill, opening or trade credit), whoever the event names as attacker. Their `kills` row names no attacker (`attacker_steamid`, `attacker_side`, attacker place / coordinates and `distance` are empty), because every consumer of the `kills` table counts a row with differing sides as a kill.
 - **Knife round:** only the first round of a (re)started match (`total_rounds_played == 0`) can be one; a late-starting demo whose first round is decided by a knife kill keeps it.
 - **Damage:** capped by the victim's remaining health; no team or self damage. Utility damage is HE plus fire.
 - **Assists** include flash assists. **KAST** = kill, non-flash assist, survived or traded (HLTV's definition).
@@ -161,7 +161,7 @@ ALL_MAPS = "*"
 
 - Both cover maps played in `[as_of - window_days, as_of)`; the `as_of` day itself is excluded, so rows with `window_end = D` are safe to use for matches on day `D`.
 - Rows of the same `window_end` are replaced; other `window_end` values are kept (walk-forward backtests) unless `prune_before` is given. Both flush and return the row count.
-- `positions_agg`: per player / map / side / place - `rounds_sampled` (the denominator), `presence_share`, enemy kills made from and deaths suffered in that place, opening kills and deaths.
+- `positions_agg`: per player / map / side / place - `rounds_sampled` (the denominator), `presence_share`, enemy kills made from and deaths suffered in that place, opening kills and deaths. Samples without a place name count in `rounds_sampled` but in no place, so the shares of a player / map / side can sum to less than 1.
 - `duels_agg`: one row per ordered pair per map plus `map_name == "*"`.
 
 ### Errors
@@ -246,7 +246,49 @@ RAR tools are called with an argument list (no shell).
 - `resolve_steamids` step 5 loads every `players` row outside the lineup when some demo player is
   unresolved (a full-table scan per map); fine for thousands of players, worth a JSON index or a
   `player_steamids` table later.
-- HLTV sync (`cs2bot.ingest.hltv.sync.matches._write_round_rows`, opt-in) writes `Round` rows without
-  `source=DataSource.HLTV`, so they get the column default `DEMO`. `persist_parsed_demo` replaces
-  them anyway, but `datasets` filtering on `source` would mistake them for demo rows.
+- (Resolved since: HLTV sync now writes its round rows with `source=DataSource.HLTV`; checked in the
+  second pass below.)
 - The real-demo validation module was not re-run in this review (the demos are not cached here).
+
+### Second pass (independent re-review, same round)
+
+The first pass above was found committed; this pass re-verified it rather than trusting it. All
+definition-of-done checks pass: `pytest tests/ingest/demos` 313 passed / 14 skipped (opt-in
+real-demo module), ruff check + format clean, mypy clean, `pytest tests/foundation` 37 passed; the
+consumer tests that read demo tables (`tests/learning -k "demo or roles"`) still pass.
+
+**Re-verified:** brief items 1-8 and the Addendum point by point; round cleaning and numbering
+(restart segments, backup-restore replacement, knife round only at `total_rounds_played == 0`);
+reason / winner code tables against CS's `RoundEndReason` (1, 7, 8, 9, 12, 17, 18); buy thresholds
+identical to `models.round_model.classify_buy`; trade window inclusive and same-tick symmetric;
+damage capping by remaining health; KAST without pure flash assists; persistence orientation chain
+and idempotent replace (any source, written as DEMO); `Player.extra` reassigned as a new dict;
+pipeline status flow, attempts, blocked handling, URL scheme guard, clean-up limited to the work
+directory; aggregates' half-open window (no look-ahead). Adversarial run: event frames with NaN
+ticks, non-numeric / zero steam ids and a bogus winner-less `round_end` parse to the same result;
+an empty `position_sample_seconds` yields no samples without error.
+
+**Issues found and fixed** (regression tests in `tests/ingest/demos/test_demos_review1.py`):
+
+7. *major* - The first pass stopped crediting bomb-blast deaths to the planter inside
+   `player_rounds`, but the stored `kills` row still carried the planter as attacker with side `t`
+   against a `ct` victim. Every consumer of the `kills` table (`datasets.demo` team kill / trade
+   counts, `features.roles`, `rebuild_position_aggregates`, `rebuild_duel_aggregates`) counts a row
+   with differing sides as a kill, so the planter would have been credited there. Kill rows of
+   `NON_KILL_WEAPONS` deaths now carry no attacker id, side, place, coordinates or distance
+   (`worldspawn` added to the set). Tests: parse output and persist + both aggregates.
+8. *minor (doc)* - `aggregates.py` claimed the presence shares of a player / map / side always add
+   up to 1; samples without a place name count in the denominator only. Docstring and report fixed.
+
+**Remaining concerns (not fixed):**
+
+- Clutch counting when a 1vN turns into a 1v1 (both last players flagged) - unchanged from the first
+  pass; HLTV's exact rule could not be checked.
+- A round without a `round_freeze_end` (surrender vote during freeze time) is timed from its
+  `round_start`; if that same round were also a backup-restore replay, the restore's pseudo deaths on
+  the start tick would count. Not observed in real demos; very unlikely combination.
+- Deterministic failures (orientation undecidable, no file matches a map) are retried up to three
+  times, each re-downloading the archive (1-2 GB). Bounded, but a `DemoPersistError` could mark the
+  row FAILED with `attempts = max_attempts` directly; left as is because a later HLTV sync may add
+  the lineup / score that makes the orientation decidable.
+- The real-demo validation module was not re-run (the 2.4 GB fixtures are not cached here).

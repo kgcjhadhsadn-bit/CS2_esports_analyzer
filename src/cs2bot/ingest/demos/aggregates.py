@@ -14,7 +14,8 @@ old ones.
 * ``rounds_sampled`` - rounds on that map and side in which the player was alive at the sample
   second (the denominator, identical for all places of that player / map / side);
 * ``presence_share`` - share of those rounds in which the player stood in this place at the sample
-  second (the shares of a player / map / side add up to 1);
+  second (the shares of a player / map / side add up to 1 when every sample has a place name; a
+  sample without one still counts in ``rounds_sampled`` but in no place, so the sum is then below 1);
 * ``kills`` / ``deaths`` / ``opening_kills`` / ``opening_deaths`` - enemy kills made from, and deaths
   suffered in, this place at any time of the round (team kills and suicides are ignored).
 

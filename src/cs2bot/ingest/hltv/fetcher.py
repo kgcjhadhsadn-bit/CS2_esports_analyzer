@@ -44,7 +44,10 @@ from cs2bot.ingest.hltv.selectors import (
     BLOCK_PAGE_PATTERNS,
     CHALLENGE_PATTERNS,
     CHALLENGE_TITLE_RE,
+    DELETED_MATCH_HTML_RE,
+    DEMO_LINK_HTML_RE,
     FINISHED_MATCH_HTML_RE,
+    MATCH_HEADER_UNIX_RE,
 )
 from cs2bot.ingest.hltv.urls import UrlKind, cache_key, classify_url, is_immutable_url
 from cs2bot.utils.http import RateLimiter, build_http_client
@@ -94,6 +97,9 @@ class FetchOptions:
     block_resources: bool = True  # browser: skip images / media / fonts (less traffic for HLTV and us)
     browser_profile_dir: Path | None = None  # browser: persistent profile (keeps cookies between runs)
     locale: str = "en-US"
+    # A "Match over" page only gets the long TTL once it is final: the GOTV demo link is shown, or the
+    # match started at least this long before the page was fetched (demo / stats links lag the result).
+    finished_match_settle_hours: float = 48.0
 
     @classmethod
     def from_settings(cls, settings: HLTVSettings, **overrides: Any) -> FetchOptions:
@@ -430,6 +436,17 @@ class HttpPageLoader:
 # ============================================================================================ fetcher
 
 
+def _match_start(html: str) -> datetime | None:
+    """Start time from a match page header (``data-unix`` in ms) without a full parse."""
+    m = MATCH_HEADER_UNIX_RE.search(html[:300_000])
+    if not m:
+        return None
+    try:
+        return parse_datetime(int(m.group(1) or m.group(2)))
+    except (OverflowError, OSError, ValueError, TypeError):
+        return None
+
+
 def _bare_host(netloc: str) -> str:
     host = netloc.lower().rsplit("@", 1)[-1]
     return host[4:] if host.startswith("www.") else host
@@ -562,17 +579,37 @@ class HLTVFetcher:
         self.close()
 
     # ------------------------------------------------------------------ cache policy
-    def ttl_minutes(self, url: str, cached_html: str | None = None) -> int:
-        """Default TTL for ``url``: long for content that no longer changes, short otherwise."""
+    def ttl_minutes(
+        self, url: str, cached_html: str | None = None, fetched_at: datetime | None = None
+    ) -> int:
+        """Default TTL for ``url``: long for content that no longer changes, short otherwise.
+
+        A finished match page ("Match over") is only final once HLTV has added the GOTV demo link
+        (often an hour or more after the result) or the match started at least
+        ``FetchOptions.finished_match_settle_hours`` before the page was fetched (``fetched_at``,
+        default now); until then it keeps the normal TTL so the demo / map stats links are picked up.
+        "Match deleted" pages are final at once.
+        """
         long_ttl = self.settings.finished_match_cache_ttl_minutes
         if is_immutable_url(url, today=self._now().date()):
             return long_ttl
         if classify_url(url) is UrlKind.MATCH and cached_html and FINISHED_MATCH_HTML_RE.search(cached_html):
-            return long_ttl
+            if DELETED_MATCH_HTML_RE.search(cached_html) or DEMO_LINK_HTML_RE.search(cached_html):
+                return long_ttl
+            started = _match_start(cached_html)
+            seen = fetched_at or self._now()
+            if started is not None and seen - started >= timedelta(
+                hours=self.options.finished_match_settle_hours
+            ):
+                return long_ttl
         return self.settings.cache_ttl_minutes
 
     def _is_fresh(self, url: str, cached: CachedPage, max_age_minutes: int | None) -> bool:
-        ttl = max_age_minutes if max_age_minutes is not None else self.ttl_minutes(url, cached.html)
+        ttl = (
+            max_age_minutes
+            if max_age_minutes is not None
+            else self.ttl_minutes(url, cached.html, cached.fetched_at)
+        )
         if ttl <= 0:
             return False
         age = self._now() - cached.fetched_at
@@ -648,25 +685,29 @@ class HLTVFetcher:
             self._blocked_until = parse_datetime(data.get("blocked_until"))
             self._consecutive_blocks = int(data.get("consecutive_blocks", 0))
             self._block_reason = data.get("reason")
-        except (OSError, ValueError, TypeError):
+        except (OSError, ValueError, TypeError, AttributeError):  # corrupt file: start clean
             self._blocked_until, self._consecutive_blocks = None, 0
 
     def _save_cooldown(self) -> None:
+        """Persist the cool-down; a disk problem only loses the persistence, never the fetch result."""
         path = self._cooldown_path()
-        if self._blocked_until is None and self._consecutive_blocks == 0:
-            path.unlink(missing_ok=True)
-            return
-        path.parent.mkdir(parents=True, exist_ok=True)
-        _atomic_write(
-            path,
-            json.dumps(
-                {
-                    "blocked_until": self._blocked_until.isoformat() if self._blocked_until else None,
-                    "consecutive_blocks": self._consecutive_blocks,
-                    "reason": self._block_reason,
-                }
-            ),
-        )
+        try:
+            if self._blocked_until is None and self._consecutive_blocks == 0:
+                path.unlink(missing_ok=True)
+                return
+            path.parent.mkdir(parents=True, exist_ok=True)
+            _atomic_write(
+                path,
+                json.dumps(
+                    {
+                        "blocked_until": self._blocked_until.isoformat() if self._blocked_until else None,
+                        "consecutive_blocks": self._consecutive_blocks,
+                        "reason": self._block_reason,
+                    }
+                ),
+            )
+        except OSError as exc:
+            logger.warning("could not persist the HLTV cool-down in %s: %s", path, exc)
 
     def _check_cooldown(self, url: str) -> None:
         if self._blocked_until is None:
@@ -683,9 +724,8 @@ class HLTVFetcher:
 
     def _register_block(self, url: str, reason: str, status: int | None) -> None:
         self._consecutive_blocks += 1
-        cooldown = min(
-            self.options.cooldown_base_s * 2 ** (self._consecutive_blocks - 1), self.options.cooldown_max_s
-        )
+        exponent = min(max(0, self._consecutive_blocks - 1), 40)  # a corrupt counter must not overflow
+        cooldown = min(self.options.cooldown_base_s * 2.0**exponent, self.options.cooldown_max_s)
         self._blocked_until = self._now() + timedelta(seconds=cooldown)
         self._block_reason = reason
         self.stats.blocked += 1

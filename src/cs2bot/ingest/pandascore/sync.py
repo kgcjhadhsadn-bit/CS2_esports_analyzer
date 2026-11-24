@@ -56,7 +56,7 @@ from sqlalchemy.orm import Session
 
 from cs2bot.config import Settings
 from cs2bot.db.models import MapPlayed, Match, MatchLineup, Player, PlayerMapStats, Team, Tournament
-from cs2bot.db.repo import find_match, is_swapped
+from cs2bot.db.repo import find_match, find_team_by_alias, is_swapped
 from cs2bot.domain.enums import MatchStatus, RoundEndReason, Side, TeamSlot, Tier
 from cs2bot.domain.records import RoundRecord
 from cs2bot.domain.sync import SyncReport
@@ -337,6 +337,10 @@ def sync_match(
         run.report.failed += 1
         run.api_failure(what, exc)
         return _finish(session, run)
+    except ValueError as exc:  # not an id / slug that can go into a URL path
+        run.report.failed += 1
+        run.report.add_error(f"match: {exc}")
+        return _finish(session, run)
     _process_match(session, run, ps_match, force_details=True)
     return _finish(session, run)
 
@@ -401,7 +405,7 @@ def _start(
         settings=settings,
         options=options or PandaScoreSyncOptions(),
         report=SyncReport(job=job),
-        now=now or utcnow(),
+        now=ensure_utc(now) if now is not None else utcnow(),  # a naive ``now`` is taken as UTC
         pages_before=client.stats.pages,
         requests_before=client.stats.requests,
     )
@@ -490,7 +494,7 @@ def _process_match(session: Session, run: _Run, ps: PSMatch, *, force_details: b
     except Exception as exc:  # one broken match must never abort the sync
         logger.exception("persisting PandaScore match %s failed", ps.id)
         run.report.failed += 1
-        run.report.add_error(f"{what}: {type(exc).__name__}: {exc}")
+        run.report.add_error(f"{what}: {type(exc).__name__}: {str(exc)[:300]}")
         # the savepoint rollback may have removed rows the per-run caches point at
         run.teams = TeamIndex()
         run.tournaments.clear()
@@ -510,7 +514,7 @@ def _process_match(session: Session, run: _Run, ps: PSMatch, *, force_details: b
     except Exception as exc:
         logger.exception("persisting details of PandaScore match %s failed", ps.id)
         run.report.failed += 1
-        run.report.add_error(f"{what}: details: {type(exc).__name__}: {exc}")
+        run.report.add_error(f"{what}: details: {type(exc).__name__}: {str(exc)[:300]}")
     match.last_synced_at = run.now
     if core.created:
         run.report.created += 1
@@ -587,12 +591,27 @@ def _payload_in_scope(session: Session, run: _Run, ps: PSMatch) -> bool:
     tier = map_tier(ps.tournament.tier if ps.tournament else None)
     if tier.value in {t.lower() for t in scope.pandascore_tiers}:
         return True
-    ids = [team.id for team in ps.team_opponents() if team.id is not None]
-    teams = session.scalars(select(Team).where(Team.pandascore_id.in_(ids)))
+    teams: list[Team] = []
+    for opponent in ps.team_opponents():
+        team = session.scalar(select(Team).where(Team.pandascore_id == opponent.id))
+        if team is None and opponent.name:
+            # a team only HLTV knows so far (it carries the HLTV rank); linked on the first store
+            candidate = find_team_by_alias(session, opponent.name.strip())
+            team = candidate if candidate is not None and candidate.pandascore_id is None else None
+        if team is not None:
+            teams.append(team)
     # the rank as of the match (same rule as refresh_match_scope): today's rank must not decide
     # whether a 2024 match of a team that only became good in 2026 is stored
     ranks = [team_rank_as_of(session, team, ps.kickoff, now=run.now) for team in teams]
-    return any(rank is not None and 0 < rank <= scope.hltv_top_n for rank in ranks)
+    if any(rank is not None and 0 < rank <= scope.hltv_top_n for rank in ranks):
+        return True
+    # a row another source (HLTV) already holds in scope is linked and kept up to date
+    if len(teams) == 2 and ps.kickoff is not None:
+        candidate_match = _link_candidate(
+            session, teams[0].id, teams[1].id, ps.kickoff, run.options.match_link_window_hours
+        )
+        return candidate_match is not None and bool(candidate_match.in_scope)
+    return False
 
 
 def _find_or_create_match(
@@ -688,6 +707,10 @@ def _merge_status(
       CANCELED: stays CANCELED unless PandaScore reports it FINISHED. The HLTV sync never moves a
       CANCELED match back to scheduled / live either, so without this rule the two sources would flip
       the row between CANCELED and SCHEDULED on every run.
+    * HLTV says it is live (``hltv_status == "live"``) and PandaScore still says not started (its
+      status lags the real start by minutes): stays LIVE. SCHEDULED is a bettable status for the
+      decision engine, so flipping a running match back to it would invite a pre-match bet on a live
+      match. HLTV's own next sync moves the row on (finished, or back to scheduled if it was wrong).
     """
     if created or current is None:
         return new
@@ -701,6 +724,8 @@ def _merge_status(
         and current is MatchStatus.CANCELED
         and new is not MatchStatus.FINISHED
     ):
+        return current
+    if hltv_linked and hltv_status == "live" and current is MatchStatus.LIVE and new is MatchStatus.SCHEDULED:
         return current
     return new
 
@@ -772,6 +797,12 @@ def _apply_match_fields(run: _Run, core: _Core, ps: PSMatch, tournament: Tournam
                 tracker.set(match, "team2_score", score2)
             if winner_id is not None or ps.draw:
                 tracker.set(match, "winner_team_id", winner_id)
+    elif match.status is MatchStatus.CANCELED and not _hltv_has_final_result(match):
+        # PandaScore withdrew a result it had published (finished -> canceled): a cancelled match
+        # carries no series result (a walkover winner lives in extra['pandascore'] only), otherwise
+        # settlement could pay out on the stale winner.
+        for attr in ("team1_score", "team2_score", "winner_team_id"):
+            tracker.set(match, attr, None)
     extra.update(
         {
             "name": ps.name,
@@ -952,10 +983,29 @@ def _persist_details(
     session.flush()
 
 
+def _expected_finished_games(ps: PSMatch) -> int:
+    """How many played maps the match payload announces (at least 1 for a finished match).
+
+    From the per-game statuses of the match payload, else from the series score (maps won by either
+    side = maps played; a CS2 map cannot be drawn).
+    """
+    from_games = sum(1 for g in ps.games if map_game_status(g.status) is MatchStatus.FINISHED)
+    from_score = sum(max(0, r.score or 0) for r in ps.results)
+    return max(1, from_games or from_score)
+
+
 def _games_final(run: _Run, ps: PSMatch, games: list[PSGame]) -> bool:
-    """True when the game data will not change any more, so it need not be fetched again."""
+    """True when the game data will not change any more, so it need not be fetched again.
+
+    Final = every map the match payload says was played is there with final stats, or the match is
+    older than ``games_final_after_hours``. An empty or partial games list right after the match
+    (PandaScore still filling it in) is NOT final: it would otherwise never be fetched again while the
+    match's ``modified_at`` stays the same.
+    """
     finished = [g for g in games if map_game_status(g.status) is MatchStatus.FINISHED]
-    if all(g.complete or g.detailed_stats is False for g in finished):
+    if len(finished) >= _expected_finished_games(ps) and all(
+        g.complete or g.detailed_stats is False for g in finished
+    ):
         return True
     ended = ps.end_at or ps.kickoff
     return ended is not None and run.now - ended > timedelta(hours=run.options.games_final_after_hours)
@@ -1030,7 +1080,12 @@ def _sync_maps(
     by_game: dict[int, MapPlayed] = {}
     for game in games:
         status = map_game_status(game.status)
-        if game.position is None or game.forfeit or status not in (MatchStatus.FINISHED, MatchStatus.LIVE):
+        if (
+            game.position is None
+            or not 1 <= game.position <= 9
+            or game.forfeit
+            or status not in (MatchStatus.FINISHED, MatchStatus.LIVE)
+        ):
             continue  # unplayed, walkover or not started: no map row (same rule as the HLTV sync)
         name = game_map_name(game)
         row = existing.get(game.position)

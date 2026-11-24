@@ -1,6 +1,6 @@
 # llm: implementation report
 
-**Tests:** `.venv/bin/python -m pytest tests/llm -q` - 216 passed, 0 failed (after review round 1) (about 7 s with `-n 2`; lint/type clean: True)
+**Tests:** `.venv/bin/python -m pytest tests/llm -q` - 233 passed, 0 failed (after review round 1, second pass) (about 7 s with `-n 2`; lint/type clean: True)
 
 ## Summary
 
@@ -109,7 +109,8 @@ select_news_for_match(session, ctx: MatchContext, *, days: int = 14, limit: int 
 news_row_to_input(row: NewsItem) -> NewsItemIn
 ```
 
-- `persist_flags` deactivates the match's active rows and inserts the new ones; identical flags are a no-op. An empty list deactivates everything, so pass it only after a successful analysis.
+- `persist_flags` deactivates the match's active rows and inserts the new ones; identical flags are a no-op. An empty list deactivates everything, so pass it only after a successful analysis. Rows whose `model` is `MANUAL_FLAG_MODEL` (`"manual"`, flags the owner sets by hand) are never deactivated, and `persist_flags` refuses that model name (`ValueError`). `load_active_flags` returns them like any other row.
+- `store_triage` also records `extra["llm"]["triage"]["added_team_ids"]` (ids only the verdict merged into `team_ids`), so `select_news_for_match` can ignore them at an instant before `triaged_at`.
 - `select_news_for_match` never returns items published after `now`, and ignores triage verdicts written after `now` (such an item counts as untriaged). Untriaged items are included, so a triage outage cannot hide a fresh roster story.
 
 ### Pipeline helpers (what the jobs should call)
@@ -122,7 +123,7 @@ refresh_match_context(session, analyzer, ctx: MatchContext, *, now=None, form_su
                       days: int = 14, force: bool = False) -> ContextRefresh
 ```
 
-`ContextRefresh`: `flags` (active, unexpired, to use now), `status`, `source` (`"llm"`, `"memo"`, `"db"`, or `"stale"` = analysis unavailable, stored flags kept), `note`, `n_news`, `fingerprint`. The fingerprint of the last successful analysis is stored in `matches.extra["llm"]["context"]`, so unchanged inputs cost no request after a restart either.
+`ContextRefresh`: `flags` (active, unexpired, to use now; read back from the database when the match exists, so manual flags are included on every path), `status`, `source` (`"llm"`, `"memo"`, `"db"`, or `"stale"` = analysis unavailable, stored flags kept), `note`, `n_news`, `fingerprint`. The fingerprint of the last successful analysis is stored in `matches.extra["llm"]["context"]`, so unchanged inputs cost no request after a restart either.
 
 ### Other
 
@@ -132,7 +133,9 @@ refresh_match_context(session, analyzer, ctx: MatchContext, *, now=None, form_su
 - `suggestion_to_flag(...)`, `ADVERSE_FLAG_TYPES`, `VETO_MIN_CONFIDENCE`.
 - Schemas: `TriageLabel`, `TriageItem`, `TriageBatch`, `ContextFlagSuggestion`, `MatchContextResult`, `RationaleOutput`.
 - `cs2bot.llm.rationale.sanitize_markdown(text) -> str` for any other LLM-derived text shown in the dashboard.
-- `cs2bot.llm.rationale.has_risk_statement(text) -> bool`: whether a text says the bets can lose (English or Polish); `finalize_rationale` appends `RISK_DISCLAIMER` when it does not.
+- `cs2bot.llm.rationale.has_risk_statement(text) -> bool`: whether a text says the bets can lose (English or Polish); negated statements ("this bet cannot lose") do not count. `has_certainty_language(text) -> bool`: "guaranteed", "risk-free", "can't lose", ... `finalize_rationale` appends `RISK_DISCLAIMER` when there is no risk statement or there is certainty language.
+- `MANUAL_FLAG_MODEL` (from `cs2bot.llm` / `cs2bot.llm.store`): the reserved `context_flags.model` value for hand-set flags.
+- `cs2bot.llm.context.resolve_evidence(raw, index, *, limit=8)`: one string citing several items (`"news-1, news-3"`) is split; in the split parts only explicit `news-<n>`, `context` and supplied URLs count.
 
 ### Wiring example
 
@@ -214,3 +217,27 @@ Reviewer: independent, round 1. I re-read the brief (no addendum work beyond "no
 - `dedupe_flags` keeps one flag per (type, team), so two genuinely separate `other` situations about the same team merge into the stronger one. This is conservative.
 - `UsageTotals` counters are updated without a lock. They are for display only.
 - Still untested against the live API (no key on this machine).
+
+## Review round 1 (second independent pass)
+
+The first round-1 pass above was saved mid-way ("in-flight" commit), so I reviewed the whole package again from scratch: brief point by point, every module, the installed SDK (anthropic 2.12.0: `beta.messages.parse` takes `fallbacks`/`betas`, `messages.parse` does not; `Anthropic(api_key=None)` with no environment key builds a client whose `api_key`/`auth_token`/`credentials` are all None, which is what disabled mode detects), and adversarial probes of the sanitiser, the risk-statement check, evidence resolution and news selection. Everything the first pass lists as verified I confirmed. The addendum adds no work.
+
+**Issues found and fixed**
+
+1. *(major, fixed)* `has_risk_statement` accepted negated sentences: "This bet cannot lose.", "Losses are not possible.", "You will never lose this bet." all counted as the required risk statement, so a rationale promising certainty got **no** disclaimer - the opposite of the brief. A match now counts only when there is no negation inside it or in the words just before it in the same sentence (English and Polish). In addition, certainty language ("guaranteed", "risk-free", "safe bet", "can't lose", "gwarantowany", "bez ryzyka") always gets the disclaimer appended (`has_certainty_language`, new). Tests: `test_negated_risk_statements_do_not_suppress_the_disclaimer`, `test_certainty_language_always_gets_the_disclaimer`.
+2. *(minor, fixed; defence in depth)* `sanitize_markdown` let through links whose text contains brackets (`[a [b] c](javascript:alert(1))` is a link in CommonMark), images with brackets in the alt text (remote image), reference-style images (`![alt][ref]` + `[ref]: https://tracker/x.png`) and a link nested in a safe link (`[[x](javascript:1)](https://ok)`). It also left a stray `)` behind for `javascript:alert(1)` targets. Images and links are now matched with balanced brackets / parentheses, link texts are sanitised recursively, and `![` that is not an inline image is reduced to `[`. Test: `test_sanitize_markdown_handles_nested_brackets_and_reference_images`.
+3. *(minor, fixed; safety)* `persist_flags` deactivated *every* active row of the match, so a flag the owner sets by hand (`engine.decision` mentions "Claude flag or manual") - for example a manual no-bet veto - would be switched off silently by the next analysis. Rows with `model == "manual"` (`MANUAL_FLAG_MODEL`) are now left alone, and `refresh_match_context` reads the flags back from the database on the "llm"/"memo" path too, so its result always includes them. No package writes manual flags yet; whoever adds that (dashboard / integration) must use this model value. Test: `test_manual_flags_survive_an_analysis_and_are_returned`.
+4. *(minor, fixed; look-ahead)* The first pass made `select_news_for_match` ignore a triage verdict written after `now`, but `store_triage` also *merges* the verdict's team ids into `news_items.team_ids`, so a replay before `triaged_at` still attached the item to the team. `store_triage` now records which ids only the verdict added (`added_team_ids`, kept across repeated calls) and the "future verdict" path subtracts them. Test: `test_replay_before_the_verdict_ignores_the_team_ids_it_merged`.
+5. *(minor, fixed)* With a small `limit`, the reserved slots for match-wide `meta_patch` news crowded out news about the two teams (`limit=2` returned two patch notes and no team news). Match-wide items now take at most `max(limit - n_team_items, limit // 4)` slots (unchanged for the default 25/3). Test added to `test_select_news_adds_a_few_global_meta_items`.
+6. *(minor, fixed)* A flag citing several items in one string (`"news-1, news-3"`) was dropped for lack of evidence. Such strings are split; in the parts only explicit `news-<n>`, `context` and supplied URLs count, so "Reported by 2 outlets" or "#1 ranked team" never become `news-2` / `news-1`. Test: `test_evidence_strings_citing_several_items_are_split`.
+
+**Remaining concerns (not changed)**
+
+- The first pass's concerns still apply (Opus runs for matches without news; the fingerprint does not include the bounds, the model names or the prompt version; `dedupe_flags` merges two separate `other` situations about one team; unlocked usage counters; no live-API run).
+- `refresh_match_context` writes `matches.extra` as a whole JSON value. Another package updating `matches.extra` in a concurrent session can lose one of the two writes (last write wins). Each package only touches its own section, so the window is small.
+- Two concurrent `refresh_match_context` calls for the same match (two threads) can both send an Opus request; the memo is filled only after the response.
+- The manual-flag convention (`model == "manual"`) is defined here, not in the foundation; see the change request below.
+
+**Foundation change request (optional)**
+
+- `src/cs2bot/db/models.py` / `docs/ARCHITECTURE.md`: document `context_flags.model = "manual"` (or add a `source` column with values `llm` / `manual`) as the marker for hand-set flags, so the dashboard and `engine.decision` use the same convention as `cs2bot.llm.store.persist_flags`.

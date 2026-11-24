@@ -24,7 +24,7 @@ from cs2bot.executor.base import (
     LoginRequiredError,
 )
 from cs2bot.executor.betclic import BetclicExecutor, LoginState
-from cs2bot.executor.factory import create_betclic_executor
+from cs2bot.executor.factory import create_betclic_executor, journal_clicked_check
 from cs2bot.executor.fake import FakeExecutor
 from cs2bot.executor.journal import JournalError, PlacementJournal
 from cs2bot.executor.lock import ProfileLock, ProfileLockedError
@@ -79,6 +79,7 @@ __all__ = [
     "create_betclic_executor",
     "db_halt_check",
     "format_polish_decimal",
+    "journal_clicked_check",
     "load_selectors",
     "never_halted",
     "normalise_text",

@@ -7,7 +7,7 @@ import logging
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import UTC, date, datetime, time
+from datetime import UTC, date, datetime, time, timedelta
 from typing import Any, Protocol
 
 from sqlalchemy import select
@@ -19,7 +19,7 @@ from cs2bot.db.repo import resolve_player
 from cs2bot.domain.enums import DataSource, Tier
 from cs2bot.ingest.hltv.errors import HLTVBlockedError, HLTVFetchError, HLTVNotFoundError
 from cs2bot.ingest.hltv.models import SyncReport
-from cs2bot.utils.time import parse_datetime
+from cs2bot.utils.time import parse_datetime, utcnow
 
 logger = logging.getLogger(__name__)
 
@@ -48,6 +48,13 @@ class HLTVSyncOptions:
     max_news_articles: int = 100  # article pages fetched per sync_news call
     min_ranking_rows_for_cleanup: int = 30  # clear stale Team.hltv_rank only after a full ranking
     commit_every: int | None = None  # sync_results: commit after every N matches (long backfills)
+    # A finished match only counts as complete (skipped by later result syncs) once HLTV shows its demo
+    # link and every played map's stats link - or once it started this long ago (some never get one).
+    finalize_after_hours: float = 48.0
+    # Ranks shown on a match page / an explicitly dated ranking only move ``Team.hltv_rank`` (the
+    # *current* rank) when that ranking is at most this old: a backfill must not give a team that is
+    # unranked today its rank from years ago (the dated ``team_rankings`` row is always stored).
+    current_rank_max_age_days: int = 21
 
 
 @contextmanager
@@ -90,6 +97,21 @@ def fetch_page(
         return None
     report.fetched_pages += 1
     return html
+
+
+def drop_cached(source: PageSource, path: str) -> None:
+    """Forget a cached page that turned out to be unparsable (e.g. a truncated or error page).
+
+    Map stats pages and articles are cached for a month, so a broken copy would otherwise block the
+    data until it expires. Sources without a cache (fakes) are left alone.
+    """
+    invalidate = getattr(source, "invalidate", None)
+    if not callable(invalidate):
+        return
+    try:
+        invalidate(path)
+    except Exception as exc:  # a cache problem must never break the sync
+        logger.debug("could not drop the cached copy of %s: %s", path, exc)
 
 
 def source_base_url(source: PageSource, default: str) -> str:
@@ -219,11 +241,21 @@ def utc_midnight(day: date) -> datetime:
 
 
 def record_team_rank(
-    session: Session, team: Team, rank: int, ranked_on: date, points: int | None = None
+    session: Session,
+    team: Team,
+    rank: int,
+    ranked_on: date,
+    points: int | None = None,
+    *,
+    current_max_age_days: int | None = None,
+    now: datetime | None = None,
 ) -> bool:
     """Upsert a ``team_rankings`` row and move ``Team.hltv_rank`` forward if this ranking is newer.
 
-    Returns True if the team's current rank was updated.
+    With ``current_max_age_days`` the current rank is only touched when ``ranked_on`` is at most that
+    many days before ``now``: an old match page (backfill) must not set the *current* rank of a team
+    that has no newer ranking (e.g. one that is unranked today). Returns True if the current rank was
+    updated.
     """
     row = session.scalar(
         select(TeamRanking).where(
@@ -239,6 +271,10 @@ def record_team_rank(
         if points is not None:
             row.points = points
     ranked_at = utc_midnight(ranked_on)
+    if current_max_age_days is not None:
+        today = (now or utcnow()).date()
+        if ranked_on < today - timedelta(days=current_max_age_days):
+            return False
     if team.hltv_rank_updated_at is None or team.hltv_rank_updated_at <= ranked_at:
         team.hltv_rank = rank
         team.hltv_rank_updated_at = ranked_at

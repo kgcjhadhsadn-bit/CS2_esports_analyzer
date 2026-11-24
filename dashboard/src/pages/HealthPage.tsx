@@ -8,7 +8,7 @@ import type { Health, JobHealth, JobStatus } from "../api/types";
 import { AlertList } from "../components/AlertList";
 import { AgeBadge, JobStatusBadge } from "../components/badges";
 import { BetclicLoginButton } from "../components/TradingControls";
-import { Badge, Card, Chips, Empty, Pager, QueryView } from "../components/ui";
+import { Badge, Card, Chips, Empty, Pager, QueryView, toggleRowProps } from "../components/ui";
 import type { BadgeTone } from "../components/ui";
 import { formatAge, formatDateTime, formatMoney, formatNumber, formatRelative, humanize } from "../lib/format";
 
@@ -171,7 +171,7 @@ function JobsTable({ jobs }: { jobs: JobHealth[] }) {
                     {j.stale && <Badge tone="neg">stale</Badge>}
                   </span>
                 </td>
-                <td className="nowrap small">{formatRelative(j.last_started_at)}</td>
+                <td className="nowrap small"><span title={formatDateTime(j.last_started_at)}>{formatAge(j.age_s)} ago</span></td>
                 <td className="num">{j.duration_s !== null ? `${formatNumber(j.duration_s, 1)} s` : "—"}</td>
                 <td className="num">{j.items}</td>
                 <td className="num">
@@ -207,7 +207,7 @@ function SchedulerCard({ health }: { health: Health }) {
     >
       {!s ? (
         <p className="small muted" style={{ margin: 0 }}>
-          The API runs without the built-in scheduler (e.g. <code>cs2bot api</code> alone). Start everything with{" "}
+          This API process runs without the built-in scheduler. Start everything with{" "}
           <code>cs2bot up</code>.
         </p>
       ) : !s.jobs.length ? (
@@ -323,7 +323,7 @@ function JobRunsCard() {
                         <Fragment key={r.id}>
                           <tr
                             className={hasDetails ? `clickable ${open ? "expanded" : ""}` : undefined}
-                            onClick={hasDetails ? () => setExpanded(open ? null : r.id) : undefined}
+                            {...toggleRowProps(hasDetails ? () => setExpanded(open ? null : r.id) : undefined, open)}
                           >
                             <td className="nowrap">{formatDateTime(r.started_at)}</td>
                             <td className="mono">{r.job_name}</td>

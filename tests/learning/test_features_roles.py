@@ -425,3 +425,21 @@ def test_roles_on_synthetic_kills_without_weapons(learning_db: Session, learning
     assert len(roles) >= 40
     assert {r for r, _ in roles.values()} <= {PlayerRole.ENTRY, PlayerRole.SUPPORT, PlayerRole.RIFLER}
     assert all(0.0 < c <= 1.0 for _, c in roles.values())
+
+
+def test_update_player_roles_is_idempotent_with_the_clock_running(session: Session):
+    """Review round 1: with ``as_of=None`` the stored confidence had aged by a few milliseconds on the
+    second run, so every player was rewritten and counted as changed."""
+    _persist(session)
+    roles = infer_roles(build_frames())
+    assert update_player_roles(session, roles=roles) == len(roles)
+    assert update_player_roles(session, roles=roles) == 0  # as_of=None: "now" moved on
+    stamps = {p: session.get(Player, p).extra[ROLE_INFERRED_AT_KEY] for p in roles}
+    assert update_player_roles(session, roles=roles) == 0
+    assert {p: session.get(Player, p).extra[ROLE_INFERRED_AT_KEY] for p in roles} == stamps
+
+    # a day later the same evidence re-confirms the labels: not a change, but the age is reset
+    later = datetime.fromisoformat(stamps[1]) + timedelta(days=2)
+    assert update_player_roles(session, roles=roles, as_of=later) == 0
+    assert session.get(Player, 1).extra[ROLE_INFERRED_AT_KEY] == later.isoformat()
+    assert (session.get(Player, 1).primary_role, session.get(Player, 1).role_confidence) == roles[1]

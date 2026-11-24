@@ -478,12 +478,15 @@ class MapRatingModel:
     def _process(self, rec: MapResultRecord, t: datetime) -> None:
         cfg = self._config
         map_name = normalize_map_name(rec.map_name)
+        # A record without a usable map name (malformed source data) still informs the overall
+        # ratings, but must not create a shared pseudo-map "" offset that lumps unrelated maps together.
+        map_key: str | None = map_name or None
         team1 = self._rolled(self._teams.get(rec.team1_id) or self._new_team(), t)
         team2 = self._rolled(self._teams.get(rec.team2_id) or self._new_team(), t)
         team1, ch1 = self._apply_roster(team1, rec.team1_lineup)
         team2, ch2 = self._apply_roster(team2, rec.team2_lineup)
-        view1 = self._view(team1, map_name, t, rec.is_lan, roster_changes=ch1)
-        view2 = self._view(team2, map_name, t, rec.is_lan, roster_changes=ch2)
+        view1 = self._view(team1, map_key, t, rec.is_lan, roster_changes=ch1)
+        view2 = self._view(team2, map_key, t, rec.is_lan, roster_changes=ch2)
         s1 = mov_score(rec.team1_rounds, rec.team2_rounds, cfg.mov_weight)
         weight = cfg.tier_weight(rec.tier)
         kappa = cfg.lan_kappa(rec.is_lan)
@@ -824,7 +827,10 @@ class MapRatingModel:
         for seq in sequences:
             if seq.probability <= 0.0:
                 continue
-            for raw, picker in zip(seq.maps, seq.pickers, strict=False):
+            # A pickers list shorter than the maps (hand-built input) means unknown pickers (None),
+            # never a dropped map.
+            pickers = list(seq.pickers[: len(seq.maps)]) + [None] * max(0, len(seq.maps) - len(seq.pickers))
+            for raw, picker in zip(seq.maps, pickers, strict=True):
                 per_map = weights.setdefault(normalize_map_name(raw), {})
                 per_map[picker] = per_map.get(picker, 0.0) + seq.probability
         out: dict[str, MapWinEstimate] = {}
@@ -1304,7 +1310,14 @@ def evaluate_walk_forward(model: MapRatingModel, records: Iterable[MapResultReco
     ``played_at`` (matches may overlap in time). Matches the model has already (partly) processed
     are only used for updating. ``model`` is mutated.
     """
-    recs = sorted(records, key=_record_sort_key)
+    # Duplicate (match_id, map_number) rows (the same map from two sources) are scored once, like
+    # ``update`` processes them once: the first in chronological order wins.
+    recs: list[MapResultRecord] = []
+    seen: set[tuple[int, int]] = set()
+    for r in sorted(records, key=_record_sort_key):
+        if (r.match_id, r.map_number) not in seen:
+            seen.add((r.match_id, r.map_number))
+            recs.append(r)
     by_match: dict[int, list[MapResultRecord]] = defaultdict(list)
     for r in recs:
         by_match[r.match_id].append(r)

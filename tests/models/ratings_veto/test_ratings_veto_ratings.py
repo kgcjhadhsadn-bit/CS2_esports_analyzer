@@ -947,3 +947,46 @@ def test_negative_round_counts_are_ignored() -> None:
     assert model.update(map_result(3, 1, 2, score=(13, 5), day=2)) is True
     wf = evaluate_walk_forward(MapRatingModel(), [map_result(4, 1, 2, score=(-2, 13), day=3)])
     assert wf.n == 0
+
+
+def test_blank_map_names_update_overall_only() -> None:
+    """Review round 1 (cont.): a record without a usable map name must not create a "" map offset."""
+    model = MapRatingModel()
+    assert model.update(map_result(1, 1, 2, score=(13, 4), map_name="  ")) is True
+    assert model.update(map_result(2, 1, 2, score=(13, 6), map_name="", day=1)) is True
+    for tid in (1, 2):
+        state = model._teams[tid]
+        assert "" not in state.maps and not state.maps
+    assert model.rating(1).n_games == 2
+    assert model.rating(1).mu > 0.0 > model.rating(2).mu
+    # the same result on a real map does create the offset
+    model.update(map_result(3, 1, 2, score=(13, 6), map_name="Mirage", day=2))
+    assert set(model._teams[1].maps) == {"mirage"}
+    # a payload with only overall components survives save/load
+    clone = MapRatingModel.from_dict(json.loads(json.dumps(model.to_dict())))
+    as_of = T0 + timedelta(days=5)
+    assert clone.predict(1, 2, "", as_of) == model.predict(1, 2, "", as_of)
+
+
+def test_predict_for_sequences_pads_missing_pickers() -> None:
+    """A hand-built sequence whose pickers list is shorter than its maps keeps every map."""
+    recs = _season(4)
+    as_of = _after(recs)
+    model = MapRatingModel().fit(recs)
+    seqs = [
+        MapSequenceProbability(maps=["mirage", "nuke", "inferno"], pickers=[TeamSlot.TEAM1], probability=1.0)
+    ]
+    out = model.predict_for_sequences(1, 2, seqs, as_of)
+    assert set(out) == {"mirage", "nuke", "inferno"}
+    assert out["mirage"].picked_by is TeamSlot.TEAM1
+    assert out["inferno"].picked_by is None
+
+
+def test_walk_forward_scores_duplicate_rows_once() -> None:
+    """The same map delivered twice is processed once by ``update`` and must be scored once too."""
+    recs = [map_result(1, 1, 2, score=(13, 5)), map_result(2, 1, 2, score=(7, 13), day=1)]
+    dup = [*recs, recs[0], recs[1]]
+    once = evaluate_walk_forward(MapRatingModel(), recs)
+    twice = evaluate_walk_forward(MapRatingModel(), dup)
+    assert twice.n == once.n == 2
+    assert twice.log_loss == pytest.approx(once.log_loss)

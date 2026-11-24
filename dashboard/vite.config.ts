@@ -3,7 +3,7 @@ import react from "@vitejs/plugin-react";
 import { loadEnv } from "vite";
 import { defineConfig } from "vitest/config";
 
-// The FastAPI app (cs2bot api / cs2bot up) listens on 127.0.0.1:8000 and serves dashboard/dist.
+// The FastAPI app (started by `cs2bot up`) listens on 127.0.0.1:8000 and serves dashboard/dist.
 // During development `npm run dev` serves the app on http://localhost:5173 and proxies /api to it
 // (http://localhost:5173 is the API's default CORS origin and its port is on the Host allow-list).
 // Override the target with CS2BOT_API_URL (environment variable or dashboard/.env.local).

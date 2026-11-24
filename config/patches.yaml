@@ -96,13 +96,14 @@ patches:
     date: 2025-07-16
     kind: map_pool
     impact: major
-    date_verified: false
+    date_verified: true
     title: "Premier Season 3: Overpass replaces Anubis in Active Duty"
     map_pool: [ancient, dust2, inferno, mirage, nuke, overpass, train]
     notes: >
-      Month confirmed by several sources, exact day from secondary sources only (UNVERIFIED). Also
-      reported for this update: MP9 nerf, incendiary fire spreads faster, CTs earn an extra 50 USD
-      per kill in Competitive.
+      Premier Season 3 launch. Day re-checked in review round 1 (2026-11-24): hotspawn.com,
+      dust2.us, blast.tv and esports.net agree on 2025-07-16 UTC (US outlets date the patch notes
+      07-15, Valve's afternoon release). Also reported for this update: MP9 nerf, incendiary fire
+      spreads faster, CTs earn an extra 50 USD per kill in Competitive.
 
   - id: 2025-07-29-animgraph2-first-person
     date: 2025-07-29
@@ -175,8 +176,9 @@ patches:
     title: "Premier Season 5: Cache replaces Overpass in Active Duty"
     map_pool: [ancient, anubis, cache, dust2, inferno, mirage, nuke]
     notes: >
-      Cache (added to other modes on 2026-04-29) enters Active Duty, Overpass leaves. The month is
-      confirmed by several sources but the day is UNVERIFIED: sources quote 07-06, 07-08 or 07-09.
+      Cache (added to other modes on 2026-04-29) enters Active Duty, Overpass leaves; announced by
+      Valve on 2026-06-22. The day is UNVERIFIED: op.gg's patch log and escharts.com give 07-08
+      (the majority), esports.gg 07-09, the announcement named the end of Season 4 on 07-06.
       Same update: C4 explosion damage reworked.
 
   - id: 2026-07-21-bomb-clears-utility

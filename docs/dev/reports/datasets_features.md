@@ -1,6 +1,6 @@
 # datasets_features: implementation report
 
-Tests: `.venv/bin/python -m pytest tests/learning -q -n 2` - 68 passed, 0 failed (17 s; 63 before review round 1). `tests/foundation`: 37 passed. `ruff check`, `ruff format --check` and `mypy` are clean on `src/cs2bot/datasets`, `src/cs2bot/features`, `tests/learning`.
+Tests: `.venv/bin/python -m pytest tests/learning -q -n 2` - 71 passed, 2 skipped (PostgreSQL, need `CS2BOT_TEST_DATABASE_URL`), 0 failed (19 s; 63 before review round 1). With a PostgreSQL 16 URL the 2 PostgreSQL tests pass too. `tests/foundation`: 37 passed. `ruff check`, `ruff format --check` and `mypy` are clean on `src/cs2bot/datasets`, `src/cs2bot/features`, `tests/learning`.
 
 ## Summary
 
@@ -86,14 +86,14 @@ RATING_LOGIT_FEATURE = "rating_logit";  META_COLUMNS;  TIER_RANK
 # roles
 infer_roles(source: Session | RoleFrames, *, window_days=120, as_of=None, config: RoleConfig | None = None) -> dict[int, tuple[PlayerRole, float]]
 update_player_roles(session, *, window_days=120, as_of=None, config=None, roles=None,
-                    unknown_stored_confidence=0.5, confidence_half_life_days=180.0) -> int      # flushes, does not commit
+                    unknown_stored_confidence=0.5, confidence_half_life_days=180.0) -> int      # flushes, does not commit; idempotent (re-confirmed labels only get a daily timestamp refresh, not counted)
 role_metrics(frames: RoleFrames, config=None) -> pandas.DataFrame;  decide_role(metrics, config=None, *, flash_median=nan)
 
 # meta
 detect_active_map_pool(map_results, as_of, *, window_days=60, min_share=0.04, recent_days=14, min_maps=30, pool_size=7) -> list[str]
 load_patch_timeline(path=None) -> PatchTimeline;  PatchTimeline.from_yaml(path)
 days_since_last_patch(as_of, *, min_impact="moderate", timeline=None) -> float;  patch_id(as_of, *, timeline=None) -> str | None
-timeline.last_patch / days_since_last_patch / patch_id / patch_index / map_pool_at
+timeline.last_patch / days_since_last_patch / days_since_pool_change / patch_id / patch_index / map_pool_at
 bocpd(values, config: BOCPDConfig | None = None) -> BOCPDResult
 RegimeDetector.from_map_results(map_results, *, strength_config=None, config=None)
 recent_regime_break(team_id, as_of, *, detector) -> RegimeBreak;  form_trend(team_id, as_of, *, detector) -> float
@@ -140,9 +140,9 @@ actuals = datasets.load_match_actuals(session, match_id)            # None if th
 
 ## Known limitations
 
-- **Not run against PostgreSQL.** No test database was available (`CS2BOT_TEST_DATABASE_URL` unset). Only portable SQL is used, but the loaders have executed on SQLite only.
+- **PostgreSQL:** verified in review round 1 against a local PostgreSQL 16 (`tests/learning/test_datasets_postgres.py`, marker `postgres`): every loader, the context / completeness / actuals, role inference and the training matrix are identical to SQLite. Position-sample queries only ran on the handcrafted role fixture.
 - **Role thresholds are not fitted.** No labelled role data exists; the thresholds in `RoleConfig` follow public statistics of professional players and were checked on handcrafted fixtures only, never on a real parsed demo. Site attribution relies on `BombsiteA` / `BombsiteB` place names plus coordinates; on Nuke (stacked sites) it depends on `z`.
-- **Patch dates:** 11 of the 16 entries in `config/patches.yaml` are marked `date_verified: false`. The day of the July 2026 Cache/Overpass swap is disputed between sources (07-06, 07-08, 07-09) and was downgraded to unverified. A day or two does not matter to the features.
+- **Patch dates:** 10 of the 16 entries in `config/patches.yaml` are marked `date_verified: false`. The day of the July 2026 Cache/Overpass swap is disputed between sources (07-06, 07-08, 07-09) and was downgraded to unverified. A day or two does not matter to the features.
 - **Change-point detection is slow by design:** a shift of 0.10 in round share is flagged within 20 maps in 68 % of 300 simulated series, with a false alarm about 1 % of the time. `regime_break_prob` is a weak feature in a universe without drift.
 - **`adj_round_share_90d` regresses to the mean** when team strength does not drift (the proxy has already absorbed the surprise). Its sign is for the ensemble to learn; it is not a "hot team wins" indicator.
 - **The store is immutable.** New results need a rebuild: about 0.5 s per 3,000 maps plus loading. Loading two years of round rows takes on the order of 10 s; use `with_rounds=False` for frequent rebuilds.
@@ -161,7 +161,7 @@ actuals = datasets.load_match_actuals(session, match_id)            # None if th
 
 None.
 
-## Review round 1
+## Review round 1 (first pass)
 
 Independent review of the whole package (brief incl. Addendum, every module, tests). Checks after the fixes: `pytest tests/learning -n 2` 68 passed (17 s), `tests/foundation` 37 passed, `ruff check`, `ruff format --check` and `mypy` clean.
 
@@ -185,3 +185,26 @@ New tests: `test_actuals_partial_forfeit_as_stored_by_hltv_never_voids_played_ma
 - Patch-file dates marked `date_verified: false` were not re-researched in this round.
 - A decider and an unknown pick still look identical in training rows (`MapResultRecord` has no `is_decider`; see the foundation change request above).
 - `data_completeness` with the default gate of 0.95 effectively requires confirmed lineups in `match_lineups` (a carried-over lineup alone gives at most 0.85). That is intended, but it means no bets until HLTV/PandaScore publish lineups.
+
+## Review round 1
+
+Second, independent reviewer of round 1 (the first pass above had been saved before a container restart and was re-verified rather than trusted). Checks after the fixes: `pytest tests/learning -n 2` 71 passed + 2 PostgreSQL tests skipped without a URL (both pass against PostgreSQL 16), `tests/foundation` 37 passed, `ruff check`, `ruff format --check`, `mypy` clean.
+
+**Verified:** read every module against the brief and Addendum (all points implemented, nothing stubbed); re-derived the BOCPD recursions (NIG Student-t predictive, conjugate updates, hazard split), side-split arithmetic, prefix-sum windows, the `matches_14d` carry-over, h2h orientation, trade attribution in `load_team_demo_stats`, HLTV round-history orientation in `load_match_actuals` (matches `ingest/hltv/sync/matches.py`), the `RatingProvider` dispatch against the current `MapRatingModel.historical_predict` / `records_history` / `WalkForwardRatings`. Leakage probe: for 40 random maps of a 317-map universe (rounds, vetoes, stat lines), the training row from the full store equals the row from a store loaded with `until=<match start>` - every feature identical except `pl_known` (issue 2). PostgreSQL: started a throw-away PostgreSQL 16 cluster and compared every loader, `load_team_demo_stats` (the GROUP BY), role frames, `load_match_context`, `completeness_breakdown`, `load_match_actuals`, `infer_roles` / `update_player_roles` and `build_training_rows` with SQLite: identical.
+
+**Issues found**
+
+1. **Minor, fixed - `update_player_roles` was not idempotent in production.** With `as_of=None` the stored confidence had aged by a few milliseconds on the next run, so every player was rewritten with a new timestamp and counted as changed (the existing test only used a fixed `as_of`). A label re-confirmed with the same confidence is now left alone and returns 0; its `role_inferred_at` is refreshed at most once a day (so a label that keeps being confirmed does not age), not counted.
+2. **Minor, fixed - `pl_known` was NaN for a store without any stat line but 0 for a store whose stat lines all lie after `as_of`**, so a walk-forward store cut early in the history produced a different value than the full store for the same row. It is now 0 in both cases.
+3. **Minor, fixed - `days_since_pool_change` counted "Train added to the game" (2024-11-13, kind `map_pool` but no new pool) as an Active Duty change.** New `PatchTimeline.days_since_pool_change` only counts `map_pool` entries that list a pool; the store feature uses it.
+4. **Minor, fixed - context-flag `evidence` stored as a bare JSON string was split into single characters** (`[str(e) for e in "url"]`); non-list values are now handled (string -> one item, other junk -> empty, `None` items dropped).
+5. **Data, fixed - `config/patches.yaml`:** the 2025-07-16 Overpass-for-Anubis entry is confirmed by several outlets (hotspawn.com, dust2.us, blast.tv, esports.net) and is now `date_verified: true`; the Cache entry notes the 2026-06-22 announcement and the source split (07-08 majority, 07-09) and stays unverified.
+
+New tests: `test_update_player_roles_is_idempotent_with_the_clock_running`, `test_player_count_is_the_same_for_a_store_without_stat_lines_and_one_cut_before_them`, `test_context_flag_evidence_is_always_a_list_of_strings`, pool-change assertions in `test_patch_lookups`, and `tests/learning/test_datasets_postgres.py` (2 tests, marker `postgres`).
+
+**Remaining concerns (not changed)**
+
+- Roles are only checked on handcrafted fixtures; thresholds are literature-based. Position-sample SQL ran on PostgreSQL with the handcrafted fixture only.
+- A decider and an unknown pick still look identical in training rows (foundation change request above).
+- `lineup_known = 1` also for a lineup carried over from the previous match (live), while training rows always have the real lineup; `data_completeness` discounts carried-over lineups, so betting is gated, but the feature itself does not tell the two apart.
+- `features_for_match_map` during a running series with a `MapRatingModel` fitted without history and already updated with map 1: the clamped `as_of` is before its last game and `predict` raises (by design, documented above).

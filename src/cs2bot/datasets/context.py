@@ -144,6 +144,15 @@ def _fallback_map_pool(session: Session, settings: Settings, as_of: datetime) ->
     return configured
 
 
+def _evidence_list(raw: object) -> list[str]:
+    """``context_flags.evidence`` (a JSON list) as strings; a bare string is one item, junk is dropped."""
+    if isinstance(raw, str):
+        return [raw] if raw else []
+    if isinstance(raw, (list, tuple)):
+        return [str(e) for e in raw if e is not None]
+    return []
+
+
 def _active_flags(session: Session, match: Match, now: datetime) -> list[ContextFlag]:
     stmt = (
         select(ContextFlagRow)
@@ -170,7 +179,7 @@ def _active_flags(session: Session, match: Match, now: datetime) -> list[Context
                     logit_shift=row.logit_shift,
                     veto=row.veto,
                     rationale=row.rationale,
-                    evidence=[str(e) for e in (row.evidence or [])],
+                    evidence=_evidence_list(row.evidence),
                     expires_at=row.expires_at,
                 )
             )

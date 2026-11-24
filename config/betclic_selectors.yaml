@@ -56,6 +56,9 @@
 # AFTER THE FINAL CLICK the bot trusts a rejection message only if nothing contradicts it: when a
 # receipt shows up after all, or the header balance dropped below its value from before the click, the
 # result is UNCERTAIN (never "definitely not placed") and the bet is reconciled via "Moje zakłady".
+# Likewise a receipt confirms a bet only with a texts.bet_accepted phrase or a readable bet id: if the
+# first real bets end UNCERTAIN with "inconclusive Betclic message ...", add the receipt's wording to
+# texts.bet_accepted (or fix receipt_bet_id / patterns.bet_id).
 # =====================================================================================================
 
 version: 1
@@ -516,7 +519,11 @@ elements:
       - {role: button, name: "/^(anuluj|odrzuć)( zmian[ęy])?$/i"}
       - {css: "[data-qa='betslip-decline-odds']"}
   bet_receipt:
-    description: Confirmation / receipt shown after a successful placement (contains the bet id).
+    description: >-
+      Confirmation / receipt shown after a successful placement. It confirms the bet only with a
+      confirmation phrase (texts.bet_accepted) or a readable bet id (receipt_bet_id / patterns.bet_id)
+      and no error phrase; an empty box (still loading) or any other text is inconclusive (the bot keeps
+      waiting, then reports UNCERTAIN and the bet is reconciled via "Moje zakłady").
     verified: false
     locators:
       - {css: "[data-qa='bet-receipt'], [data-qa='betslip-receipt']"}

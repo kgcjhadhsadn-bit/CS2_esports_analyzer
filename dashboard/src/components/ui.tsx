@@ -1,8 +1,28 @@
 /** Small presentational building blocks of the design system. */
 import { useEffect, useId, useRef, useState } from "react";
-import type { ReactNode } from "react";
+import type { KeyboardEvent as ReactKeyboardEvent, ReactNode } from "react";
 import { ApiError } from "../api/client";
 import { formatPct } from "../lib/format";
+
+/**
+ * Props that make a table row act as a toggle button: click, Enter / Space and keyboard focus.
+ * Returns `{}` when there is nothing to toggle.
+ */
+export function toggleRowProps(onToggle: (() => void) | undefined, expanded: boolean) {
+  if (!onToggle) return {};
+  return {
+    onClick: onToggle,
+    onKeyDown: (e: ReactKeyboardEvent<HTMLTableRowElement>) => {
+      if (e.target !== e.currentTarget) return;
+      if (e.key === "Enter" || e.key === " ") {
+        e.preventDefault();
+        onToggle();
+      }
+    },
+    tabIndex: 0,
+    "aria-expanded": expanded,
+  };
+}
 
 export function Card({
   title,

@@ -26,6 +26,9 @@ from cs2bot.utils.time import ensure_utc, utcnow
 log = get_logger(__name__)
 
 EXTRA_KEY = "llm"  # our namespace inside the shared ``extra`` JSON columns
+# ``context_flags.model`` value reserved for flags the owner sets by hand (e.g. a manual no-bet veto).
+# :func:`persist_flags` never deactivates such rows; everything else in the table is ours to replace.
+MANUAL_FLAG_MODEL = "manual"
 _DEFAULT_TUNING = LLMTuning()
 _UNTRIAGED_RANK = 0.5  # untriaged items sort between clearly relevant and marginal triaged ones
 
@@ -101,19 +104,26 @@ def persist_flags(
     inserted per flag, with ``team_id`` resolved from the flag's ``TeamSlot`` through
     ``team_ids = (matches.team1_id, matches.team2_id)``. ``logit_shift`` stays in team1's perspective.
 
+    Rows whose ``model`` is :data:`MANUAL_FLAG_MODEL` (flags the owner set by hand) are left alone:
+    an analysis never switches off a manual veto.
+
     Idempotent: when the active rows already describe exactly the same flags (same content, same
     model), nothing is written and the existing rows are returned. Passing an empty list deactivates
     everything - only do that after a *successful* analysis that found nothing.
     """
     current = ensure_utc(now) if now is not None else utcnow()
     model_name = model[:64] if model else None
-    active = list(
-        session.scalars(
+    if model_name == MANUAL_FLAG_MODEL:
+        raise ValueError(f"model name {MANUAL_FLAG_MODEL!r} is reserved for flags set by hand")
+    active = [
+        row
+        for row in session.scalars(
             select(ContextFlagRow)
             .where(ContextFlagRow.match_id == match_id, ContextFlagRow.active.is_(True))
             .order_by(ContextFlagRow.id)
         )
-    )
+        if row.model != MANUAL_FLAG_MODEL  # the owner's own flags are never replaced by an analysis
+    ]
     wanted = [
         _flag_signature(
             flag.flag_type.value,
@@ -251,11 +261,17 @@ def store_triage(
     row.triaged_at = current
     suggested = {int(t) for t in item.team_ids}
     known: set[int] = set()
+    original = _int_set(row.team_ids)
+    previous = llm_extra(row.extra).get("triage")
+    # Ids that only the verdict put into ``team_ids`` (kept across repeated calls), so that a replay at
+    # an instant before ``triaged_at`` can take them out again (see select_news_for_match).
+    added = _int_set(previous.get("added_team_ids")) if isinstance(previous, dict) else set()
     if suggested:
         known = set(session.scalars(select(Team.id).where(Team.id.in_(suggested))))
-        merged = sorted(_int_set(row.team_ids) | known)
+        merged = sorted(original | known)
         if merged != list(row.team_ids or []):
             row.team_ids = merged
+    added |= known - original
     row.extra = merge_llm_extra(
         row.extra,
         {
@@ -263,6 +279,7 @@ def store_triage(
                 "summary": item.summary,
                 "team_names": list(item.team_names),
                 "team_ids": sorted(known),
+                "added_team_ids": sorted(added),
                 "model": model,
             }
         },
@@ -366,7 +383,12 @@ def select_news_for_match(
             continue
         if not triaged and not include_untriaged:
             continue
-        mentioned = _mentioned_team_ids(row) if triaged else _int_set(row.team_ids)
+        if triaged:
+            mentioned = _mentioned_team_ids(row)
+        elif row.triage_label is not None:  # verdict written after ``now``: without the ids it added
+            mentioned = _int_set(row.team_ids) - _triage_added_team_ids(row)
+        else:
+            mentioned = _int_set(row.team_ids)
         mentions = bool(team_ids & mentioned) or bool(player_ids & _int_set(row.player_ids))
         rank = relevance if triaged else _UNTRIAGED_RANK
         if mentions:
@@ -374,7 +396,10 @@ def select_news_for_match(
         elif label == TriageLabel.META_PATCH.value:
             general.append((rank, when, row))
     general.sort(key=lambda entry: (entry[1], entry[2].id), reverse=True)  # newest first
-    general = general[: min(global_cap, limit)]
+    # Match-wide items get up to ``global_cap`` slots, but never crowd out news about the two teams
+    # when ``limit`` is small: they then only fill what the team-specific items leave free (with
+    # the default limit of 25 and cap of 3 the reservation always holds).
+    general = general[: min(global_cap, max(limit - len(specific), limit // 4))]
     specific.sort(key=lambda entry: (entry[0], entry[1], entry[2].id), reverse=True)
     chosen = specific[: max(0, limit - len(general))] + general
     chosen.sort(key=lambda entry: (entry[1], entry[2].id))  # oldest first for the prompt
@@ -386,6 +411,12 @@ def _mentioned_team_ids(row: NewsItem) -> set[int]:
     triage = llm_extra(row.extra).get("triage")
     from_triage = _int_set(triage.get("team_ids")) if isinstance(triage, dict) else set()
     return _int_set(row.team_ids) | from_triage
+
+
+def _triage_added_team_ids(row: NewsItem) -> set[int]:
+    """Team ids that only the triage verdict merged into ``team_ids`` (see :func:`store_triage`)."""
+    triage = llm_extra(row.extra).get("triage")
+    return _int_set(triage.get("added_team_ids")) if isinstance(triage, dict) else set()
 
 
 def _int_set(values: Any) -> set[int]:

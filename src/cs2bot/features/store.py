@@ -1026,6 +1026,9 @@ class FeatureStore:
             "pl_awp_kpr_max",
         )
         out = dict.fromkeys(names, NAN)
+        # 0 (not NaN) when the store has no stat lines at all: a walk-forward store cut early in the
+        # history must give the same value as the full store gives for the same row
+        out["pl_known"] = 0.0
         if not self._players:
             return out
         since = ts - cfg.player_window_days * _DAY
@@ -1177,8 +1180,6 @@ class FeatureStore:
         index = tl.patch_index(as_of)
         return {
             "days_since_patch": tl.days_since_last_patch(as_of, min_impact="moderate"),
-            "days_since_pool_change": tl.days_since_last_patch(
-                as_of, min_impact="minor", kinds=("map_pool",)
-            ),
+            "days_since_pool_change": tl.days_since_pool_change(as_of),
             "patch_index": float(index) if index >= 0 else NAN,
         }

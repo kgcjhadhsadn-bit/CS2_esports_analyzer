@@ -163,6 +163,49 @@ def series_prefix_sum_pmf(
     return mass, out / out.sum()
 
 
+def series_prefix_sum_pmfs(
+    fmt: MatchFormat,
+    p_maps: Sequence[float],
+    pmf_if_team1_wins: Sequence[FloatArray],
+    pmf_if_team2_wins: Sequence[FloatArray],
+) -> list[tuple[float, FloatArray]]:
+    """:func:`series_prefix_sum_pmf` for every ``upto = 1..n_maps`` in ONE pass of the programme.
+
+    Element ``upto - 1`` is ``(P(map upto is played), pmf of X_1 + ... + X_upto given that it is
+    played)``; ``(0.0, [1.0])`` when that map can never be played.
+    """
+    n = fmt.n_maps
+    need = fmt.maps_to_win
+    states: dict[tuple[int, int], FloatArray] = {(0, 0): np.array([1.0])}
+    out: list[tuple[float, FloatArray]] = []
+    for k in range(n):
+        p = float(p_maps[k])
+        acc_total = np.zeros(1, dtype=np.float64)
+        for acc in states.values():
+            acc_total = pad_add(acc_total, acc)
+        mass = float(acc_total.sum())
+        if mass <= 0.0:
+            out.append((0.0, np.array([1.0])))
+        else:
+            last = pad_add(p * np.asarray(pmf_if_team1_wins[k]), np.asarray(pmf_if_team2_wins[k]), 1.0 - p)
+            conv = np.convolve(acc_total / mass, last)
+            out.append((mass, conv / conv.sum()))
+        if k == n - 1:
+            break
+        nxt: dict[tuple[int, int], FloatArray] = {}
+        for (a, b), acc in states.items():
+            for state, q, pmf in (
+                ((a + 1, b), p, pmf_if_team1_wins[k]),
+                ((a, b + 1), 1.0 - p, pmf_if_team2_wins[k]),
+            ):
+                if q <= 0.0:
+                    continue
+                contrib = q * np.convolve(acc, pmf)
+                nxt[state] = pad_add(nxt[state], contrib) if state in nxt else contrib
+        states = {state: acc for state, acc in nxt.items() if not _decided(state, need)}
+    return out
+
+
 def played_mask(fmt: MatchFormat, team1_won: np.ndarray) -> np.ndarray:
     """Vectorised "slot played" mask for simulated series.
 
@@ -183,4 +226,11 @@ def played_mask(fmt: MatchFormat, team1_won: np.ndarray) -> np.ndarray:
     return out
 
 
-__all__ = ["SeriesResult", "played_mask", "series_outcome", "series_prefix_sum_pmf", "series_sum_pmf"]
+__all__ = [
+    "SeriesResult",
+    "played_mask",
+    "series_outcome",
+    "series_prefix_sum_pmf",
+    "series_prefix_sum_pmfs",
+    "series_sum_pmf",
+]

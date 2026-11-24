@@ -4,7 +4,8 @@ The owner logs in by hand once (incl. SMS / 2FA) via :meth:`BetclicExecutor.open
 profile keeps the session. :meth:`BetclicExecutor.place` then places single pre-match bets:
 
 0. the idempotency key was already clicked (this process or the placement journal) -> ``UNCERTAIN``,
-   before anything else; then the order is validated (``FAILED``; started event -> ``MARKET_UNAVAILABLE``)
+   before anything else (and again once the profile lock is held); then the order is validated
+   (``FAILED``; started event -> ``MARKET_UNAVAILABLE``)
 1. halt check (kill switch / pause)                -> ``KILL_SWITCH``
 2. open the event page (``order.event_url`` or find the event on the CS2 listing by its id)
 3. logged in?                                      -> ``LOGIN_REQUIRED``
@@ -23,10 +24,13 @@ profile keeps the session. :meth:`BetclicExecutor.place` then places single pre-
 9. dry run -> screenshot, clear the slip, ``DRY_RUN_OK`` (the final button is located, never clicked)
 10. make sure the button is clickable, then re-read the slip (still one selection, odds still
     acceptable, stake field still equal to the order stake, potential win, no message, no receipt),
-    write the write-ahead journal record, then the halt check again, immediately before the click
+    verify the profile lock, write the write-ahead journal record, then the halt check again,
+    immediately before the click
 11. click "Postaw zakład"; handle the odds-changed dialog (accept only at >= min odds, read again right
     before the accept click, at most once per dialog); wait for the receipt (bet id, new balance) ->
-    ``PLACED``; known errors -> their status, unless a receipt or a lower balance contradicts them;
+    ``PLACED`` - a receipt counts only with a confirmation phrase or a readable bet id (an empty /
+    unrecognised one is inconclusive); known errors -> their status, unless a receipt or a lower
+    balance contradicts them;
     anything unclear after the click -> ``UNCERTAIN`` (never retried; reconcile via
     :meth:`BetclicExecutor.fetch_bet_history`).
 
@@ -52,10 +56,11 @@ import importlib
 import logging
 import random
 import re
+import threading
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from enum import StrEnum
 from pathlib import Path
@@ -230,6 +235,8 @@ class BetclicExecutor:
         self._journal_compacted = False
         self._last_attempt_end: float | None = None
         self._closed = False
+        # Set from ANY thread (abort_login) to end a waiting open_login_window, e.g. at shutdown.
+        self._login_abort = threading.Event()
 
     # ================================================================== public API
 
@@ -319,6 +326,12 @@ class BetclicExecutor:
             if not self._journal_compacted:  # we hold the profile lock: we are the journal's only writer
                 self._journal_compacted = True
                 self._journal.compact()  # best effort, never raises
+            # Again, now that we hold the profile lock: the first check ran before it was taken (and
+            # before the pacing gap), so another process that held the profile meanwhile (``cs2bot bet
+            # run`` next to ``cs2bot up``) may have clicked this key in between.
+            refusal = self._refuse_if_already_clicked(attempt)
+            if refusal is not None:
+                return refusal
             try:
                 return self._place_on_page(page, attempt)
             except _Abort as abort:
@@ -410,6 +423,9 @@ class BetclicExecutor:
         log.info("waiting up to %.0fs for the owner to log in to Betclic (incl. SMS / 2FA)", timeout_s)
         deadline = time.monotonic() + max(0.0, timeout_s)
         while time.monotonic() < deadline:
+            if self._login_abort.is_set():
+                log.warning("waiting for the Betclic login was aborted (shutdown)")
+                return False
             current = self._session.current_page()
             if current is None:
                 log.info("browser window closed during login - checking the saved session")
@@ -425,6 +441,15 @@ class BetclicExecutor:
                 time.sleep(min(self.tuning.login_poll_s, 0.5))
         log.warning("Betclic login not completed within %.0fs", timeout_s)
         return False
+
+    def abort_login(self) -> None:
+        """Thread-safe: a waiting :meth:`open_login_window` returns ``False`` at its next poll.
+
+        The only method that may be called from another thread: :class:`ThreadBoundExecutor` calls it on
+        ``close()`` so that shutting down does not wait up to ``timeout_s`` for a login window. Once
+        called it stays in force (the executor is about to be closed).
+        """
+        self._login_abort.set()
 
     def health_check(self) -> ExecutorHealth:
         """Browser starts, logged in, balance readable, key selectors resolvable (listing + one event)."""
@@ -781,8 +806,25 @@ class BetclicExecutor:
             ) from None
 
     def _journal_click(self, attempt: _Attempt) -> None:
-        """Record the imminent final click durably; without the record the button is not clicked."""
+        """Record the imminent final click durably; without the record the button is not clicked.
+
+        The profile lock is verified first: the journal is only trustworthy while this process is its
+        single writer (a process that lost the lock - e.g. broken as stale after the PC slept - must not
+        click while another one may be placing with the same profile and journal).
+        """
         order = attempt.order
+        try:
+            lock_ok = self._session.lock.verify()
+        except OSError as exc:  # pragma: no cover - verify() swallows its own I/O errors
+            log.warning("could not verify the profile lock: %s", _short_error(exc))
+            lock_ok = False
+        if not lock_ok:
+            raise _Abort(
+                PlacementStatus.FAILED,
+                f"the browser-profile lock {self._session.lock.path} is no longer held by this process; "
+                "refusing to click 'Postaw zakład' (another process may be using the profile)",
+                clear_slip=False,  # hands off the page: it may not be ours alone any more
+            )
         try:
             self._journal.record_click(order.idempotency_key, order.bet_id)
         except JournalError as exc:
@@ -868,12 +910,14 @@ class BetclicExecutor:
             # next pass looks again. A read that fails must not end a placement that went through.)
             receipt_text = _soft_text(receipt.first) if receipt is not None else None
             if receipt is not None and receipt_text is not None:
-                if self._receipt_confirms(receipt_text):
+                if self._receipt_confirms(receipt.first, receipt_text):
                     return self._on_receipt(page, attempt, receipt.first, receipt_text, odds, pre_balance)
-                # "przyjęty, oczekuje na akceptację": the bookmaker may still refuse it; or the receipt
-                # box carries a rejection. Keep waiting for the final word; without one the attempt ends
-                # UNCERTAIN (reconciled via bet history) - never PLACED, never a definite "no bet".
-                unknown_message = receipt_text
+                # "przyjęty, oczekuje na akceptację": the bookmaker may still refuse it; the receipt box
+                # carries a rejection; or it is still rendering (empty, a spinner). Keep waiting for the
+                # final word; without one the attempt ends UNCERTAIN (reconciled via bet history) -
+                # never PLACED, never a definite "no bet".
+                if receipt_text:
+                    unknown_message = receipt_text
             accept, dialog_open = self._odds_dialog(page)
             if not dialog_open:
                 accepted = None  # the dialog we accepted is gone: a later one is a new one
@@ -950,21 +994,43 @@ class BetclicExecutor:
                 )
             page.wait_for_timeout(t.poll_interval_s * 1000)
 
-    def _receipt_confirms(self, text: str) -> bool:
-        """Whether a displayed ``bet_receipt`` confirms the bet.
+    def _receipt_confirms(self, receipt: Locator, text: str) -> bool:
+        """Whether a displayed ``bet_receipt`` confirms the bet (``PLACED`` debits the ledger).
 
         The receipt locators include plain containers (``.betslip_receipt``, ``.betslip_confirmation``)
-        that may also show a refusal. Not a confirmation: a "pending approval" text, or a known error
-        phrase (rejected, stake limit, ...) WITHOUT a confirmation phrase - such a receipt is
-        inconclusive. A confirmation phrase wins over incidental error words ("Zakład przyjęty - kurs
-        uległ zmianie": the bet was taken at the changed odds).
+        that may be displayed before the bookmaker has answered (empty, a spinner, "Ładowanie") or carry
+        a refusal. So a receipt confirms only on POSITIVE evidence:
+
+        * a confirmation phrase (``texts.bet_accepted``) - it wins over incidental error words ("Zakład
+          przyjęty - kurs uległ zmianie": the bet was taken at the changed odds) but not over a
+          "pending approval" text;
+        * otherwise a readable bet id (``receipt_bet_id`` or ``patterns.bet_id``) and no known error
+          phrase.
+
+        Anything else (empty text, an unknown text without a bet id, an error phrase) is inconclusive:
+        the caller keeps waiting and, without a final word, reports ``UNCERTAIN``.
         """
+        if not normalise_text(text):
+            return False
         if self.selectors.classify(text, ("pending",)) is not None:
             return False
         if self.selectors.classify(text, ("bet_accepted",)) is not None:
             return True
         errors = tuple(c for c in MESSAGE_CATEGORY_ORDER if c in CATEGORY_STATUS)
-        return self.selectors.classify(text, errors) is None
+        if self.selectors.classify(text, errors) is not None:
+            return False
+        return self._receipt_bet_id(receipt, text) is not None
+
+    def _receipt_bet_id(self, receipt: Locator, text: str) -> str | None:
+        """The Betclic bet id shown on a receipt (``receipt_bet_id`` element, else ``patterns.bet_id``)."""
+        bet_id: str | None = None
+        try:
+            id_el = self.selectors.probe(receipt, "receipt_bet_id", state="attached")
+            if id_el is not None:
+                bet_id = self._clean_bet_id(_soft_text(id_el.first) or "")
+        except PlaywrightError:  # the receipt is re-rendering: the patterns below still apply
+            bet_id = None
+        return bet_id or first_regex_group(text, self.selectors.compiled_patterns("bet_id"))
 
     def _handle_odds_change(
         self, page: Page, attempt: _Attempt, accept: ResolvedElement, rounds: int
@@ -1195,6 +1261,8 @@ class BetclicExecutor:
         problem = self._odds_problem(current, order)
         if problem is not None:
             raise _Abort(PlacementStatus.ODDS_MOVED, f"bet-slip odds after accepting new odds {problem}")
+        # still the ordered selection (a SELECTOR_ERROR here ends as UNCERTAIN: we are after the click)
+        self._recheck_slip_selection(page, order)
         halted, reason = self._halted()
         if halted:
             raise _Abort(
@@ -1221,12 +1289,7 @@ class BetclicExecutor:
         it was recognised. The details are read tolerantly: a receipt that closes itself while they are
         collected still is a confirmed bet (reported without the parts that could not be read).
         """
-        bet_id: str | None = None
-        id_el = self.selectors.probe(root, "receipt_bet_id", state="attached")
-        if id_el is not None:
-            bet_id = self._clean_bet_id(_soft_text(id_el.first) or "")
-        if not bet_id:
-            bet_id = first_regex_group(receipt_text, self.selectors.compiled_patterns("bet_id"))
+        bet_id = self._receipt_bet_id(root, receipt_text)
         placed_odds = odds
         odds_el = self.selectors.probe(root, "receipt_odds", state="attached")
         if odds_el is not None:
@@ -2075,10 +2138,14 @@ class BetclicExecutor:
         )
         placed_at = parse_polish_datetime(date_text, now=now) if date_text else None
         status_text = field("history_item_status")
-        status = self._classify_history_status(status_text or raw)
+        if status_text:
+            status = self._classify_history_status(status_text)
+        else:  # no status label: the whole row text, where buttons and promos may use the same words
+            status = self._classify_history_status(raw, whole_row=True)
         payout = amount("history_item_payout", "history_payout")
-        if status is BookmakerBetStatus.OPEN:
-            payout = None  # "możliwa wygrana" is a potential, not an actual payout
+        if status in (BookmakerBetStatus.OPEN, BookmakerBetStatus.UNKNOWN):
+            # "możliwa wygrana" / a cash-out offer is a potential, not an actual payout
+            payout = None
         elif status is BookmakerBetStatus.LOST and payout is None:
             payout = Decimal("0")
         return BookmakerBetRecord(
@@ -2094,11 +2161,21 @@ class BetclicExecutor:
             raw_text=raw[:1000],
         )
 
-    def _classify_history_status(self, text: str) -> BookmakerBetStatus:
-        for key, status in HISTORY_STATUS_ORDER:
-            if self.selectors.classify(text, (key,)) is not None:
-                return status
-        return BookmakerBetStatus.UNKNOWN
+    def _classify_history_status(self, text: str, *, whole_row: bool = False) -> BookmakerBetStatus:
+        """Status of a bet-history row from its status label (first phrase in ``HISTORY_STATUS_ORDER``).
+
+        ``whole_row``: the label could not be located and the whole row text is classified. That text
+        also holds buttons and notes - an OPEN bet offers "Cash out 9,80 zł", a promo mentions "zwrot" -
+        so the row is classified only when the phrases of exactly ONE status occur, else ``UNKNOWN``
+        (never guess: a cash-out or void reported for an open bet would settle it wrongly).
+        """
+        matches = [status for key, status in HISTORY_STATUS_ORDER if self.selectors.classify(text, (key,))]
+        if not matches:
+            return BookmakerBetStatus.UNKNOWN
+        if whole_row and len(set(matches)) > 1:
+            log.debug("bet-history row matches several statuses %s; reported as unknown", matches)
+            return BookmakerBetStatus.UNKNOWN
+        return matches[0]
 
     def _clean_bet_id(self, text: str) -> str | None:
         found = first_regex_group(text, self.selectors.compiled_patterns("bet_id"))
@@ -2532,7 +2609,9 @@ def _latest_possible(placed_at: datetime) -> datetime:
     """
     local = placed_at.astimezone(WARSAW)
     if (local.hour, local.minute, local.second) == (0, 0, 0):
-        return placed_at + timedelta(days=1)
+        # The next LOCAL midnight (aware + timedelta is wall-clock arithmetic): the October day on which
+        # the clocks go back has 25 hours, and "+24 h in UTC" would end it an hour early.
+        return (local + timedelta(days=1)).astimezone(UTC)
     if local.second == 0:
         return placed_at + timedelta(minutes=1)
     return placed_at

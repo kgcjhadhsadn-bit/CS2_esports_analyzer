@@ -8,6 +8,7 @@ Everything here is pure numpy/scipy and deterministic. Conventions:
 
 from __future__ import annotations
 
+import math
 import zlib
 from collections.abc import Iterable, Mapping, Sequence
 
@@ -63,6 +64,30 @@ def binom_inverse(u: npt.NDArray[np.floating], n: int, p: FloatArray | float) ->
         pmf = pmf * ((n - j) / (j + 1.0)) * ratio
         cdf = cdf + pmf
     return k
+
+
+def gamma_quadrature(cv2: float, n_nodes: int = 7) -> tuple[FloatArray, FloatArray]:
+    """Gauss quadrature of a mean-one Gamma multiplier with squared coefficient of variation ``cv2``.
+
+    Returns ``(nodes, weights)`` (weights sum to 1) such that ``sum w f(x)`` matches ``E[f(X)]`` for
+    ``X ~ Gamma(shape=1/cv2, scale=cv2)`` exactly for polynomials of degree ``<= 2 n_nodes - 1`` (mean 1,
+    variance ``cv2`` and skewness are reproduced). Generalised Gauss-Laguerre rule computed with the
+    Golub-Welsch eigenvalue method, which (unlike ``scipy.special.roots_genlaguerre``) stays finite for
+    the large shape parameters of well-estimated rates. ``cv2 <= 0`` -> a single node at 1.
+    """
+    if not math.isfinite(cv2) or cv2 <= 0.0 or n_nodes <= 1:
+        return np.ones(1, dtype=np.float64), np.ones(1, dtype=np.float64)
+    shape = 1.0 / cv2
+    alpha = shape - 1.0  # generalised Laguerre weight x**alpha * exp(-x), alpha > -1
+    k = np.arange(n_nodes, dtype=np.float64)
+    diag = 2.0 * k + alpha + 1.0
+    kk = np.arange(1, n_nodes, dtype=np.float64)
+    off = np.sqrt(kk * (kk + alpha))
+    jacobi = np.diag(diag) + np.diag(off, 1) + np.diag(off, -1)
+    x, vec = np.linalg.eigh(jacobi)
+    w = vec[0] ** 2
+    w = w / w.sum()
+    return np.asarray(x / shape, dtype=np.float64), np.asarray(w, dtype=np.float64)
 
 
 def weighted_mean(x: npt.ArrayLike, weights: FloatArray | None = None) -> float:
@@ -215,6 +240,7 @@ __all__ = [
     "binom_inverse",
     "convolve",
     "expit",
+    "gamma_quadrature",
     "logit",
     "mix_dicts",
     "mix_pmfs",

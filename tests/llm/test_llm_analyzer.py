@@ -238,6 +238,16 @@ def test_evidence_resolution_variants() -> None:
     assert len(resolve_evidence([f"news-{i}" for i in range(1, 3)] + ["context"], index, limit=2)) == 2
 
 
+def test_evidence_strings_citing_several_items_are_split() -> None:
+    """Review round 1: "news-1, news-2" in one string cites both; loose numbers are not references."""
+    news = [make_news(1), make_news(2)]
+    index = build_evidence_index(news)
+    assert resolve_evidence(["news-1, news-2"], index) == [news[0].url, news[1].url]
+    assert resolve_evidence(["news-2 and context"], index) == [news[1].url, CONTEXT_EVIDENCE]
+    assert resolve_evidence([f"news-1; {news[1].url}"], index) == [news[0].url, news[1].url]
+    assert resolve_evidence(["Reported by 2 outlets", "#1 ranked team", "news-9 x"], index) == []
+
+
 def test_context_only_evidence_is_accepted() -> None:
     lineup_unknown = suggestion(
         flag_type=ContextFlagType.OTHER,

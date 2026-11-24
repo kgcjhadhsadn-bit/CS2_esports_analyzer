@@ -47,6 +47,20 @@ _RISK_STATEMENT_PATTERNS: tuple[re.Pattern[str], ...] = tuple(
         rf"\bprzegra\w*{_SENTENCE}\bzakład\w*",
     )
 )
+# A matched risk statement only counts when it is not negated ("this bet cannot lose", "losses are
+# not possible", "you will never lose this stake", "zakładu nie można przegrać"): the negation is
+# looked for inside the match and in the words just before it in the same sentence.
+_NEGATION = re.compile(
+    r"(?:\b(?:not|no|never|cannot|without|hardly|nie|nigdy|bez)\b|n['’]t\b)", re.IGNORECASE
+)
+_NEGATION_LOOKBEHIND_CHARS = 30
+# Certainty language: when present, the disclaimer is appended even if a risk statement exists, so
+# "a guaranteed win ... losses are possible" still ends with the explicit disclaimer.
+_CERTAINTY = re.compile(
+    r"\b(?:guarantee\w*|risk[- ]free|sure thing|safe bet|can(?:no|['’])t lose|"
+    r"bez ryzyka|gwarant\w*)",
+    re.IGNORECASE,
+)
 # A tag starts with a letter, "/" or "!" right after "<" - so "p < 0.75 and EV > 0.03" is left alone.
 # Tags may span lines ("<img\nsrc=x\nonerror=...>" is one tag for a browser) but not contain "<".
 _HTML_TAG = re.compile(r"</?[A-Za-z!][^<>]{0,400}>")
@@ -54,9 +68,11 @@ _HTML_TAG = re.compile(r"</?[A-Za-z!][^<>]{0,400}>")
 # the remains of "<scr<script>ipt>") is defused by a space: "< img" is text for every HTML parser.
 _TAG_START = re.compile(r"<(?=[A-Za-z!/])")
 _MAX_STRIP_PASSES = 10
-_MD_IMAGE = re.compile(r"!\[([^\]\n]*)\]\([^)\n]*\)")
-# Inline links "[text](target)" and reference definitions "[label]: target".
-_MD_LINK = re.compile(r"\[([^\]\n]*)\]\(\s*<?([^)\s>]*)[^)\n]*\)")
+# Inline images "![alt](target)" and links "[text](target)". Like CommonMark, the text may contain
+# balanced brackets ("[a [b] c](javascript:x)" is a link) and the destination balanced parentheses
+# ("javascript:alert(1)"); one level of nesting is enough for both, deeper nesting is not a link.
+_MD_INLINE = re.compile(r"(!?)\[((?:[^\[\]\n]|\[[^\[\]\n]*\])*)\]\(((?:[^()\n]|\([^()\n]*\))*)\)")
+# Reference definitions "[label]: target".
 _MD_LINK_DEFINITION = re.compile(r"^[ \t]{0,3}\[[^\]\n]+\]:[ \t]*<?(\S*).*$", re.MULTILINE)
 _SAFE_LINK = re.compile(r"^(https?://|#|/(?!/))", re.IGNORECASE)
 _MAX_SEQUENCES = 5
@@ -351,15 +367,14 @@ def sanitize_markdown(text: str) -> str:
     as Markdown without raw HTML anyway; stripping here is defence in depth (no script tags, no
     remote images that would leak that the page was opened, no ``javascript:`` / ``data:`` links).
     Links to ``http(s)://`` addresses, in-page anchors and site-relative paths are kept; any other
-    link is reduced to its text.
+    link is reduced to its text. Link texts are sanitised recursively ("[[x](javascript:y)](https://z)"
+    renders the inner link in CommonMark).
     """
-    without_images = _MD_IMAGE.sub(lambda m: m.group(1), text)
-    without_links = _MD_LINK.sub(
-        lambda m: m.group(0) if _SAFE_LINK.match(m.group(2)) else m.group(1), without_images
-    )
-    text = _MD_LINK_DEFINITION.sub(
-        lambda m: m.group(0) if _SAFE_LINK.match(m.group(1)) else "", without_links
-    )
+    text = _sanitize_inline_links(text)
+    # A reference-style image ("![alt][ref]", "![alt]") would load its target like an inline one;
+    # without the "!" it is at most a link, whose definition is checked below.
+    text = text.replace("![", "[")
+    text = _MD_LINK_DEFINITION.sub(lambda m: m.group(0) if _SAFE_LINK.match(m.group(1)) else "", text)
     for _ in range(_MAX_STRIP_PASSES):  # nested fragments ("<scr<b>ipt>") re-form a tag after one pass
         stripped = _HTML_TAG.sub("", text)
         if stripped == text:
@@ -368,9 +383,41 @@ def sanitize_markdown(text: str) -> str:
     return _TAG_START.sub("< ", text)
 
 
+def _link_target(destination: str) -> str:
+    """The URL part of an inline link destination ("<url>", "url", or "url 'title'")."""
+    stripped = destination.strip()
+    if stripped.startswith("<"):
+        return stripped[1:].split(">", 1)[0].strip()
+    return stripped.split(None, 1)[0] if stripped else ""
+
+
+def _sanitize_inline_links(text: str) -> str:
+    """Images become their alt text; links with an unsafe target become their (sanitised) text."""
+
+    def replace(match: re.Match[str]) -> str:
+        is_image, label, destination = match.group(1) == "!", match.group(2), match.group(3)
+        inner = _sanitize_inline_links(label)
+        if is_image or not _SAFE_LINK.match(_link_target(destination)):
+            return inner
+        return f"[{inner}]({destination})"
+
+    return _MD_INLINE.sub(replace, text)
+
+
 def has_risk_statement(text: str) -> bool:
     """Whether ``text`` says (in English or Polish) that the bets can lose / losses are possible."""
-    return any(pattern.search(text) for pattern in _RISK_STATEMENT_PATTERNS)
+    for pattern in _RISK_STATEMENT_PATTERNS:
+        for match in pattern.finditer(text):
+            before = text[max(0, match.start() - _NEGATION_LOOKBEHIND_CHARS) : match.start()]
+            before = re.split(r"[.!?\n]", before)[-1]  # same sentence only
+            if not _NEGATION.search(match.group(0)) and not _NEGATION.search(before):
+                return True
+    return False
+
+
+def has_certainty_language(text: str) -> bool:
+    """Whether ``text`` uses words that suggest certainty ("guaranteed", "risk-free", "can't lose")."""
+    return _CERTAINTY.search(text) is not None
 
 
 def finalize_rationale(text: str) -> str:
@@ -378,6 +425,6 @@ def finalize_rationale(text: str) -> str:
     cleaned = sanitize_markdown(text).strip()
     if not cleaned:
         return ""
-    if not has_risk_statement(cleaned):
+    if not has_risk_statement(cleaned) or has_certainty_language(cleaned):
         cleaned = f"{cleaned}\n\n*{RISK_DISCLAIMER}*"
     return cleaned

@@ -5,7 +5,7 @@ import { bankroll, betPage, health, matchPage, tradingState } from "../test/fixt
 import { mockApi, renderWithProviders } from "../test/utils";
 import OverviewPage from "./OverviewPage";
 
-const plain = (s: string | null | undefined) => (s ?? "").replace(/[  ]/g, " ");
+const plain = (s: string | null | undefined) => (s ?? "").replace(/[\u00a0\u202f]/g, " ");
 
 function routes(extra: Record<string, unknown> = {}) {
   return {

@@ -208,3 +208,42 @@ def test_explicit_risk_statements_are_recognised(text: str) -> None:
 def test_sanitize_markdown_handles_multiline_nested_and_unclosed_tags(text: str, expected: str) -> None:
     """Review round 1: tags spanning lines, re-forming after one pass, or left unclosed are defused."""
     assert sanitize_markdown(text) == expected
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "This bet cannot lose.",
+        "These bets can't lose money.",
+        "Losses are not possible here.",
+        "No losses are expected.",
+        "You will never lose this bet.",
+        "Zakładu nie można przegrać.",
+    ],
+)
+def test_negated_risk_statements_do_not_suppress_the_disclaimer(text: str) -> None:
+    """Review round 1: "this bet cannot lose" is a promise of certainty, not a risk statement."""
+    assert finalize_rationale(text).endswith(f"*{RISK_DISCLAIMER}*")
+
+
+def test_certainty_language_always_gets_the_disclaimer() -> None:
+    text = "A guaranteed win for Wolves. Losses are possible."
+    assert finalize_rationale(text).endswith(f"*{RISK_DISCLAIMER}*")
+    assert finalize_rationale("Losses are possible.") == "Losses are possible."
+
+
+@pytest.mark.parametrize(
+    ("text", "expected"),
+    [
+        ("[a [b] c](javascript:alert(1))", "a [b] c"),
+        ("[x](javascript:alert(1)) end", "x end"),
+        ("[x](<javascript:alert(1)>)", "x"),
+        ("[[x](javascript:1)](https://ok.example)", "[x](https://ok.example)"),
+        ("![a [b]](http://tracker.example/x.png)", "a [b]"),
+        ("![alt][r]\n\n[r]: https://tracker.example/x.png", "[alt][r]\n\n[r]: https://tracker.example/x.png"),
+        ('[ok](https://a.example/c_(d) "t")', '[ok](https://a.example/c_(d) "t")'),
+    ],
+)
+def test_sanitize_markdown_handles_nested_brackets_and_reference_images(text: str, expected: str) -> None:
+    """Review round 1: CommonMark allows balanced brackets / parentheses in links and reference images."""
+    assert sanitize_markdown(text) == expected

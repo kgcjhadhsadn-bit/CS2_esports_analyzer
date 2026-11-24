@@ -36,7 +36,7 @@ from __future__ import annotations
 import math
 from collections.abc import Mapping
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Final
 
 import numpy as np
@@ -55,6 +55,8 @@ _ROUND_KEYS: Final[list[str]] = ["map_played_id", "round_number"]
 _ROUND_COLS: Final[list[str]] = ["map_played_id", "round_number", "player_id", "side"]
 _IN_CHUNK: Final[int] = 500
 ROLE_INFERRED_AT_KEY: Final[str] = "role_inferred_at"
+#: A label re-confirmed with an unchanged confidence gets a fresh timestamp at most this often.
+_REFRESH_AFTER: Final[timedelta] = timedelta(days=1)
 
 METRIC_COLUMNS: Final[tuple[str, ...]] = (
     "rounds",
@@ -527,7 +529,8 @@ def update_player_roles(
 
     ``roles`` lets the caller pass the result of :func:`infer_roles`; otherwise it is computed from
     the session. The session is flushed, not committed. Re-running with the same data changes
-    nothing (idempotent).
+    nothing and returns 0 (idempotent, also with ``as_of=None``); a label re-confirmed with the same
+    confidence only gets its ``role_inferred_at`` refreshed, at most once a day, and is not counted.
     """
     now = ensure_utc(as_of) if as_of is not None else utcnow()
     if roles is None:
@@ -542,13 +545,25 @@ def update_player_roles(
                 continue
             extra = player.extra if isinstance(player.extra, dict) else {}
             has_role = player.primary_role is not None and player.primary_role is not PlayerRole.UNKNOWN
+            inferred_at = _parse_iso(extra.get(ROLE_INFERRED_AT_KEY))
+            if (
+                has_role
+                and role is player.primary_role
+                and player.role_confidence is not None
+                and abs(confidence - float(player.role_confidence)) <= 1e-9
+            ):
+                # The same label re-confirmed by the same evidence: nothing changes (idempotent, also
+                # when ``as_of`` is "now" and the stored confidence has aged by a few seconds). The
+                # timestamp is refreshed at most once a day so a re-confirmed label does not age.
+                if inferred_at is None or now - inferred_at >= _REFRESH_AFTER:
+                    player.extra = {**extra, ROLE_INFERRED_AT_KEY: now.isoformat()}
+                continue
             if not has_role:
                 stored = -1.0
             elif player.role_confidence is None:
                 stored = unknown_stored_confidence
             else:
                 stored = float(player.role_confidence)
-                inferred_at = _parse_iso(extra.get(ROLE_INFERRED_AT_KEY))
                 if confidence_half_life_days and inferred_at is not None and now > inferred_at:
                     age_days = (now - inferred_at).total_seconds() / 86_400.0
                     stored *= 0.5 ** (age_days / confidence_half_life_days)

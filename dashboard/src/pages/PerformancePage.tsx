@@ -166,7 +166,14 @@ function PeriodChart({ rows }: { rows: PeriodPnl[] }) {
         <BarChart data={data} margin={{ top: 8, right: 16, bottom: 8, left: 8 }}>
           <CartesianGrid stroke={colors.grid} vertical={false} />
           <XAxis dataKey="period" {...axisProps(colors)} />
-          <YAxis tickFormatter={(v: number) => v.toFixed(0)} width={56} {...axisProps(colors)} />
+          {/* Bars grow from 0, so 0 must always be inside the domain (all-negative weeks otherwise
+              start the axis at the smallest loss and the bars look tiny). */}
+          <YAxis
+            domain={[(min: number) => Math.min(0, Math.floor(min)), (max: number) => Math.max(0, Math.ceil(max))]}
+            tickFormatter={(v: number) => v.toFixed(0)}
+            width={56}
+            {...axisProps(colors)}
+          />
           <ReferenceLine y={0} stroke={colors.axis} />
           <Tooltip
             cursor={{ fill: colors.grid, opacity: 0.4 }}

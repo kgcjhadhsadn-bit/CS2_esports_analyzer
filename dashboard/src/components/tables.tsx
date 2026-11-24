@@ -5,7 +5,7 @@ import { Link } from "react-router-dom";
 import type { BetOut, MatchBrief, MatchSummary } from "../api/types";
 import { formatDateTime, formatMoney, formatOdds, formatSignedPct, signClass, teamName } from "../lib/format";
 import { BetStatusBadge, CompletenessBadge, EvBadge, LinkBadge, MatchStatusBadge, TierBadge } from "./badges";
-import { Badge, Empty } from "./ui";
+import { Badge, Empty, toggleRowProps } from "./ui";
 
 export function MatchTitle({ match }: { match: Pick<MatchBrief, "id" | "team1" | "team2"> }) {
   return (
@@ -120,14 +120,13 @@ export function BetsTable({
               <Fragment key={b.id}>
                 <tr
                   className={`${onSelect ? "clickable" : ""} ${selected ? "expanded" : ""}`}
-                  onClick={onSelect ? () => onSelect(selected ? null : b.id) : undefined}
-                  aria-expanded={onSelect ? selected : undefined}
+                  {...toggleRowProps(onSelect ? () => onSelect(selected ? null : b.id) : undefined, selected)}
                 >
                   <td className="nowrap">{formatDateTime(b.placed_at ?? b.created_at)}</td>
-                  <td className="small">
+                  <td className="small" style={{ minWidth: 140 }}>
                     {b.match ? <MatchTitle match={b.match} /> : <span className="faint">{b.external_event_id}</span>}
                   </td>
-                  <td>
+                  <td style={{ minWidth: 170 }}>
                     {b.label}
                     {b.dry_run && (
                       <>

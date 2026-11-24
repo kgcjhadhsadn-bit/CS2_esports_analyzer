@@ -91,6 +91,18 @@ export function ChartTooltip<T>({
  * Probability histogram (bars = P(x)), with an optional reference line (e.g. a market line or
  * the mean) and per-bar colouring (e.g. team1 vs team2 side of a margin).
  */
+/** Integer axis ticks covering [min, max] with a "nice" step (at most ~12 ticks). */
+export function integerTicks(min: number, max: number, maxTicks = 12): number[] {
+  if (!Number.isFinite(min) || !Number.isFinite(max) || max < min) return [];
+  const lo = Math.ceil(min);
+  const hi = Math.floor(max);
+  const span = Math.max(hi - lo, 1);
+  const step = [1, 2, 3, 5, 10, 20, 25, 50, 100].find((s) => span / s <= maxTicks) ?? Math.ceil(span / maxTicks);
+  const ticks: number[] = [];
+  for (let t = Math.ceil(lo / step) * step; t <= hi; t += step) ticks.push(t);
+  return ticks;
+}
+
 export function Histogram({
   bars,
   xLabel,
@@ -108,15 +120,19 @@ export function Histogram({
 }) {
   const colors = useChartColors();
   const data = bars.map((b) => ({ ...b, fill: colorFor ? colorFor(b.x) : colors.series[0] }));
+  const xs = bars.map((b) => b.x);
+  const ticks = xs.length ? integerTicks(Math.min(...xs), Math.max(...xs)) : undefined;
   return (
     <div className="chart-box" style={{ height }} aria-label={`${xLabel} distribution`} role="img">
       <ResponsiveContainer width="100%" height="100%">
-        <BarChart data={data} margin={{ top: 8, right: 8, bottom: 16, left: 0 }} barCategoryGap={1}>
+        <BarChart data={data} margin={{ top: 18, right: 8, bottom: 16, left: 0 }} barCategoryGap={1}>
           <CartesianGrid stroke={colors.grid} vertical={false} />
           <XAxis
             dataKey="x"
             type="number"
             domain={["dataMin - 0.5", "dataMax + 0.5"]}
+            ticks={ticks}
+            interval={0}
             allowDecimals={false}
             {...axisProps(colors)}
             label={{ value: xLabel, position: "insideBottom", offset: -10, fill: colors.axis, fontSize: 12 }}

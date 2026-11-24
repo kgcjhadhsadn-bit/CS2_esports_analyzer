@@ -90,9 +90,10 @@ function FieldRow({
           type="button"
           className="btn btn-sm btn-ghost"
           onClick={() => onChange(toFormValue(defaultValue))}
+          disabled={value === toFormValue(defaultValue)}
           title="Put the default value in the field (save to apply)"
         >
-          Default
+          Reset
         </button>
       </td>
     </tr>

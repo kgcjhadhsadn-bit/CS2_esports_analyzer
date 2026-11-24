@@ -2,7 +2,7 @@
 
 > Written by the engineer who implemented the package. Reviewers update it when the public API changes.
 
-**Tests:** `.venv/bin/python -m pytest tests/models/sim -q` - 104 passed, 0 failed, about 25 s with `-n 2` (lint/type clean: True; updated in review round 1)
+**Tests:** `.venv/bin/python -m pytest tests/models/sim -q` - 116 passed, 0 failed, about 25 s with `-n 2` (lint/type clean: True; updated in review round 1, second pass)
 
 ## Summary
 
@@ -34,7 +34,7 @@ Match engine:
 - Every slot distribution is conditional on the slot being played.
 - Player kill pmfs for map:k, maps:1,2 (plus maps:1,2,3 for BO5) and match.
 - Top fragger comes from a joint series simulation with ties split evenly.
-- Runtime: a BO3 whose veto distribution covers all 7 maps, with 3 scenarios, 20k sims and 10 players, takes about 2.3-4.7 s (the 20 s target is met).
+- Runtime: a BO3 whose veto distribution covers all 7 maps, with 3 scenarios, 20k sims and 10 players, takes about 2.3-4.7 s (the 20 s target is met). Worst case measured in review round 1: a BO5 with 30 veto sequences and ten players without history (rate quadrature for every player) takes about 9 s.
 
 Decisions you may want to revisit:
 - Low/high use max(2000, n_sims // 2) simulations by default, which the spec allows if documented. Change it with scenario_n_sims.
@@ -110,6 +110,8 @@ Integration helpers (review round 1, adopt the foundation additions):
   - `RoundModel.default()` returns a model with prior parameters only.
 - `.fit(rounds: Iterable[RoundRecord], *, as_of: datetime | None = None, half_life_days: float | None = 365.0, rounds_per_half: int = 12, max_iter: int = 2000) -> RoundModel` (returns self).
   - Only rounds strictly before `as_of` are used.
+  - Every call starts from the priors (review round 1): estimates of an earlier `fit` never survive into a re-fit, so re-fitting one instance with an earlier `as_of` (backtests) cannot leak later data.
+  - Unusable rounds (unknown buys, a map name that normalises to empty, round number < 1, malformed values) are skipped and counted in `fit_stats["n_skipped"]`.
   - Missing buys are classified from equipment values; rounds whose buys stay unknown are skipped and counted in `fit_stats`.
 - Probabilities:
   - `.round_win_prob(a_side: Side | Sequence[Side] | NDArray[bool], buy_a: BuyType | Sequence[BuyType] | NDArray[int], buy_b, map_name: str, d: float | ArrayLike = 0.0) -> NDArray[float64]` (vectorised).
@@ -157,6 +159,7 @@ Integration helpers (review round 1, adopt the foundation additions):
   - `kills_distribution(...same...) -> KillsDistribution(pmf, mean, var)`.
   - `sample_kills(rate, own_rounds, opp_rounds, rng, *, margin_center=0.0, score_skew=0.0, hist_margin_var=0.12)`.
   - `effective_size(size, cv2, score_skew=0.0, hist_margin_var=0.0)`.
+- Constants (review round 1, second pass): `MIN_CV2_FOR_QUADRATURE = 0.004`, `RATE_QUADRATURE_NODES = 7` (used by the match engine's multi-map kill scopes).
 - Data classes:
   - `KillModelConfig` (frozen): `score_skew=0.3` (prior/default), `hist_margin_var=0.12` (default), `estimate_score_skew=True`, `score_skew_prior_sd=0.15`, `score_skew_bounds=(0.0, 1.0)`, `min_records_for_skew=200`, `normalise_teams=True`, `unknown_player_cv_mult=1.5`, `default_kpr=0.68`, shrinkage pseudo-counts, and more.
   - `PlayerRate` (frozen): `kpr`, `base_kpr`, `cv2`, `size`, `dpr`, `known`, `role`, `map_factor`, `opp_factor`, `team_scale`; `.scaled(f)`.
@@ -173,9 +176,10 @@ Integration helpers (review round 1, adopt the foundation additions):
 - `series_outcome(fmt: MatchFormat, p_maps: Sequence[float]) -> SeriesResult`, with `p_played: tuple[float, ...]`, `final: dict[(team1 maps, team2 maps), p]`, `.p_team1_win`, `.p_draw`, `.score_pmf()`.
 - `series_sum_pmf(fmt, p_maps, pmf_if_team1_wins, pmf_if_team2_wins) -> NDArray`.
 - `series_prefix_sum_pmf(fmt, p_maps, pmf_if_team1_wins, pmf_if_team2_wins, upto: int) -> tuple[float, NDArray]` **(review round 1)**: P(map `upto` is played) and the pmf of X_1 + ... + X_upto given that it is played.
+- `series_prefix_sum_pmfs(fmt, p_maps, pmf_if_team1_wins, pmf_if_team2_wins) -> list[tuple[float, NDArray]]` **(review round 1, second pass)**: the same for every `upto = 1..n_maps` in one pass (element `upto - 1`).
 - `played_mask(fmt, team1_won[n_maps, n]) -> NDArray[bool]`.
 
-`cs2bot.models.sim_stats` holds internal numerical helpers (NB pmf matrix, pmf utilities, `stable_seed`).
+`cs2bot.models.sim_stats` holds internal numerical helpers (NB pmf matrix, pmf utilities, `stable_seed`, and since review round 1 `gamma_quadrature(cv2, n_nodes=7) -> (nodes, weights)`: Gauss quadrature of a mean-one Gamma multiplier, exact for the first 2n-1 moments).
 
 ## Known limitations
 
@@ -184,7 +188,7 @@ Integration helpers (review round 1, adopt the foundation additions):
 - With default settings and equal teams the simulator gives about 22.3 rounds per map and about 14% overtime. That is somewhat more decisive than the synthetic generator (about 23.4 rounds, 18% overtime), because of the CS2 economy's momentum. Map-win probabilities still match the synthetic ground truth closely. Real-data calibration of the behaviour settings is recommended.
 - When the starting side is unknown, the engine uses an exact 50/50 mixture. It does not infer who chooses the side (the non-picking team, or 'Team B' on the decider under Valve rules); pass start_sides once they are known. This matters most for pistol and half markets.
 - The kills-score skew and the historical margin variance are estimated from `team_rounds_won` / `opponent_rounds_won` when at least 200 records carry them (review round 1); otherwise the documented defaults (0.3 / 0.12) are used.
-- Multi-map player-kill scopes assume maps are independent given the scenario, and treat the player's rate uncertainty as independent per map. This slightly understates the variance of multi-map totals for unknown players.
+- Multi-map player-kill scopes assume maps are independent given the scenario and the player's true rate. The rate's estimation uncertainty is shared by all maps (review round 1: Gamma quadrature for `cv2 >= MIN_CV2_FOR_QUADRATURE = 0.004`; below that it is folded into each map's NB size, which changes multi-map variances by < ~3 %).
 - Map-level draws (Premier's single-overtime limit) are not supported: professional rules (unlimited overtime) are assumed. Overtime beyond 3 periods (about 0.4% of maps) is simulated as full buy against full buy.
 - Low/high scenarios use max(2000, n_sims // 2) simulations by default (configurable via scenario_n_sims). They share common random numbers with each other but not with the central run.
 - DEFAULT_SIMULATOR is a process-global cache (about 0.8 MB per cached 20k-sim output with 16 race targets, 64 outputs by default, i.e. up to ~50 MB). It is thread-safe since review round 1.
@@ -229,3 +233,29 @@ Reviewer: independent review of the sim package against docs/dev/briefs/sim.md (
 - A BO5 prediction with 30 veto sequences and 10 players serialises to about 1.4 MB of JSON (1-16 race keys, many kill pmfs and scopes). Integration should keep that in mind when storing `match_analyses` payloads.
 - Behaviour parameters (BuyPolicy, RoundFlowParams) are still heuristics (see Known limitations). The round model only fits side/buy effects; real-data calibration is pending demo data.
 - Unknown starting sides are still an exact 50/50 mixture. Who chooses the side (the non-picking team) is not modelled.
+
+### Review round 1 - second independent pass
+
+A second reviewer re-checked the package (the first pass above was already in the report) and re-derived the logic instead of trusting it.
+
+**What I verified:**
+- Simulator invariants on 50k simulations for CT / T / unknown starting sides: every final score is a legal MR12/MR3 score (13-x with x <= 11, or 16+3k with a 2-4 round margin), the score pmf sums to 1, `p_neither_race_to[N]` equals P(max final score < N) exactly for N = 1..16, and P(team1 first to N) lies between its exact lower and upper bounds from the final scores.
+- The round-outcome logit (CT bias sign, pistol adjustment, buy table orientation), race snapshots after 2N-1 rounds in regulation and overtime, half-2 bookkeeping, OT side handling, loss-bonus streak, time-expiry loss bonus, plant/defuse/kill bonuses, the calibration root finder and the exact reweighting.
+- CS2 values: $10,000 overtime money (`mp_overtime_startmoney` default) and $600 plant bonus are consistent with current community references; both are configurable.
+- Series DP, slot conditioning and scope conventions against `cs2bot.domain.predictions` and `engine.pricing` (contract tests pass).
+- Empirical-Bayes algebra (Gamma posterior mean/variance, effective-sample factor, moment estimators) and that the folded NB size `1/s_eff = (1+1/s)(1+cv2)-1` gives exactly the hierarchical single-map variance.
+
+**Issues found:**
+1. (major, fixed) Multi-map player-kill scopes (`maps:1,2`, ..., `match`) and the joint top-fragger simulation treated a player's rate uncertainty as independent on every map. A player's true KPR is one number, so his kills on different maps are positively correlated: Cov(K1, K2) = cv2 E[K1] E[K2]. For players without history (role/global prior, cv2 about 0.06 on the synthetic universe) this understated the variance of a BO3 match total by about 25 % (119 instead of 160 kills squared; `maps:1,2,3` 97 instead of 157), i.e. over/under kill lines on stand-ins looked far more certain than they are. The engine now integrates the common multiplier with 7 Gauss-Gamma quadrature nodes (`sim_stats.gamma_quadrature`, Golub-Welsch, finite for large shapes where `scipy.special.roots_genlaguerre` overflows) for every player with `cv2 >= 0.004`; the top-fragger simulation draws one rate multiplier per player and series sample. Verified against a brute-force Monte Carlo of the hierarchical model (match-scope variance 160.03 vs 160.06).
+2. (major, fixed) `RoundModel.fit` kept the parameters of an earlier fit: re-fitting the same instance with an earlier `as_of` (a backtest) kept later-data estimates for maps without rounds before the cut-off, and a fit with no usable rounds returned the previous fit's parameters under a "priors only" note. Look-ahead leakage. Every fit now starts from the priors.
+3. (minor, fixed) `RoundModel.fit` had no per-record guard: a round whose map name normalises to empty was fitted as a pseudo-map "", and a malformed record could abort the fit. Such rounds (and round numbers < 1) are now skipped and counted.
+4. (minor, fixed) With an extreme map probability and few simulations, a run can contain no map won by one side; `reweighted` then cannot hit the target and the map probability silently stayed at 0 or 1. The engine now records a warning in `components["warnings"]`.
+5. (minor, fixed) Performance: the prefix scopes re-ran the series programme once per prefix. `series_prefix_sum_pmfs` computes every prefix in one pass (results identical); a worst-case BO5 (30 veto sequences, ten players without history) takes about 9 s.
+6. (doc, fixed) The match-engine docstring claimed common random numbers between the central and the low/high runs; that only holds when `scenario_n_sims == n_sims`.
+
+**Tests added** (tests/models/sim/test_sim_review_round1.py): quadrature moments, the multi-map covariance identity for an unknown and a known player, the one-pass prefix sums vs the single-prefix function for every format, the round-model re-fit without leakage, and skipping unusable rounds.
+
+**Remaining concerns:**
+- With the default `scenario_n_simulations = None` (n_sims // 2), low/high use different random numbers from the central run. The pricing sigma's curvature term then picks up Monte Carlo noise: measured 0.005-0.014 on strength-insensitive outcomes (map overtime, odd/even, half draw) vs 0.002-0.004 with `scenario_n_simulations = n_map_simulations`. That costs about 50 % more simulation time but stays well under the runtime target. It only inflates sigma (conservative), but a void-heavy scope (map 3) doubles it on the settled scale. Consider setting `scenario_n_simulations` equal to `n_map_simulations` in the owner's config.
+- `deaths_mean` ignores the score skew (deaths = DPR x rounds), so it is informational only. No market prices deaths.
+- The other concerns of the first pass still apply: behaviour parameters are heuristics, sides are a 50/50 mixture when unknown, and predictions are large JSON payloads.

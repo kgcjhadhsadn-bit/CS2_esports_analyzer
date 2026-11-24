@@ -131,7 +131,11 @@ POST_ROUND_SECONDS = 7.0  # mp_round_restart_delay: used when round_officially_e
 UTILITY_DAMAGE_WEAPONS: frozenset[str] = frozenset({"hegrenade", "inferno", "molotov", "incgrenade"})
 # Deaths caused by the bomb blast (or the map) are never a player's kill, whoever the event names as
 # the attacker: the scoreboard and HLTV credit nobody with them. They still count as deaths.
-NON_KILL_WEAPONS: frozenset[str] = frozenset({"planted_c4", "c4", "world", "trigger_hurt"})
+# The stored kill row of such a death names no attacker (no steam id, side, place or position):
+# consumers of the ``kills`` table (datasets, features.roles, the aggregates) count every row whose
+# attacker and victim sides differ as a kill, so a planter named as the attacker of a bomb-blast
+# death would otherwise be credited with a kill there.
+NON_KILL_WEAPONS: frozenset[str] = frozenset({"planted_c4", "c4", "world", "worldspawn", "trigger_hurt"})
 
 EVENT_NAMES: tuple[str, ...] = (
     "round_start",
@@ -1311,15 +1315,19 @@ def _parse(
                 assister.assists += 1
                 if not death.flash_assisted:
                     assister.kast_assists += 1
+            # Bomb blast / world deaths are nobody's kill: the row names no attacker (see NON_KILL_WEAPONS).
+            blamed = death.weapon not in NON_KILL_WEAPONS
+            attacker_side = death.attacker_side if blamed else None
+            attacker_pos = death.attacker_pos if blamed else (None, None, None)
             kill_rows.append(
                 {
                     "round_number": rnd.number,
                     "tick": death.tick,
                     "seconds_into_round": max(0.0, (death.tick - rnd.freeze_tick) / tick_rate),
-                    "attacker_steamid": death.attacker,
+                    "attacker_steamid": death.attacker if blamed else None,
                     "victim_steamid": death.victim,
                     "assister_steamid": death.assister,
-                    "attacker_side": death.attacker_side.value if death.attacker_side else None,
+                    "attacker_side": attacker_side.value if attacker_side else None,
                     "victim_side": death.victim_side.value if death.victim_side else None,
                     "weapon": death.weapon,
                     "headshot": death.headshot,
@@ -1328,15 +1336,15 @@ def _parse(
                     "noscope": death.noscope,
                     "attacker_blind": death.attacker_blind,
                     "flash_assisted": death.flash_assisted,
-                    "attacker_place": death.attacker_place if death.attacker is not None else None,
+                    "attacker_place": death.attacker_place if blamed and death.attacker is not None else None,
                     "victim_place": death.victim_place,
-                    "attacker_x": death.attacker_pos[0],
-                    "attacker_y": death.attacker_pos[1],
-                    "attacker_z": death.attacker_pos[2],
+                    "attacker_x": attacker_pos[0],
+                    "attacker_y": attacker_pos[1],
+                    "attacker_z": attacker_pos[2],
                     "victim_x": death.victim_pos[0],
                     "victim_y": death.victim_pos[1],
                     "victim_z": death.victim_pos[2],
-                    "distance": _distance(death.attacker_pos, death.victim_pos),
+                    "distance": _distance(attacker_pos, death.victim_pos),
                     "is_opening": death.is_opening,
                     "is_trade": death.is_trade,
                     "was_traded": death.was_traded,

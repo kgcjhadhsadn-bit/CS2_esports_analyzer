@@ -3,20 +3,25 @@
 from __future__ import annotations
 
 from collections.abc import Iterator
+from datetime import timedelta
 from pathlib import Path
 
+import pandas as pd
 import pytest
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session, sessionmaker
 
 from cs2bot.config import DemoSettings, Settings
 from cs2bot.db.base import Base
-from cs2bot.db.models import Demo
+from cs2bot.db.models import Demo, DuelAggregate, Kill, PositionAggregate
 from cs2bot.db.session import make_engine
 from cs2bot.domain.enums import DemoStatus
+from cs2bot.ingest.demos.aggregates import rebuild_duel_aggregates, rebuild_position_aggregates
 from cs2bot.ingest.demos.parse import ParsedDemo, parse_demo
+from cs2bot.ingest.demos.persist import persist_parsed_demo
 from cs2bot.ingest.demos.pipeline import PipelineOptions, process_pending_demos
 from tests.ingest.demos.demos_builders import DemoBuilder, FakeParser, H, K, factory_for, sid
-from tests.ingest.demos.demos_db import seed_match
+from tests.ingest.demos.demos_db import PLAYED_AT, seed_match
 
 DEMO_MAGIC = b"PBDEMS2\x00"
 
@@ -78,6 +83,56 @@ def test_bomb_blast_death_is_a_death_but_nobody_s_kill() -> None:
     assert int(first.loc[sid("a1"), "deaths"]) == 1
     kill = parsed.kills.iloc[0]
     assert not kill["is_enemy_kill"] and not kill["is_opening"]
+
+
+def _bomb_blast_demo() -> DemoBuilder:
+    """Round 1: b1 plants and the blast kills a1; the event names the planter as the attacker."""
+    builder = DemoBuilder()
+    builder.add_round(
+        "T",
+        "bomb_exploded",
+        kills=[K(20, "a2", "b2"), K(50, "b1", "a1", weapon="planted_c4")],
+        plant=(30, "b1", 292),
+    )
+    builder.add_rounds("CCCCCCCCCCCC")
+    return builder
+
+
+def test_bomb_blast_kill_row_names_no_attacker() -> None:
+    """Consumers of ``kills`` count every row with differing sides as a kill (review round 1, pass 2)."""
+    parsed = parse(_bomb_blast_demo())
+    blast = parsed.kills[parsed.kills["weapon"] == "planted_c4"].iloc[0]
+    assert blast["attacker_steamid"] is None
+    assert pd.isna(blast["attacker_side"]) and pd.isna(blast["attacker_place"]) and pd.isna(blast["distance"])
+    assert blast["victim_steamid"] == sid("a1") and blast["victim_side"] == "ct"
+    gun = parsed.kills[parsed.kills["weapon"] == "ak47"].iloc[0]
+    assert gun["attacker_steamid"] == sid("a2") and gun["attacker_side"] == "ct"
+
+
+def test_bomb_blast_death_is_no_kill_in_the_stored_rows_and_aggregates(session: Session) -> None:
+    seeded = seed_match(session)
+    parsed = parse(_bomb_blast_demo())
+    persist_parsed_demo(session, seeded.map_ids[1], parsed, seeded.steamid_map)
+    blast = session.scalars(select(Kill).where(Kill.weapon == "planted_c4")).one()
+    assert blast.attacker_player_id is None and blast.attacker_side is None
+    assert blast.victim_player_id == seeded.player_ids["a1"]
+
+    as_of = PLAYED_AT.date() + timedelta(days=1)
+    rebuild_duel_aggregates(session, as_of=as_of)
+    planter, victim = seeded.player_ids["b1"], seeded.player_ids["a1"]
+    duel = session.scalars(
+        select(DuelAggregate).where(
+            DuelAggregate.player_id == planter, DuelAggregate.opponent_player_id == victim
+        )
+    ).all()
+    assert duel == []
+    rebuild_position_aggregates(session, as_of=as_of)
+    planter_kills = session.scalar(
+        select(func.coalesce(func.sum(PositionAggregate.kills), 0)).where(
+            PositionAggregate.player_id == planter
+        )
+    )
+    assert planter_kills == 0
 
 
 # ------------------------------------------------------------------------------------------ pipeline

@@ -225,8 +225,11 @@ def refresh_match_context(
         session.flush()
     else:
         log.warning("match %s is not in the database - context flags were not persisted", ctx.match_id)
+    # Read back from the database: the result then also carries flags the owner set by hand
+    # (``store.MANUAL_FLAG_MODEL``), exactly as on the "db" / "stale" paths.
+    flags = load_active_flags(session, ctx.match_id, now=current) if match is not None else outcome.flags
     return ContextRefresh(
-        active_flags(outcome.flags, now=current),
+        active_flags(flags, now=current),
         LLMStatus.OK,
         "memo" if outcome.from_cache else "llm",
         note=outcome.note,

@@ -66,6 +66,7 @@ from cs2bot.ingest.hltv.sync.common import (
     SOURCE,
     HLTVSyncOptions,
     PageSource,
+    drop_cached,
     fetch_page,
     in_scope,
     merge_extra,
@@ -125,6 +126,7 @@ def sync_match(
     url_hint: str | None = None,
     hints: Mapping[str, Any] | None = None,
     expect_finished: bool = False,
+    now: datetime | None = None,
 ) -> SyncReport:
     """Fetch + persist one HLTV match (and its map stats pages when ``with_mapstats``).
 
@@ -133,8 +135,14 @@ def sync_match(
     match's orientation. Never raises for page/DB problems of this match: they end up in the report.
     ``expect_finished`` (set by :func:`sync_results`) re-fetches once if the cached page still shows
     the match as upcoming / live.
+
+    ``Match.extra['hltv']['complete']`` (finished matches are skipped by later :func:`sync_results`
+    runs) is only set once the page is final: every played map's stats page was synced and HLTV shows
+    the GOTV demo link and every stats link - or the match started ``HLTVSyncOptions.finalize_after_hours``
+    before ``now`` (some matches never get a demo). Demo and stats links appear after "Match over".
     """
     opts = options or HLTVSyncOptions()
+    current = now or utcnow()
     report = SyncReport(job="hltv.sync_match")
     base_url = settings.hltv.base_url
     path = url_hint or match_path(hltv_match_id)
@@ -150,6 +158,7 @@ def sync_match(
                 return report
             page = parse_match_page(fresh, absolute_url(path, base_url), base_url=base_url)
     except HLTVParseError as exc:
+        drop_cached(fetcher, path)
         report.failed += 1
         report.add_error(f"{what}: {exc}")
         return report
@@ -159,7 +168,7 @@ def sync_match(
     report.warnings.extend(f"{what}: {w}" for w in page.warnings)
     try:
         with session.begin_nested():
-            orient = _persist_match_page(session, page, settings, opts, report, hints or {})
+            orient = _persist_match_page(session, page, settings, opts, report, hints or {}, current)
     except Exception as exc:  # one broken match must never abort a whole sync
         logger.exception("persisting HLTV match %s failed", hltv_match_id)
         report.failed += 1
@@ -192,10 +201,22 @@ def sync_match(
                 break
     finished = page.status in (HLTVMatchStatus.FINISHED, HLTVMatchStatus.DELETED)
     needs_stats = any(m.state is MapState.PLAYED and m.mapstats_id is not None for m in page.maps)
-    complete = finished and (not needs_stats or (with_mapstats and mapstats_ok))
+    stats_done = not needs_stats or (with_mapstats and mapstats_ok)
+    complete = finished and stats_done and _is_final(page, match, opts, current)
     match.extra = merge_extra(match.extra, {"complete": complete})
     session.flush()
     return report
+
+
+def _is_final(page: MatchPage, match: Match, opts: HLTVSyncOptions, now: datetime) -> bool:
+    """No more data will appear on this finished match page (see :func:`sync_match`)."""
+    if page.status is HLTVMatchStatus.DELETED:
+        return True
+    started = page.scheduled_at or match.scheduled_at
+    if started is not None and now - started >= timedelta(hours=opts.finalize_after_hours):
+        return True
+    links_missing = any(m.state is MapState.PLAYED and m.mapstats_id is None for m in page.maps)
+    return bool(page.demos) and not links_missing
 
 
 def _persist_match_page(
@@ -205,6 +226,7 @@ def _persist_match_page(
     opts: HLTVSyncOptions,
     report: SyncReport,
     hints: Mapping[str, Any],
+    now: datetime,
 ) -> _Orientation | None:
     what = f"match {page.hltv_match_id}"
     if page.team1 is None or page.team2 is None:
@@ -238,7 +260,6 @@ def _persist_match_page(
             report.failed += 1
             report.add_error(f"{what}: linked match {match.id} has different teams; not touching it")
             return None
-    now = utcnow()
     _apply_match_fields(session, match, page, orient, tournament, settings, team1, team2, hints, now)
     session.flush()
     _sync_vetoes(session, match, page, orient)
@@ -248,7 +269,14 @@ def _persist_match_page(
     if page.rank_date is not None:
         for team, rank in ((team1, page.team1_rank), (team2, page.team2_rank)):
             if rank is not None:
-                record_team_rank(session, team, rank, page.rank_date)
+                record_team_rank(
+                    session,
+                    team,
+                    rank,
+                    page.rank_date,
+                    current_max_age_days=opts.current_rank_max_age_days,
+                    now=now,
+                )
     session.flush()
     if created:
         report.created += 1
@@ -303,10 +331,16 @@ _STATUS_RANK = {
 
 
 def _merge_status(current: MatchStatus | None, new: MatchStatus) -> MatchStatus:
-    """Never move a finished match back; a cancelled match may still turn out finished."""
+    """Never move a finished match back; a cancelled match may still turn out finished.
+
+    A live match is not moved back to SCHEDULED either (a match page cached shortly before kick-off,
+    or HLTV lagging behind PandaScore): code that only acts before the start must keep seeing it live.
+    """
     if current is None:
         return new
     if current is MatchStatus.FINISHED and new is not MatchStatus.FINISHED:
+        return current
+    if current is MatchStatus.LIVE and new is MatchStatus.SCHEDULED:
         return current
     if current is MatchStatus.CANCELED and _STATUS_RANK[new] < _STATUS_RANK[MatchStatus.CANCELED]:
         return current
@@ -559,6 +593,7 @@ def sync_mapstats(
     try:
         page = parse_mapstats_page(html, absolute_url(path, base_url))
     except HLTVParseError as exc:
+        drop_cached(fetcher, path)  # cached for a month otherwise
         report.failed += 1
         report.add_error(f"{what}: {exc}")
         return report
@@ -1019,7 +1054,7 @@ def sync_results(
         new_on_page = 0
         complete_on_page = 0
         for row in rows:
-            if row.played_at is not None and row.played_at < since:
+            if _older_than(row, since):
                 reached_old = True
                 continue
             existing = session.scalar(select(Match).where(Match.hltv_id == row.hltv_match_id))
@@ -1045,6 +1080,16 @@ def sync_results(
             break
     report.details.update({"pages": pages, "since": since.isoformat(), "matches_synced": synced})
     return report
+
+
+def _older_than(row: ResultRow, since: datetime) -> bool:
+    """The row was played before ``since``. A date-only row (no start time on the page) only counts
+    as older once its whole day is: otherwise a ``since`` inside that day would end the walk early."""
+    if row.played_at is None:
+        return False
+    if row.played_at_is_date_only:
+        return row.played_at + timedelta(days=1) <= since
+    return row.played_at < since
 
 
 def _sync_listed_match(
@@ -1115,6 +1160,7 @@ def sync_upcoming(
                 options=opts,
                 url_hint=row.url,
                 hints={"stars": row.stars},
+                now=current,
             )
         )
         if report.blocked:

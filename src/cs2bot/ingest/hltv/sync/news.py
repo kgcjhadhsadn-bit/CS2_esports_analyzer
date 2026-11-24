@@ -18,6 +18,7 @@ from cs2bot.ingest.hltv.parsers import parse_news_article, parse_news_list
 from cs2bot.ingest.hltv.sync.common import (
     HLTVSyncOptions,
     PageSource,
+    drop_cached,
     fetch_page,
     merge_extra,
     source_base_url,
@@ -182,6 +183,7 @@ def sync_news(
             try:
                 article = parse_news_article(article_html, row.url)
             except HLTVParseError as exc:
+                drop_cached(fetcher, row.url)  # articles are cached for a month
                 report.failed += 1
                 report.add_error(f"news {row.url}: {exc}")
                 continue

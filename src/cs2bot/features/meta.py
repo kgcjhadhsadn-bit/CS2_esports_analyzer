@@ -199,6 +199,21 @@ class PatchTimeline:
             return math.nan
         return (ensure_utc(as_of) - p.effective_at).total_seconds() / _SECONDS_PER_DAY
 
+    def days_since_pool_change(self, as_of: dt.datetime) -> float:
+        """Days since the last Active Duty change: an entry of kind ``map_pool`` that lists the new
+        pool. Entries of that kind without a ``map_pool`` (a map added to the game, not to the
+        competitive pool) are not pool changes. NaN before the first change."""
+        t = ensure_utc(as_of)
+        found: Patch | None = None
+        for p in self.patches:
+            if p.effective_at > t:
+                break
+            if p.kind == "map_pool" and p.map_pool:
+                found = p
+        if found is None:
+            return math.nan
+        return (t - found.effective_at).total_seconds() / _SECONDS_PER_DAY
+
     def patch_id(self, as_of: dt.datetime, *, min_impact: Impact = "minor") -> str | None:
         p = self.last_patch(as_of, min_impact=min_impact)
         return p.id if p is not None else None

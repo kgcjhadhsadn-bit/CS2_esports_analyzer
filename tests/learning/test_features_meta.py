@@ -134,6 +134,15 @@ def test_patch_lookups():
     assert patch_id(change) == "2024-04-25-dust2-in-overpass-out"
     assert "dust2" in timeline.map_pool_at(change) and "dust2" not in timeline.map_pool_at(change - DAY)
     assert timeline.days_since_last_patch(change + 3 * DAY, kinds=("map_pool",)) == pytest.approx(3.0)
+    assert timeline.days_since_pool_change(change + 3 * DAY) == pytest.approx(3.0)
+    assert math.isnan(timeline.days_since_pool_change(change - DAY))
+    # review round 1: "Train added to the game" (kind map_pool, no new pool) is not a pool change
+    train_added = datetime(2024, 11, 13, tzinfo=UTC)
+    assert patch_id(train_added) == "2024-11-13-train-returns"
+    expected = (train_added + DAY - change).days
+    assert timeline.days_since_pool_change(train_added + DAY) == pytest.approx(expected)
+    store = FeatureStore.build([], patch_timeline=timeline)
+    assert store.meta_features(train_added + DAY)["days_since_pool_change"] == pytest.approx(expected)
     # minor patches are skipped by the default "moderate" filter but visible on request
     feb = datetime(2024, 2, 20, tzinfo=UTC)
     assert patch_id(feb) == "2024-02-06-call-to-arms"

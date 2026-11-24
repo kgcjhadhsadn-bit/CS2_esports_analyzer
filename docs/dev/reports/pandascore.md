@@ -1,6 +1,6 @@
 # pandascore: implementation report
 
-**Tests:** `.venv/bin/python -m pytest tests/ingest/pandascore -q` - 147 passed, 0 failed (ruff check / ruff format --check / mypy clean on `src/cs2bot/ingest/pandascore`, `src/cs2bot/ingest/scope.py`; `tests/foundation` still passes)
+**Tests:** `.venv/bin/python -m pytest tests/ingest/pandascore -q` - 168 passed, 0 failed (ruff check / ruff format --check / mypy clean on `src/cs2bot/ingest/pandascore`, `src/cs2bot/ingest/scope.py`; `tests/foundation` still passes)
 
 ## Summary
 
@@ -57,11 +57,16 @@ PandaScoreClient(settings: PandaScoreSettings, *, http_client: httpx.Client | No
   .has_token -> bool ; .ensure_token() -> None ; .stats: ClientStats ; .close() ; context manager
 ```
 
+- Ids / slugs passed to the single-resource methods must be safe URL path segments (non-negative int, or
+  `[A-Za-z0-9_-][A-Za-z0-9_.-]*` without `..`); anything else raises `ValueError` before any request.
+- Server error text quoted in exceptions has the API token masked (`***`) should the server echo it.
+
 - `ClientStats`: `requests`, `retries`, `pages`, `invalid_items`, `rate_limit_remaining` (last `X-Rate-Limit-Remaining`).
 - Default limiter: `utils.http.RateLimiter` with a gap of `3600 / settings.max_requests_per_hour` seconds between requests (3.6 s at the default 1000/h). Set `CS2BOT_PANDASCORE__MAX_REQUESTS_PER_HOUR=10000` on the historical / real-time plans.
 - A malformed list item is skipped and passed to `on_invalid(raw, exc)` (or logged); it never aborts the list.
   This includes out-of-range numeric timestamps and non-hashable ids. `paginate` stops when a
-  page only repeats rows already yielded (a server ignoring `page[number]` cannot loop it forever).
+  non-empty page brings no new object (only rows already yielded, or only non-object garbage), so a
+  server ignoring `page[number]` cannot loop it forever.
 - `format_timestamp(dt) -> str` gives the `2026-11-21T00:00:00Z` form used in `range[...]`.
 - Errors, all subclasses of `PandaScoreError`:
   - `PandaScoreAuthError`: no token configured (raised before any request) or HTTP 401.
@@ -107,7 +112,12 @@ pandascore_round_records(session, map_played: MapPlayed) -> list[RoundRecord]   
 
 - Status merge with HLTV: PandaScore's status wins, except that it never re-opens a match HLTV saw
   finished, nor one HLTV deleted (`extra['hltv']['status'] == "deleted"`, stored CANCELED) unless
-  PandaScore reports it finished.
+  PandaScore reports it finished, and it never moves a match HLTV sees live (`extra['hltv']['status']
+  == "live"`) back to SCHEDULED (PandaScore's `not_started` lags the real start; SCHEDULED is bettable).
+- A match PandaScore moves from finished to canceled loses its series score and winner (unless HLTV
+  holds a final result); a walkover winner is only ever in `extra['pandascore']`.
+- `now` may be naive (taken as UTC). `sync_match` with an id that is not a safe path segment records an
+  error instead of raising.
 - `sync_upcoming`: not-started matches of the next `settings.scope.max_hours_ahead` hours plus running matches. Open matches we store that vanished from both lists are re-fetched one by one (at most 40 per run); that is how results, cancellations and far-away reschedules arrive. Run it on the scheduler's `upcoming_sync_min` interval.
 - `sync_past`: matches that began in `[since, until]`, oldest first, in 30-day windows. It is both the results job (`since = now - 2 days`) and the backfill (`since = settings.scope.backfill_start`, with `commit_every`).
 - `sync_match`: one match with game details and rosters whatever its scope.
@@ -121,7 +131,7 @@ pandascore_round_records(session, map_played: MapPlayed) -> list[RoundRecord]   
 |---|---|---|
 | `videogame_title` | `"cs-2"` | `filter[videogame_title]` on the lists; payloads of another title are skipped |
 | `match_link_window_hours` | `12.0` | `db.repo.find_match` window for linking a match HLTV created |
-| `store_out_of_scope` | `True` | keep out-of-scope matches too (no extra API calls); `False` skips them |
+| `store_out_of_scope` | `True` | keep out-of-scope matches too (no extra API calls); `False` skips them (the pre-check also sees HLTV-only teams by alias and an in-scope HLTV row it would link) |
 | `game_details` | `"in_scope"` | `/csgo/matches/{id}/games` for finished matches: `"in_scope"`, `"all"`, `"never"` |
 | `rosters` | `"in_scope"` | `/tournaments/{id}/rosters` for lineups: same three modes |
 | `lineup_size` | `5` | a roster becomes the expected lineup only with exactly this many (active) players |
@@ -130,7 +140,7 @@ pandascore_round_records(session, map_played: MapPlayed) -> list[RoundRecord]   
 | `include_running` | `True` | `sync_upcoming` also reads `/matches/running` |
 | `reconcile_missing`, `reconcile_lookback_hours`, `max_reconcile` | `True`, `72.0`, `40` | re-fetch of vanished open matches |
 | `current_team_window_days` | `30` | older matches never move `Player.current_team_id` |
-| `games_final_after_hours` | `48.0` | incomplete game stats are re-fetched until the match is this old |
+| `games_final_after_hours` | `48.0` | game stats are re-fetched until every announced map is there with final stats, or the match is this old |
 | `past_window_days` | `30` | window size of `sync_past` (`None` = one request series) |
 | `max_pages`, `commit_every` | `None`, `None` | page cap per list; commit after every N matches |
 
@@ -272,3 +282,71 @@ scope rule and the as-of-date rank history (no look-ahead from today's rank for 
 - `refresh_match_scope` is sticky, and recent matches (< 45 days) use today's rank: a mild selection
   effect for datasets, documented in `scope.py`.
 - Everything is still unverified against the live API (no token); see "Known limitations".
+
+## Review round 1 (second pass)
+
+A second independent pass over the whole package (brief incl. Addendum, foundation contracts, the HLTV
+package's status merge and scope calls, the decision engine's bettable statuses). Every new finding
+was first reproduced with a failing test, then fixed; all 21 new tests in
+`tests/ingest/pandascore/test_pandascore_review2.py` fail on the code before this pass. Checks re-run:
+168 tests pass (`-n 2`, ~8 s); ruff check / format and mypy clean on the owned paths;
+`tests/foundation` and `tests/ingest/hltv` (which imports `ingest.scope`) pass.
+
+**Verified (no change needed):** status / format / tier / LAN / prize-pool tables (`first_to 2` = BO3,
+`best_of 2` / `all_games_played 2` = BO2); CS2 overtime arithmetic and CT/T splits from the round
+history in swapped orientation; series score and map winners by team id (orientation-free); linking
+to HLTV rows (`_link_candidate` never steals a row another PandaScore match owns); the scope rule and
+the as-of-date rank lookup; idempotency (the existing double-run tests plus the new ones); retry /
+`Retry-After` handling; the token never reaching URLs, logs or `repr`.
+
+**Issues found and fixed:**
+
+1. (major) Game details were marked final (`games_synced_for`) when the games endpoint returned an
+   empty or partial list right after a match: `all()` over no finished games is True. The maps were
+   then never fetched again while the match's `modified_at` stayed the same. Final now requires every
+   map the match payload announces (finished games in the list payload, else the series score) with
+   final stats; otherwise the match is re-fetched until `games_final_after_hours`. Tests:
+   `test_empty_games_list_right_after_the_match_is_fetched_again`, `test_partial_games_list_is_not_final`,
+   `test_empty_games_list_becomes_final_once_the_match_is_old`.
+2. (major, money safety) For an HLTV-linked match HLTV already saw live, PandaScore's lagging
+   `not_started` moved the row back to SCHEDULED (and HLTV moved it to LIVE again on its next run).
+   SCHEDULED is in the decision engine's `BETTABLE_MATCH_STATUSES`, so a running match could be priced
+   as pre-match. The row now stays LIVE while HLTV says live; PandaScore-only matches still follow
+   PandaScore. Tests: `test_lagging_not_started_does_not_reopen_a_match_hltv_sees_live`,
+   `test_pandascore_only_match_follows_pandascore_back_to_scheduled`.
+3. (major) A result PandaScore withdrew (finished -> canceled) kept its series score and winner on a
+   CANCELED row; settlement could act on the stale winner. Cleared now unless HLTV holds a final
+   result. Test: `test_result_withdrawn_by_a_cancellation_is_cleared`.
+4. (major) `paginate` looped forever on a server that keeps sending `rel="next"` with pages holding no
+   JSON object (the earlier repeat guard only fired when there was at least one object). Test:
+   `test_pagination_stops_on_a_page_without_any_object`.
+5. (minor) A naive `now` made every match fail (`can't compare offset-naive and offset-aware
+   datetimes`); it is now taken as UTC. Test: `test_naive_now_is_taken_as_utc`.
+6. (minor) `store_out_of_scope=False` looked up team ranks by PandaScore id only, so a match of a
+   top-N team only HLTV knew (no PandaScore id yet), or a row HLTV had already put in scope, was
+   skipped. The pre-check now also finds unlinked teams by exact alias and accepts an in-scope link
+   candidate. Tests: `test_store_out_of_scope_false_sees_hltv_only_top_teams`,
+   `test_store_out_of_scope_false_links_an_in_scope_hltv_row`.
+7. (minor, security hardening) Ids were interpolated into URL paths unchecked (`"../teams/1"` reached
+   another endpoint); the single-match fallback trusted the first row even if a server ignored
+   `filter[id]`; server error text was quoted verbatim (a server echoing the token would have put it
+   into an exception / the job report). Ids are now validated, the fallback checks the id, the token
+   is masked. Tests: `test_ids_that_are_not_safe_url_path_segments_are_refused`,
+   `test_sync_match_reports_an_invalid_id`,
+   `test_single_match_fallback_ignores_a_server_that_ignores_the_filter`,
+   `test_a_token_echoed_by_the_server_is_masked`.
+8. (minor) Game positions outside 1..9 created nonsensical `maps_played.map_number` rows; such games
+   are now skipped. Exception texts recorded in the report are truncated to 300 characters (SQL errors
+   can be huge). Test: `test_absurd_map_positions_are_ignored`.
+
+**Remaining concerns (not fixed):**
+
+- Everything in the first pass's "Remaining concerns" still applies (HLTV re-listing a rescheduled
+  match under a new id; a team change on an HLTV-linked row is reported as an error on every run;
+  sticky scope; no live API verification).
+- `sync_upcoming` re-fetches every open match that is missing from the lists on every run (postponed,
+  or delayed more than an hour), up to `max_reconcile` (40) per run until it leaves the 72 h lookback.
+  At the default 30-minute interval that is at most ~80 requests/hour - affordable, but a
+  per-match back-off would save quota.
+- The new LIVE rule relies on HLTV's own next sync to move a match it wrongly saw live back to
+  scheduled; until then the match is not bettable (the safe direction).

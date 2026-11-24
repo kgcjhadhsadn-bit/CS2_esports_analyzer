@@ -1,6 +1,6 @@
 # ratings_veto: implementation report
 
-**Tests:** `.venv/bin/python -m pytest tests/models/ratings_veto -q` - 180 passed, 0 failed (about 20 s with `-n 2`; lint/type clean: True; 174 before review round 1)
+**Tests:** `.venv/bin/python -m pytest tests/models/ratings_veto -q` - 183 passed, 0 failed (about 45 s with `-n 2` on the shared machine; lint/type clean: True; 174 before review round 1)
 
 ## Summary
 
@@ -240,7 +240,7 @@ Incremental use between trainings: `ratings.update(record)` and `veto.update(rec
 ## Foundation change requests
 
 - `docs/ARCHITECTURE.md`, P5 section: update the `predict_sequences` signature to `top_k: int | None = 50, as_of=None, map_advantage=None, template=None, preserve_marginals=True`, and mention `WalkForwardRatings` / `record_history=True` as the leakage-free provider for historical rows.
-- `docs/dev/STATUS.md`: set ratings_veto to done with 180 tests, reviewed (round 1).
+- `docs/dev/STATUS.md`: set ratings_veto to done with 183 tests, reviewed (round 1).
 - `src/cs2bot/models/__init__.py` (shared, not edited): optionally re-export `MapRatingModel`, `RatingConfig`, `WalkForwardRatings`, `VetoModel`, `VetoConfig`.
 
 ## New dependency requests
@@ -263,6 +263,39 @@ Issues found:
 2. **Minor, fixed - `predict_for_sequences` sigma for mixed pickers** was the weighted average of the scenario sigmas, which ignores the spread between the scenario means; it is now the mixture standard deviation (law of total variance). Test updated.
 3. **Minor, fixed - negative round counts** (malformed external data) were scored as `s = 0.5` updates (`mov_score` returns 0.5 for a non-positive total) instead of being skipped. `update` now returns `False` for them and `evaluate_walk_forward` skips them. Test added.
 4. **Minor, fixed - 2-3-1 BO1 vetoes with the default template.** Published steps whose teams contradict the alternating BO1 order kept the template's actors for the remaining steps (e.g. step 5 predicted for team1 after team1, team1, team2, team2). Without `template=`, known steps that do not fit the default order but fit `BO1_TEMPLATE_2_3_1` now switch to it (an explicit `template=` always wins). Test added.
+
+Second pass (same round, after the work above had been saved). I re-ran every check, re-read all
+four modules against the brief and the paper, and tried to break them: a 3,000-record fuzz of the
+rating model (random teams, maps incl. blank and unknown names, scores incl. 13-13 / negative /
+100-2 / 1-0, lineups of 0-6 players, LAN, tiers, pickers, time gaps of 0 s to 400 days) under the
+default, an all-features-on and an overall-only config (no exception, every `p` in (0, 1), every
+component finite, save/load gives identical predictions); a 2,000-map 13-0 streak (stable, p =
+0.9996); a 400-record malformed veto fuzz (duplicate / zero / out-of-range step numbers, blank map
+names, empty pools, advantage callables returning NaN / inf / 1e9 or raising) followed by 400 random
+`predict_sequences` calls (every result sums to 1 with the format's map count and no repeated map;
+the only exceptions are the documented `ValueError`s for pools too small for the format or known
+steps that cannot fit the pool); slot marginals of the default 50-sequence list against the full
+distribution for BO3 / BO5 with known and unknown first veto (max error 2e-15; 0.02-0.34 s).
+Further issues:
+
+5. **Minor, fixed - blank map names created a shared `""` map offset.** A record whose map name
+   normalises to an empty string (malformed source data) updated an offset keyed `""`, lumping
+   unrelated maps together. Such records now update the overall ratings only. Test added.
+6. **Minor, fixed - `evaluate_walk_forward` scored duplicate rows twice.** The same
+   `(match_id, map_number)` delivered twice was processed once by `update` but predicted twice,
+   biasing `tune` toward matches with duplicated rows. Duplicates are now scored once. Test added.
+7. **Minor, fixed - `predict_for_sequences` dropped maps when `pickers` was shorter than `maps`**
+   (`zip(strict=False)`); missing pickers now count as unknown (`None`), as in the match engine.
+   Test added.
+
+Checks after the second pass: 183/183 package tests, `ruff check`, `ruff format --check` and `mypy`
+clean on the owned paths, 37/37 foundation tests, `tests/learning/test_features_rows.py` (the
+rating-provider consumer) passes. Public API unchanged.
+
+Not a defect of this package, noted for the integration work: `build_match_prediction` merges
+sequences with the same map order and keeps the first sequence's pickers, so with an unknown first
+veto the engine's per-sequence pickers are not meaningful (it does not use them today); per-map
+picker information should come from `predict_for_sequences`, which aggregates them correctly.
 
 Remaining concerns (not changed):
 - `_check_as_of` makes one future-dated result block every prediction (already listed under known limitations; the wiring's `fit_until(records, now)` avoids it).

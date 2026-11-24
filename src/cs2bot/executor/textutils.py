@@ -172,6 +172,8 @@ def names_compatible(shown: str, wanted: str, *, min_len: int = 3) -> bool:
     """Loose check that a bet-slip label refers to the wanted selection (both normalised).
 
     Equal, or one contains the other as whole words (the shorter one at least ``min_len`` chars).
+    Numbers are whole too (decimal commas are already dots): ``"powyzej 26"`` does not fit
+    ``"powyzej 26.5"`` and ``"5 rund"`` does not fit ``"26.5 rund"`` - another line is another bet.
     Used only as a sanity check after the exact match on the event page.
     """
     if not shown or not wanted:
@@ -181,7 +183,8 @@ def names_compatible(shown: str, wanted: str, *, min_len: int = 3) -> bool:
     short, long_ = (shown, wanted) if len(shown) <= len(wanted) else (wanted, shown)
     if len(short) < min_len:
         return False
-    return re.search(r"(?<![0-9a-z])" + re.escape(short) + r"(?![0-9a-z])", long_) is not None
+    pattern = r"(?<![0-9a-z])(?<!\d\.)" + re.escape(short) + r"(?![0-9a-z])(?!\.\d)"
+    return re.search(pattern, long_) is not None
 
 
 def first_regex_group(text: str | None, patterns: Iterable[re.Pattern[str]]) -> str | None:

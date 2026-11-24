@@ -6,12 +6,16 @@ that thread by ``factory`` (lazily, on the first call) and every method call is 
 executed there, serialised. From async code use ``await asyncio.to_thread(wrapper.place, order)``.
 
 A long ``open_login_window`` (the owner typing an SMS code) blocks queued ``place`` calls until it
-returns - intentionally, the bot cannot bet while logged out anyway.
+returns - intentionally, the bot cannot bet while logged out anyway. ``close()`` ends such a wait first
+(``abort_login`` on the wrapped executor, when it has one), so a shutdown is not held up by it.
 
 ``place`` always waits for its result (``call_timeout_s`` does not apply): giving up on a placement that
 keeps running in the worker would report a failure for a bet that may still be placed. If the wrapped
 executor cannot even be created (broken selector file, bad tuning), ``place`` returns a ``FAILED``
-result - nothing was clicked - instead of raising; the other methods raise the error.
+result - nothing was clicked - instead of raising; the other methods raise the error. A key that the
+optional ``clicked_check`` reports as already clicked (``create_betclic_executor`` reads the placement
+journal) is answered with that check's result (``UNCERTAIN``) instead: never "no bet" for a bet that
+may exist.
 """
 
 from __future__ import annotations
@@ -43,8 +47,12 @@ class ThreadBoundExecutor:
         *,
         thread_name: str = "betclic-executor",
         call_timeout_s: float | None = None,
+        clicked_check: Callable[[BetOrder], PlacementResult | None] | None = None,
     ) -> None:
         self._factory = factory
+        # Consulted only when the wrapped executor cannot be created: a key whose final button was
+        # already clicked (placement journal) must be answered UNCERTAIN, never FAILED ("no bet").
+        self._clicked_check = clicked_check
         self._pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix=thread_name)
         self._inner: AccountExecutor | None = None
         self._closed = False
@@ -83,9 +91,18 @@ class ThreadBoundExecutor:
         except ExecutorClosedError:
             raise
         except Exception as exc:
-            # Nothing touched the browser: a definite "not placed" the caller can record as FAILED.
+            # Nothing touched the browser: a definite "not placed" the caller can record as FAILED -
+            # unless the key was clicked before (an earlier run): that answer stays UNCERTAIN.
             detail = str(exc).strip().splitlines()[0][:300] if str(exc).strip() else ""
             log.error("the bet executor could not be created: %s: %s", type(exc).__name__, detail)
+            if self._clicked_check is not None:
+                try:
+                    refusal = self._clicked_check(order)
+                except Exception as check_exc:  # the check is a safety net; FAILED below is still true
+                    log.error("the already-clicked check failed: %s", type(check_exc).__name__)
+                    refusal = None
+                if refusal is not None:
+                    return refusal
             return PlacementResult(
                 status=PlacementStatus.FAILED,
                 message=f"the bet executor could not be created ({type(exc).__name__}: {detail})",
@@ -114,6 +131,14 @@ class ThreadBoundExecutor:
             if self._closed:
                 return
             self._closed = True
+            # A waiting open_login_window would hold the worker (and the shutdown) for up to its
+            # timeout: ask it to stop. abort_login is the one method that is safe from this thread.
+            abort = getattr(self._inner, "abort_login", None)
+            if callable(abort):
+                try:
+                    abort()
+                except Exception:
+                    log.exception("could not abort a waiting login window")
 
             def shutdown() -> None:
                 if self._inner is not None:

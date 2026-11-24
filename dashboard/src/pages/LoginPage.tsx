@@ -7,9 +7,16 @@ import { qk } from "../api/hooks";
 import { useAuth } from "../auth";
 import { Loading } from "../components/ui";
 
-/** Only same-app paths are accepted as the post-login target (no open redirect). */
+/**
+ * Only same-app paths are accepted as the post-login target (no open redirect): a single leading
+ * "/", and no backslash, whitespace or control character anywhere (browsers read "/\\evil.com" as
+ * "//evil.com"; React Router 6 does not normalise it - GHSA-wrjc-x8rr-h8h6).
+ */
 export function safeNext(next: string | null): string {
-  return next && next.startsWith("/") && !next.startsWith("//") && !next.startsWith("/login") ? next : "/";
+  if (!next || !next.startsWith("/") || next.startsWith("//") || next.startsWith("/login")) return "/";
+  // eslint-disable-next-line no-control-regex
+  if (/[\\\s\u0000-\u001f\u007f]/.test(next)) return "/";
+  return next;
 }
 
 export function LoginPage() {

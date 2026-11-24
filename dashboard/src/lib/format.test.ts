@@ -20,7 +20,7 @@ import {
 } from "./format";
 
 /** Intl uses non-breaking (and narrow non-breaking) spaces; normalise them for assertions. */
-const plain = (s: string) => s.replace(/[  ]/g, " ");
+const plain = (s: string) => s.replace(/[\u00a0\u202f]/g, " ");
 
 describe("money (pl-PL, PLN)", () => {
   it("formats API money strings as Polish zloty", () => {

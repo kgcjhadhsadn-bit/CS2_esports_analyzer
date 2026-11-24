@@ -242,29 +242,50 @@ class RoundModel:
         nuisance strength term per (match_id, map_number). Rounds without buy information are
         classified from equipment values (:func:`classify_buy`); pistol rounds are recognised by
         round number; rounds whose buys stay unknown are skipped (counted in ``fit_stats``).
-        Returns ``self``.
+        Every call starts from the priors: estimates of an earlier ``fit`` (e.g. with a later
+        ``as_of``) never survive into this one, so re-fitting an instance for a backtest cannot leak
+        future data (maps without rounds before ``as_of`` fall back to their prior). Returns ``self``.
         """
         cutoff = ensure_utc(as_of) if as_of is not None else None
+        self.ct_bias = {normalize_map_name(k): float(v) for k, v in self.priors.ct_bias_mean.items()}
+        self.pistol_ct_adj = float(self.priors.pistol_ct_adj_mean)
+        self.buy_pairs = np.asarray(self.priors.buy_pair_mean, dtype=np.float64)
+        self._fingerprint = None
         rows: list[tuple[int, int, int, int, int, int]] = []
         times: list[float] = []
         map_index: dict[str, int] = {}
         inst_index: dict[tuple[int, int], int] = {}
         skipped = 0
         for rec in rounds:
-            played = ensure_utc(rec.played_at)
-            if cutoff is not None and played >= cutoff:
-                continue
-            b1 = rec.team1_buy or classify_buy(rec.team1_equipment_value, rec.round_number, rounds_per_half)
-            b2 = rec.team2_buy or classify_buy(rec.team2_equipment_value, rec.round_number, rounds_per_half)
-            if b1 is None or b2 is None:
+            try:
+                played = ensure_utc(rec.played_at)
+                if cutoff is not None and played >= cutoff:
+                    continue
+                map_name = normalize_map_name(rec.map_name)
+                b1 = rec.team1_buy or classify_buy(
+                    rec.team1_equipment_value, rec.round_number, rounds_per_half
+                )
+                b2 = rec.team2_buy or classify_buy(
+                    rec.team2_equipment_value, rec.round_number, rounds_per_half
+                )
+                # unusable record (unknown buys, unknown map, impossible round number): skip, never abort
+                if b1 is None or b2 is None or not map_name or rec.round_number < 1:
+                    skipped += 1
+                    continue
+                row = (
+                    BUY_CODE[b1],
+                    BUY_CODE[b2],
+                    1 if rec.team1_side is Side.CT else -1,
+                    1 if rec.winner is TeamSlot.TEAM1 else 0,
+                    played.timestamp() / 86400.0,
+                )
+            except (AttributeError, KeyError, TypeError, ValueError, OverflowError):
                 skipped += 1
                 continue
-            m_i = map_index.setdefault(normalize_map_name(rec.map_name), len(map_index))
+            m_i = map_index.setdefault(map_name, len(map_index))
             inst_i = inst_index.setdefault((rec.match_id, rec.map_number), len(inst_index))
-            side_i = 1 if rec.team1_side is Side.CT else -1
-            y_i = 1 if rec.winner is TeamSlot.TEAM1 else 0
-            rows.append((m_i, inst_i, side_i, BUY_CODE[b1], BUY_CODE[b2], y_i))
-            times.append(played.timestamp() / 86400.0)
+            rows.append((m_i, inst_i, row[2], row[0], row[1], row[3]))
+            times.append(row[4])
         self._fingerprint = None
         maps = sorted(map_index, key=lambda k: map_index[k])
         if not rows:

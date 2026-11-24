@@ -68,5 +68,8 @@ describe("auth flow", () => {
     expect(safeNext("https://evil.example")).toBe("/");
     expect(safeNext("/login")).toBe("/");
     expect(safeNext(null)).toBe("/");
+    expect(safeNext("/\\evil.example")).toBe("/");
+    expect(safeNext("/\tevil")).toBe("/");
+    expect(safeNext("/matches/42")).toBe("/matches/42");
   });
 });

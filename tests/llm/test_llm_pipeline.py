@@ -6,6 +6,7 @@ import re
 from datetime import timedelta
 from typing import Any
 
+import pytest
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
@@ -14,6 +15,7 @@ from cs2bot.domain.enums import ContextFlagType
 from cs2bot.llm.context import ContextAnalyzer, LLMStatus
 from cs2bot.llm.pipeline import load_known_teams, refresh_match_context, triage_pending_news
 from cs2bot.llm.schemas import TriageLabel
+from cs2bot.llm.store import MANUAL_FLAG_MODEL, persist_flags
 from cs2bot.llm.tuning import LLMTuning
 from tests.llm.llm_factories import (
     NOW,
@@ -316,3 +318,38 @@ def test_rejected_requests_do_not_burn_triage_attempts(session: Session) -> None
     # Once the account works again, everything is still waiting to be triaged.
     working = ContextAnalyzer(make_settings(), client=FakeClient(_answer_all()))
     assert triage_pending_news(session, working, now=NOW).triaged == 3
+
+
+def test_manual_flags_survive_an_analysis_and_are_returned(session: Session) -> None:
+    """Review round 1: an analysis replaces only the LLM's own rows, never a flag set by hand."""
+    ctx = seed_match(session)
+    add_news(session, 1, title="Bravo Foxes stand-in", team_ids=[TEAM2_ID], label="stand_in", relevance=0.9)
+    manual = ContextFlagRow(
+        match_id=ctx.match_id,
+        team_id=None,
+        flag_type=ContextFlagType.OTHER,
+        severity=1.0,
+        confidence=1.0,
+        logit_shift=0.0,
+        veto=True,
+        rationale="Owner: do not bet this match.",
+        evidence=[],
+        model=MANUAL_FLAG_MODEL,
+        active=True,
+        created_at=NOW - timedelta(hours=1),
+    )
+    session.add(manual)
+    session.flush()
+    analyzer = ContextAnalyzer(make_settings(), client=FakeClient([_ok(suggestion()), _ok()]))
+
+    result = refresh_match_context(session, analyzer, ctx, now=NOW)
+    assert result.source == "llm"
+    assert sorted(f.flag_type.value for f in result.flags) == ["other", "stand_in"]
+    assert any(f.veto for f in result.flags)
+    # A later analysis that finds nothing deactivates the LLM's flag but keeps the manual one.
+    add_news(session, 2, title="Bravo Foxes update", team_ids=[TEAM2_ID], label="stand_in", relevance=0.9)
+    result = refresh_match_context(session, analyzer, ctx, now=NOW + timedelta(minutes=5))
+    assert [f.rationale for f in result.flags] == ["Owner: do not bet this match."]
+    assert manual.active is True
+    with pytest.raises(ValueError, match="reserved"):
+        persist_flags(session, ctx.match_id, [], model=MANUAL_FLAG_MODEL, team_ids=(TEAM1_ID, TEAM2_ID))

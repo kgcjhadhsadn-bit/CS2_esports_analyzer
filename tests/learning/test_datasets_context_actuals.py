@@ -558,3 +558,28 @@ def test_context_skips_flags_with_non_finite_values(session: Session, settings: 
     session.flush()
     ctx = datasets.load_match_context(session, match.id, settings=settings, now=now)
     assert [f.logit_shift for f in ctx.context_flags] == [pytest.approx(-0.1)]
+
+
+def test_context_flag_evidence_is_always_a_list_of_strings(session: Session, settings: Settings):
+    """Review round 1: a bare string in the JSON evidence column was split into characters."""
+    uni = populate_small(session)
+    match = uni.matches[-1]
+    now = match.played_at - timedelta(hours=1)
+    base = {
+        "match_id": match.id,
+        "flag_type": ContextFlagType.STAND_IN,
+        "severity": 0.5,
+        "confidence": 0.5,
+        "rationale": "x",
+        "created_at": now - timedelta(hours=2),
+    }
+    session.add_all(
+        [
+            ContextFlagRow(**{**base, "evidence": "https://example.org/news/1"}),
+            ContextFlagRow(**{**base, "evidence": ["a", None, 7]}),
+            ContextFlagRow(**{**base, "evidence": {"url": "b"}}),
+        ]
+    )
+    session.flush()
+    ctx = datasets.load_match_context(session, match.id, settings=settings, now=now)
+    assert [f.evidence for f in ctx.context_flags] == [["https://example.org/news/1"], ["a", "7"], []]

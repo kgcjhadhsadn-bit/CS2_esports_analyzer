@@ -11,7 +11,8 @@ Steps
 3. **Simulations.** Per scenario and map: :meth:`MapSimulator.calibrate_and_simulate` finds the round
    strength ``d`` that reproduces the map probability, the output is reweighted to hit it exactly
    (:meth:`MapSimOutput.reweighted`), and results are cached per (map, start side, p rounded to
-   1e-4). Every map uses one seed in all scenarios (common random numbers -> low < central < high).
+   1e-4). Every map uses one seed in all scenarios: low and high share common random numbers
+   (central too when ``scenario_n_sims == n_sims``); map-win probabilities are exact after reweighting.
 4. **Series math (exact).** For each veto sequence (probability ``q``) the series dynamic programme
    (:mod:`cs2bot.models.sim_series`) gives the final map-score distribution and P(slot k played).
    Slot k's map distribution is ``P(map | slot k played)``; all slot distributions are mixtures over
@@ -19,17 +20,23 @@ Steps
    played, which depends only on earlier maps).
 5. **Player props.** Per map, each player's kill pmf is a NB mixture over the simulated (rounds,
    margin) distribution (:mod:`cs2bot.models.player_props`). Scopes: ``"map:k"`` (mixture over the
-   slot's maps, conditional on the slot being played), ``"maps:1,2"`` (and ``"maps:1,2,3"`` for BO5;
-   always-played slots, convolution given the scenario), ``"match"`` (sum over played maps through
-   the series programme with per-map pmfs conditional on that map's winner, so the number of maps
-   played and the kills stay consistently correlated). Top-fragger probabilities come from one joint
-   simulation of whole series (veto sequence -> simulated scorelines -> kills of all players), ties
+   slot's maps, conditional on the slot being played), ``"maps:1,2"``, ``"maps:1,2,3"``, ... (every
+   prefix of the series, conditional on its last map being played; earlier maps enter with
+   winner-conditional pmfs), ``"match"`` (sum over played maps through the series programme with
+   per-map pmfs conditional on that map's winner, so the number of maps played and the kills stay
+   consistently correlated). In multi-map scopes the estimation uncertainty of a player's rate is
+   ONE multiplier shared by all maps (his true KPR), integrated with Gauss-Gamma quadrature nodes
+   (:data:`~cs2bot.models.player_props.MIN_CV2_FOR_QUADRATURE`); treating it as independent per map
+   would understate the variance of multi-map totals (badly for stand-ins / unknown players).
+   Top-fragger probabilities come from one joint simulation of whole series (veto sequence ->
+   simulated scorelines -> kills of all players, one rate multiplier per player and sample), ties
    split evenly; besides the documented scopes, team-restricted versions are stored under
    ``"<scope>|team1"`` / ``"<scope>|team2"``.
 6. ``sigma_team1_win = |p_high - p_low| / 2``.
 
 Runtime: one calibration needs 1-2 simulations of ~0.1 s (20k simulations); a BO3 whose veto
-distribution covers all 7 maps needs 21 calibrations (~2-4 s in total including player props). The
+distribution covers all 7 maps needs 21 calibrations (~2-4 s in total including player props; a
+BO5 with 30 veto sequences and ten players without history ~9 s, the rate quadrature dominates). The
 low/high scenarios use ``scenario_n_sims`` simulations (default ``max(2000, n_sims // 2)``): their
 only use is the sigma of each outcome, and they share common random numbers with each other (same
 seed and size per map), so ``p_high - p_low`` is far less noisy than either estimate. Maps whose
@@ -78,6 +85,8 @@ from cs2bot.models.map_sim import (
     MapSimulator,
 )
 from cs2bot.models.player_props import (
+    MIN_CV2_FOR_QUADRATURE,
+    RATE_QUADRATURE_NODES,
     KillsMixture,
     PlayerInput,
     PlayerKillModel,
@@ -87,10 +96,11 @@ from cs2bot.models.player_props import (
     top_fragger_probs,
 )
 from cs2bot.models.round_model import RoundModel
-from cs2bot.models.sim_series import played_mask, series_outcome, series_prefix_sum_pmf, series_sum_pmf
+from cs2bot.models.sim_series import played_mask, series_outcome, series_prefix_sum_pmfs, series_sum_pmf
 from cs2bot.models.sim_stats import (
     FloatArray,
     expit,
+    gamma_quadrature,
     logit,
     mix_dicts,
     mix_pmfs,
@@ -309,19 +319,18 @@ def _top_fragger(
     skew, hmv = score_skew, hist_margin_var
     for j, pl in enumerate(players):
         kpr = np.asarray([rates[m][pl.player_id].kpr for m in names])
-        s_eff = np.asarray(
-            [
-                effective_size(rates[m][pl.player_id].size, rates[m][pl.player_id].cv2, skew, hmv)
-                for m in names
-            ]
-        )
+        # The rate's estimation uncertainty is ONE mean-one Gamma multiplier per player and series
+        # sample (his true KPR is shared by all maps); per map only the conditional NB dispersion.
+        cv2 = max(rates[m][pl.player_id].cv2 for m in names)
+        s_eff = np.asarray([effective_size(rates[m][pl.player_id].size, 0.0, skew, hmv) for m in names])
+        rate_mult = rng.gamma(shape=1.0 / cv2, scale=cv2, size=n_samples) if cv2 > 1e-12 else 1.0
         sign = 1.0 if pl.team is TeamSlot.TEAM1 else -1.0
         for k in range(n_maps):
             ids = slot_map[k]
             r = (w1[k] + w2[k]).astype(np.float64)
             margin = sign * (w1[k] - w2[k]) - sign * np.take(centers, ids)
             mult = np.maximum(r + skew * margin, 0.1 * r) if skew > 0 else r
-            mu = np.maximum(np.take(kpr, ids) * mult, 1e-9)
+            mu = np.maximum(np.take(kpr, ids) * mult * rate_mult, 1e-9)
             shape = np.take(s_eff, ids)
             lam = rng.gamma(shape=shape, scale=mu / shape)
             kills[k, :, j] = rng.poisson(lam) * played[k]
@@ -364,6 +373,7 @@ def _build_core(
     n_maps = fmt.n_maps
     p_map = {m: r.out.p_team1_win for m, r in runs.items()}
     results = [series_outcome(fmt, [p_map[m] for m in s.maps]) for s in seqs]
+    results_by_seq = {s.maps: res for s, res in zip(seqs, results, strict=True)}
 
     final: dict[tuple[int, int], float] = {}
     for s, res in zip(seqs, results, strict=True):
@@ -393,11 +403,37 @@ def _build_core(
         slot_dists.append({m: v / norm for m, v in sorted(weights.items(), key=lambda kv: -kv[1]) if v > 0})
 
     kernels: dict[tuple[str, int], _Kernel] = {}
+    # Multi-map scopes: per player, quadrature nodes of the rate uncertainty that is common to all
+    # maps (weight, {map: kernel without that uncertainty}); one node = the per-map kernels above.
+    node_kernels: dict[int, list[tuple[float, dict[str, _Kernel]]]] = {}
     if players and score_params is not None:
         skew, hmv = score_params
         for m, run in runs.items():
             for pl in players:
                 kernels[(m, pl.player_id)] = _kernel(rates[m][pl.player_id], run.out, skew, hmv)
+        for pl in players:
+            cv2 = max(rates[m][pl.player_id].cv2 for m in runs)
+            if not cv2 >= MIN_CV2_FOR_QUADRATURE:
+                node_kernels[pl.player_id] = [(1.0, {m: kernels[(m, pl.player_id)] for m in runs})]
+                continue
+            xs, ws = gamma_quadrature(cv2, RATE_QUADRATURE_NODES)
+            node_kernels[pl.player_id] = [
+                (
+                    float(w),
+                    {
+                        m: _kernel(
+                            replace(
+                                rates[m][pl.player_id], kpr=rates[m][pl.player_id].kpr * float(x), cv2=0.0
+                            ),
+                            run.out,
+                            skew,
+                            hmv,
+                        )
+                        for m, run in runs.items()
+                    },
+                )
+                for x, w in zip(xs, ws, strict=True)
+            ]
 
     slots: list[MapSlotPrediction] = []
     for k in range(n_maps):
@@ -434,46 +470,65 @@ def _build_core(
     if kernels:
         for k, slot in enumerate(slots):
             by_scope[f"map:{k + 1}"] = dict(slot.players)
-        for scope, upto in prefix_scopes:
-            scope_proj: dict[str, PlayerProjection] = {}
-            for pl in players:
-                items: list[tuple[float, FloatArray]] = []
-                deaths = 0.0
-                for s in seqs:
-                    ks = [kernels[(m, pl.player_id)] for m in s.maps]
-                    p_last_played, pmf = series_prefix_sum_pmf(
-                        fmt,
-                        [p_map[m] for m in s.maps],
-                        [kk.pmf_team1_wins for kk in ks],
-                        [kk.pmf_team2_wins for kk in ks],
-                        upto,
+        # every prefix scope in one pass of the series programme per (player, veto sequence, node)
+        prefix_items: dict[int, dict[int, list[tuple[float, FloatArray]]]] = {}
+        prefix_deaths: dict[int, dict[int, float]] = {}
+        prefix_mass = dict.fromkeys(range(2, n_maps + 1), 0.0)  # sum_s q_s P(last map played | s)
+        for i_pl, pl in enumerate(players):
+            items_by_upto: dict[int, list[tuple[float, FloatArray]]] = {u: [] for u in range(2, n_maps + 1)}
+            deaths_by_upto = dict.fromkeys(range(2, n_maps + 1), 0.0)
+            for s in seqs:
+                p_maps = [p_map[m] for m in s.maps]
+                for w_node, node in node_kernels[pl.player_id]:
+                    ks = [node[m] for m in s.maps]
+                    prefixes = series_prefix_sum_pmfs(
+                        fmt, p_maps, [kk.pmf_team1_wins for kk in ks], [kk.pmf_team2_wins for kk in ks]
                     )
-                    weight = s.q * p_last_played
-                    if weight <= 0.0:
-                        continue
-                    items.append((weight, pmf))
+                    for upto in range(2, n_maps + 1):
+                        p_last_played, pmf = prefixes[upto - 1]
+                        if s.q * p_last_played > 0.0:
+                            items_by_upto[upto].append((s.q * p_last_played * w_node, pmf))
+                # P(last map played) and the deaths do not depend on the quadrature node
+                played_k = results_by_seq[s.maps].p_played
+                for upto in range(2, n_maps + 1):
+                    weight = s.q * played_k[upto - 1]
+                    if i_pl == 0:
+                        prefix_mass[upto] += weight
                     # deaths: per-map unconditional means (informational only)
-                    deaths += weight * sum(ks[i].deaths_mean for i in range(upto))
-                total_w = sum(w for w, _ in items)
-                if total_w <= 1e-15:
-                    break  # the last map of this scope (practically) cannot be played
-                scope_proj[str(pl.player_id)] = _projection(pl, mix_pmfs(items), deaths / total_w)
-            else:
-                by_scope[scope] = scope_proj
+                    deaths_by_upto[upto] += weight * sum(
+                        kernels[(m, pl.player_id)].deaths_mean for m in s.maps[:upto]
+                    )
+            prefix_items[pl.player_id] = items_by_upto
+            prefix_deaths[pl.player_id] = deaths_by_upto
+        for scope, upto in prefix_scopes:
+            if prefix_mass[upto] <= 1e-15:
+                continue  # the last map of this scope (practically) cannot be played
+            by_scope[scope] = {
+                str(pl.player_id): _projection(
+                    pl,
+                    mix_pmfs(prefix_items[pl.player_id][upto]),
+                    prefix_deaths[pl.player_id][upto] / prefix_mass[upto],
+                )
+                for pl in players
+            }
         match_proj: dict[str, PlayerProjection] = {}
         for pl in players:
             items = []
             deaths = 0.0
             for s, res in zip(seqs, results, strict=True):
-                ks = [kernels[(m, pl.player_id)] for m in s.maps]
-                pmf = series_sum_pmf(
-                    fmt,
-                    [p_map[m] for m in s.maps],
-                    [kk.pmf_team1_wins for kk in ks],
-                    [kk.pmf_team2_wins for kk in ks],
+                p_maps = [p_map[m] for m in s.maps]
+                for w_node, node in node_kernels[pl.player_id]:
+                    ks = [node[m] for m in s.maps]
+                    pmf = series_sum_pmf(
+                        fmt,
+                        p_maps,
+                        [kk.pmf_team1_wins for kk in ks],
+                        [kk.pmf_team2_wins for kk in ks],
+                    )
+                    items.append((s.q * w_node, pmf))
+                deaths += s.q * sum(
+                    res.p_played[i] * kernels[(m, pl.player_id)].deaths_mean for i, m in enumerate(s.maps)
                 )
-                items.append((s.q, pmf))
-                deaths += s.q * sum(res.p_played[i] * ks[i].deaths_mean for i in range(n_maps))
             match_proj[str(pl.player_id)] = _projection(pl, mix_pmfs(items), deaths)
         by_scope["match"] = match_proj
         assert score_params is not None
@@ -627,6 +682,13 @@ def build_match_prediction(
                 if abs(out.p_team1_win - p) > max(5 * tol, 0.02):
                     warnings.append(f"{m}: calibration reached {out.p_team1_win:.4f} for target {p:.4f}")
                 run = _MapRun(map_name=m, side=side, target_p=p, d=d, out=out.reweighted(p))
+                if abs(run.out.p_team1_win - p) > 1e-6:
+                    # no simulation won by one side (extreme p with few simulations): the exact
+                    # reweighting is impossible and the map probability stays at 0 / 1
+                    warnings.append(
+                        f"{m} ({scenario}): map probability {run.out.p_team1_win:.4f} instead of {p:.4f}"
+                        f" (no simulated map won by one side; use more simulations)"
+                    )
                 local[key] = run
             else:
                 hits += 1

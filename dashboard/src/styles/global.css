@@ -473,7 +473,11 @@ code {
 .kill-switch {
   width: 100%;
   padding: 1.1rem 1rem;
-  font-size: 1.25rem;
+  font-size: clamp(1rem, 1.6vw, 1.25rem);
+  line-height: 1.25;
+  white-space: normal;
+  text-align: center;
+  overflow-wrap: anywhere;
   letter-spacing: 0.03em;
   text-transform: uppercase;
   border-radius: var(--radius);

@@ -163,6 +163,15 @@ def effective_size(size: float, cv2: float, score_skew: float = 0.0, hist_margin
     return 1.0 / max(var_x, 1e-9)
 
 
+#: Multi-map kill scopes (match engine): the rate's estimation uncertainty is one multiplier shared by
+#: every map (the player's true KPR), integrated with :func:`~cs2bot.models.sim_stats.gamma_quadrature`
+#: nodes. Below this squared coefficient of variation it is folded into each map's NB size instead
+#: (sd < ~6 % of the rate: sharing it across maps changes multi-map variances by < ~3 %).
+MIN_CV2_FOR_QUADRATURE = 0.004
+#: Quadrature nodes for the rate-uncertainty multiplier in multi-map scopes.
+RATE_QUADRATURE_NODES = 7
+
+
 @dataclass(frozen=True)
 class KillsDistribution:
     pmf: FloatArray
@@ -1047,6 +1056,8 @@ def _expected_rounds(rounds_pmf: Mapping[int, float] | npt.ArrayLike, weights: n
 
 __all__ = [
     "DEFAULT_ROLE_KPR",
+    "MIN_CV2_FOR_QUADRATURE",
+    "RATE_QUADRATURE_NODES",
     "ROLE_ORDER",
     "KillModelConfig",
     "KillsDistribution",

@@ -180,6 +180,7 @@ def test_store_triage_sets_fields_and_merges_teams(session: Session) -> None:
         "summary": "Bravo Foxes arrive late.",
         "team_names": ["Bravo Foxes"],
         "team_ids": [TEAM2_ID],
+        "added_team_ids": [TEAM2_ID],  # not on the row before the verdict
         "model": "claude-haiku-5-5",
     }
 
@@ -302,6 +303,12 @@ def test_select_news_adds_a_few_global_meta_items(session: Session) -> None:
     ]
     assert _titles(select_news_for_match(session, ctx, limit=25, now=NOW, max_global=0)) == ["team"]
     assert _titles(select_news_for_match(session, ctx, limit=2, now=NOW, max_global=1)) == ["patch 5", "team"]
+    # Review round 1: with a small limit, match-wide items never crowd out news about the teams.
+    add_news(
+        session, 8, title="team 2", team_ids=[TEAM2_ID], label="injury_illness", relevance=0.8, hours_ago=5
+    )
+    assert _titles(select_news_for_match(session, ctx, limit=2, now=NOW)) == ["team", "team 2"]
+    assert _titles(select_news_for_match(session, ctx, limit=3, now=NOW)) == ["patch 5", "team", "team 2"]
 
 
 def test_select_news_uses_ingestion_time_when_unpublished_and_tolerates_bad_json(session: Session) -> None:
@@ -342,3 +349,25 @@ def test_select_news_still_finds_triage_teams_after_the_scraper_rewrites_team_id
     row.extra = {"llm": {"triage": "corrupted"}}  # malformed section: ignored, not fatal
     session.flush()
     assert select_news_for_match(session, ctx, limit=25, now=NOW) == []
+
+
+def test_replay_before_the_verdict_ignores_the_team_ids_it_merged(session: Session) -> None:
+    """Review round 1: ``store_triage`` merges its team ids into ``team_ids``; a replay at an instant
+    before ``triaged_at`` must not see them (the item was not known to be about the team then)."""
+    ctx = seed_match(session)
+    later = NOW + timedelta(hours=1)
+    row = add_news(session, 1, title="only the verdict names team1", team_ids=[], hours_ago=4)
+    scraped = add_news(session, 2, title="scraper names team2", team_ids=[TEAM2_ID], hours_ago=3)
+    for news_row in (row, scraped):
+        verdict = triage_item(
+            news_row.id, label=TriageLabel.STAND_IN, relevance=0.8, team_ids=[TEAM1_ID, TEAM2_ID]
+        )
+        store_triage(session, news_row.id, verdict, now=later)
+        store_triage(session, news_row.id, verdict, now=later)  # repeated call keeps the bookkeeping
+    assert row.team_ids == [TEAM1_ID, TEAM2_ID]
+    assert _titles(select_news_for_match(session, ctx, limit=25, now=NOW)) == ["scraper names team2"]
+    after = later + timedelta(minutes=1)
+    assert _titles(select_news_for_match(session, ctx, limit=25, now=after)) == [
+        "only the verdict names team1",
+        "scraper names team2",
+    ]

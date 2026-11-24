@@ -18,6 +18,7 @@ The client never logs or raises the token.
 from __future__ import annotations
 
 import logging
+import re
 import time
 from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass
@@ -106,16 +107,40 @@ def _int_header(response: httpx.Response, name: str) -> int | None:
         return None
 
 
-def _error_text(response: httpx.Response) -> str:
-    """Short server-side explanation (``{"error": ..., "message": ...}``), never request data."""
+def _error_text(response: httpx.Response, secret: str | None = None) -> str:
+    """Short server-side explanation (``{"error": ..., "message": ...}``), never request data.
+
+    The body is untrusted: should the server ever echo the token back, ``secret`` is masked before
+    the text can reach an exception message or a log line.
+    """
     try:
         body = response.json()
     except ValueError:
         return ""
     if isinstance(body, dict):
         parts = [str(body[k]) for k in ("error", "message") if body.get(k)]
-        return ": ".join(parts)[:300]
+        text = ": ".join(parts)
+        if secret:
+            text = text.replace(secret, "***")
+        return text[:300]
     return ""
+
+
+_PATH_ID = re.compile(r"[A-Za-z0-9_-][A-Za-z0-9_.-]{0,127}")
+
+
+def _path_id(value: int | str) -> str:
+    """An id or slug that is safe to put into a URL path (no ``/``, ``..``, ``?``, ``#`` ...)."""
+    if isinstance(value, bool):
+        raise ValueError("PandaScore id must be an int or a slug, not a bool")
+    if isinstance(value, int):
+        if value < 0:
+            raise ValueError(f"invalid PandaScore id: {value}")
+        return str(value)
+    text = str(value).strip()
+    if not _PATH_ID.fullmatch(text) or ".." in text:
+        raise ValueError(f"invalid PandaScore id or slug: {text[:40]!r}")
+    return text
 
 
 class PandaScoreClient:
@@ -188,6 +213,11 @@ class PandaScoreClient:
                 "(the token is shown on the PandaScore dashboard)"
             )
 
+    def _secret(self) -> str | None:
+        token = self._settings.api_token
+        value = token.get_secret_value().strip() if token is not None else ""
+        return value or None
+
     def _headers(self) -> dict[str, str]:
         self.ensure_token()
         token = self._settings.api_token
@@ -251,7 +281,7 @@ class PandaScoreClient:
                     "CS2BOT_PANDASCORE__API_TOKEN"
                 )
             if status == 403:
-                detail = _error_text(response)
+                detail = _error_text(response, self._secret())
                 raise PandaScorePlanError(
                     f"{what}: not available on this PandaScore plan (HTTP 403) {detail}".strip()
                 )
@@ -259,7 +289,8 @@ class PandaScoreClient:
                 raise PandaScoreNotFoundError(f"{what}: not found (HTTP 404)")
             if status >= 400:
                 raise PandaScoreHTTPError(
-                    f"{what}: HTTP {status} {_error_text(response)}".strip(), status_code=status
+                    f"{what}: HTTP {status} {_error_text(response, self._secret())}".strip(),
+                    status_code=status,
                 )
             return response
         raise AssertionError("unreachable")  # pragma: no cover - the loop always returns or raises
@@ -318,10 +349,11 @@ class PandaScoreClient:
                 yield item
             if not data:
                 return
-            if objects and duplicates == objects:
-                # A full page of rows we already yielded: the server ignores page[number] (or the
-                # list shifted by more than a page). Following ``next`` would loop forever.
-                logger.warning("PandaScore GET /%s: page %d repeats earlier rows; stopping", path, page)
+            if duplicates == objects:
+                # Nothing new on a non-empty page: only rows we already yielded (the server ignores
+                # page[number], or the list shifted by more than a page) or only non-object garbage.
+                # Following ``next`` would loop forever.
+                logger.warning("PandaScore GET /%s: page %d has no new rows; stopping", path, page)
                 return
             if "link" in response.headers:
                 if "next" not in response.links:
@@ -466,8 +498,9 @@ class PandaScoreClient:
         the list endpoint instead (``/csgo/matches?filter[id]=...``, available on every plan; numeric
         ids only), so reconciling single matches keeps working on the entry plan.
         """
+        match_id = _path_id(match_id)
         path = f"{self._game}/matches/{match_id}"
-        numeric = str(match_id).isdigit()
+        numeric = match_id.isdigit()
         if not (numeric and self._single_match_forbidden):
             try:
                 return self._one(PSMatch, path)
@@ -475,8 +508,8 @@ class PandaScoreClient:
                 if not numeric:
                     raise
                 self._single_match_forbidden = True  # do not ask again: go straight to the list
-        raw = next(self.paginate(f"{self._game}/matches", {"filter[id]": str(match_id)}, max_pages=1), None)
-        if raw is None:
+        raw = next(self.paginate(f"{self._game}/matches", {"filter[id]": match_id}, max_pages=1), None)
+        if raw is None or str(raw.get("id")) != match_id:  # a server ignoring the filter: not our match
             raise PandaScoreNotFoundError(f"GET /{path}: not found")
         try:
             return PSMatch.model_validate(raw)
@@ -491,30 +524,30 @@ class PandaScoreClient:
 
         Needs a plan with historical data; raises :class:`PandaScorePlanError` otherwise.
         """
-        path = f"{self._game}/matches/{match_id}/games"
+        path = f"{self._game}/matches/{_path_id(match_id)}/games"
         games = list(self._typed(PSGame, self.paginate(path, page_size=MAX_PAGE_SIZE), None))
         return sorted(games, key=lambda g: (g.position is None, g.position or 0))
 
     def game(self, game_id: int) -> PSGame:
-        return self._one(PSGame, f"{self._game}/games/{game_id}")
+        return self._one(PSGame, f"{self._game}/games/{_path_id(game_id)}")
 
     def match_opponents(self, match_id: int | str) -> PSMatchOpponents:
         """Both teams of a match with their players (``/matches/{id}/opponents``)."""
-        return self._one(PSMatchOpponents, f"matches/{match_id}/opponents")
+        return self._one(PSMatchOpponents, f"matches/{_path_id(match_id)}/opponents")
 
     # ------------------------------------------------------------------ teams / tournaments
 
     def team(self, team_id: int | str) -> PSTeam:
         """One team with its current players (generic ``/teams/{id}``: there is no ``/csgo/teams/{id}``)."""
-        return self._one(PSTeam, f"teams/{team_id}")
+        return self._one(PSTeam, f"teams/{_path_id(team_id)}")
 
     def tournament(self, tournament_id: int | str) -> PSTournament:
         """One tournament stage with tier, type, teams and ``expected_roster``."""
-        return self._one(PSTournament, f"tournaments/{tournament_id}")
+        return self._one(PSTournament, f"tournaments/{_path_id(tournament_id)}")
 
     def tournament_rosters(self, tournament_id: int | str) -> PSTournamentRosters:
         """Rosters of every team registered for a tournament stage."""
-        return self._one(PSTournamentRosters, f"tournaments/{tournament_id}/rosters")
+        return self._one(PSTournamentRosters, f"tournaments/{_path_id(tournament_id)}/rosters")
 
     def _one[M: PSModel](self, model: type[M], path: str) -> M:
         data = self.get_json(path)

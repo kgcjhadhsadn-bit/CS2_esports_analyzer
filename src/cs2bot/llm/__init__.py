@@ -34,6 +34,7 @@ from cs2bot.llm.schemas import (
     TriageLabel,
 )
 from cs2bot.llm.store import (
+    MANUAL_FLAG_MODEL,
     load_active_flags,
     news_row_to_input,
     persist_flags,
@@ -44,6 +45,7 @@ from cs2bot.llm.tuning import VETO_MIN_CONFIDENCE, LLMTuning
 
 __all__ = [
     "ADVERSE_FLAG_TYPES",
+    "MANUAL_FLAG_MODEL",
     "RISK_DISCLAIMER",
     "VETO_MIN_CONFIDENCE",
     "AnalysisMemo",

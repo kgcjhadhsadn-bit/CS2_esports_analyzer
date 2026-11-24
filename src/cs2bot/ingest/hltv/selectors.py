@@ -354,3 +354,14 @@ BLOCK_PAGE_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
 FINISHED_MATCH_HTML_RE = re.compile(
     r"\bcountdown\b[^>]*>\s*(?:<[^>]*>\s*)*(?:match over|match deleted)", re.I
 )
+DELETED_MATCH_HTML_RE = re.compile(r"\bcountdown\b[^>]*>\s*(?:<[^>]*>\s*)*match deleted", re.I)
+# A finished match page is only final once HLTV has published the GOTV demo link (usually an hour or
+# more after "Match over"); the map stats links can also lag a few minutes behind the result.
+DEMO_LINK_HTML_RE = re.compile(r"/download/demo/\d+")
+# Start time of the match in the header (``.timeAndEvent .time|.date[data-unix]``), used by the cache
+# policy without a full parse. Either attribute order is accepted.
+MATCH_HEADER_UNIX_RE = re.compile(
+    r"timeAndEvent.*?<div[^>]*?(?:class=\"[^\"]*\b(?:time|date)\b[^\"]*\"[^>]*?data-unix=\"(\d{10,14})\""
+    r"|data-unix=\"(\d{10,14})\"[^>]*?class=\"[^\"]*\b(?:time|date)\b[^\"]*\")",
+    re.I | re.S,
+)

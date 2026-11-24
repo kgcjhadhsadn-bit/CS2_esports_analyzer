@@ -80,7 +80,8 @@ def match_by_hltv(session: Session, hltv_id: int) -> Match:
 
 def test_sync_finished_bo3_creates_everything(session: Session, app_settings: Settings) -> None:
     fetcher = FakeFetcher()
-    report = sync_match(session, fetcher, 2378001, settings=app_settings)
+    now = datetime(2026, 11, 22, 12, 0, tzinfo=UTC)  # the day after the match (ranks shown are current)
+    report = sync_match(session, fetcher, 2378001, settings=app_settings, now=now)
     assert report.ok, report.errors
     assert report.created == 1 and report.fetched_pages == 4  # match page + 3 map stats pages
 
