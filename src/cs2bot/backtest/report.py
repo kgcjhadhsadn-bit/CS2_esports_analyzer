@@ -224,6 +224,12 @@ class BacktestReport(BaseModel):
     brier_bets: float | None = None
     log_loss_bets: float | None = None
     calibration: dict[str, Any] = Field(default_factory=dict)
+    # deep_data: reliability in [0.75, 1] (2.5-pp bins) and the per-market "trusted" verdict
+    # (cs2bot.models.confidence); ``predictions`` keeps the resolved predictions so a
+    # ConfidenceGuard can be fitted from a report (not serialised: it can be large)
+    high_confidence: dict[str, Any] = Field(default_factory=dict)
+    market_trust: dict[str, Any] = Field(default_factory=dict)
+    predictions: list[PredictionRecord] = Field(default_factory=list, exclude=True)
 
     profit_curve: list[CurvePoint] = Field(default_factory=list)
     by_market: list[BreakdownRow] = Field(default_factory=list)

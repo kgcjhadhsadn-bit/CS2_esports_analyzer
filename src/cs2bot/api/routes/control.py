@@ -33,9 +33,10 @@ router = APIRouter(prefix="/api/control", tags=["control"], dependencies=[Depend
 
 
 @router.get("/state", response_model=TradingStateOut)
-def get_trading_state(db: DB) -> TradingStateOut:
-    """Kill switch + pause flags and whether trading is halted."""
-    return trading_state(db)
+def get_trading_state(ctx: Ctx, db: DB) -> TradingStateOut:
+    """Kill switch + pause flags, structured pause reasons (auto-resume ETA, circuit breaker), the
+    autonomy and the Telegram status, and whether trading is halted."""
+    return trading_state(db, ctx.settings)
 
 
 @router.get("/kill-switch", response_model=SwitchState)
@@ -52,21 +53,22 @@ def set_kill_switch(body: KillSwitchIn, db: DB, auth: Auth) -> SwitchState:
 
 
 @router.post("/pause", response_model=TradingStateOut)
-def pause(db: DB, auth: Auth, body: Annotated[PauseIn | None, Body()] = None) -> TradingStateOut:
+def pause(ctx: Ctx, db: DB, auth: Auth, body: Annotated[PauseIn | None, Body()] = None) -> TradingStateOut:
+    """Manual pause (reason code ``manual``: never lifted automatically)."""
     reason = (body or PauseIn()).reason.strip() or PauseIn().reason
     state.set_paused(db, True, actor=auth.actor, reason=reason)
     db.commit()
     log.warning("trading paused from the dashboard (%s)", auth.actor)
-    return trading_state(db)
+    return trading_state(db, ctx.settings)
 
 
 @router.post("/resume", response_model=TradingStateOut)
-def resume(db: DB, auth: Auth, body: Annotated[ResumeIn | None, Body()] = None) -> TradingStateOut:
-    """Clear the pause flag (does not turn off the kill switch)."""
+def resume(ctx: Ctx, db: DB, auth: Auth, body: Annotated[ResumeIn | None, Body()] = None) -> TradingStateOut:
+    """Clear every pause reason incl. an open circuit breaker (does not turn off the kill switch)."""
     state.set_paused(db, False, actor=auth.actor, reason=(body or ResumeIn()).reason.strip())
     db.commit()
     log.warning("trading resumed from the dashboard (%s)", auth.actor)
-    return trading_state(db)
+    return trading_state(db, ctx.settings)
 
 
 @router.get("/config", response_model=ConfigOut)

@@ -32,6 +32,7 @@ import numpy as np
 
 from cs2bot.domain.enums import BuyType, Side, TeamSlot, VetoAction
 from cs2bot.domain.records import MapResultRecord, PlayerMapRecord, RoundRecord, VetoRecord
+from cs2bot.features.deep import DeepConfig, DeepFeatureIndex
 from cs2bot.features.meta import PatchTimeline, RegimeBreak, RegimeConfig, RegimeDetector, load_patch_timeline
 from cs2bot.features.strength import StrengthConfig, sigmoid, walk_strength
 from cs2bot.utils.names import normalize_map_name
@@ -40,6 +41,7 @@ from cs2bot.utils.time import ensure_utc
 if TYPE_CHECKING:
     from sqlalchemy.orm import Session
 
+    from cs2bot.datasets.deep import DeepData
     from cs2bot.datasets.demo import TeamDemoMapRecord
 
 log = logging.getLogger(__name__)
@@ -77,6 +79,11 @@ class FeatureConfig:
     use_start_side: bool = False
     strength: StrengthConfig = field(default_factory=StrengthConfig)
     regime: RegimeConfig = field(default_factory=RegimeConfig)
+    #: Deep match factors (deep_data, :mod:`cs2bot.features.deep`): schedule, travel, stakes, format,
+    #: economy / clutch detail, player match-ups, market. Off = the row has none of the ``dp_`` /
+    #: ``stage_`` / ``mkt_`` columns (the feature set of models trained before deep_data).
+    deep_features: bool = True
+    deep: DeepConfig = field(default_factory=DeepConfig)
 
 
 class _Series:
@@ -304,6 +311,7 @@ class FeatureStore:
         self.has_demo_data = False
         self.has_veto_data = False
         self.has_player_data = False
+        self.deep: DeepFeatureIndex | None = None
 
     # ------------------------------------------------------------------------------ construction
 
@@ -318,8 +326,13 @@ class FeatureStore:
         team_demo_stats: Iterable[TeamDemoMapRecord] = (),
         config: FeatureConfig | None = None,
         patch_timeline: PatchTimeline | Literal["default"] | None = "default",
+        deep: DeepData | None = None,
     ) -> FeatureStore:
         """Index the given records (any order; they are sorted here).
+
+        ``deep`` adds the deep-data inputs (match metadata, demo duels / clutches, coach changes,
+        market history; :class:`cs2bot.datasets.deep.DeepData`). Without it the deep block still has
+        every feature that can be derived from the map results and rounds (schedule, format, economy).
 
         Only ``map_results`` is required. Without ``player_maps`` the player aggregates are NaN,
         without ``rounds`` the pistol / economy / post-plant features, without ``vetoes`` the ban /
@@ -338,6 +351,7 @@ class FeatureStore:
 
         records = sorted(map_results, key=lambda r: (ensure_utc(r.played_at), r.match_id, r.map_number))
         store._records = tuple(records)
+        rounds = list(rounds)
         round_agg = _round_aggregates(rounds)
         store.has_round_data = bool(round_agg)
         demo = {(d.match_id, d.map_number, d.team_id): d for d in team_demo_stats}
@@ -536,6 +550,14 @@ class FeatureStore:
         )
         store._index_players(player_maps)
         store._index_vetoes(vetoes)
+        if store.config.deep_features:
+            store.deep = DeepFeatureIndex(
+                records,
+                rounds=rounds,
+                deep=deep,
+                patch_timeline=store.patch_timeline,
+                config=store.config.deep,
+            )
         return store
 
     def _index_players(self, player_maps: Iterable[PlayerMapRecord]) -> None:
@@ -616,8 +638,12 @@ class FeatureStore:
         with_demo: bool = True,
         config: FeatureConfig | None = None,
         patch_timeline: PatchTimeline | Literal["default"] | None = "default",
+        with_deep: bool = True,
     ) -> FeatureStore:
         """Load everything from the database (``cs2bot.datasets``) and build the store.
+
+        ``with_deep`` also loads :class:`cs2bot.datasets.deep.DeepData` (match metadata, demo duels and
+        clutches, coach changes, Betclic market history) for the deep feature block.
 
         ``until`` bounds what the store can ever see (use it for walk-forward cut-offs); for live use
         leave it ``None`` and rely on ``as_of``. ``with_rounds=False`` skips the largest table.
@@ -635,6 +661,13 @@ class FeatureStore:
             team_demo_stats=window(datasets.load_team_demo_stats) if with_demo else (),
             config=config,
             patch_timeline=patch_timeline,
+            deep=(
+                datasets.DeepData.from_session(
+                    session, since=since, until=until, in_scope_only=in_scope_only, with_demo=with_demo
+                )
+                if with_deep and (config is None or config.deep_features)
+                else None
+            ),
         )
 
     # ---------------------------------------------------------------------------------- lookups

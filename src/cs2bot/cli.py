@@ -35,6 +35,7 @@ predict_app = typer.Typer(help="Predictions", no_args_is_help=True)
 bet_app = typer.Typer(help="Betting", no_args_is_help=True)
 executor_app = typer.Typer(help="Betclic executor (browser)", no_args_is_help=True)
 control_app = typer.Typer(help="Safety controls (kill switch, pause)", no_args_is_help=True)
+telegram_app = typer.Typer(help="Telegram notifications / remote control", no_args_is_help=True)
 for _sub, _name in (
     (db_app, "db"),
     (ingest_app, "ingest"),
@@ -45,6 +46,7 @@ for _sub, _name in (
     (bet_app, "bet"),
     (executor_app, "executor"),
     (control_app, "control"),
+    (telegram_app, "telegram"),
 ):
     app.add_typer(_sub, name=_name)
 
@@ -190,9 +192,10 @@ def up(
 @_command
 def doctor() -> None:
     """Check the environment; exits 1 when something must be fixed."""
-    from cs2bot.services.doctor import run_checks
+    from cs2bot.services.doctor import default_telegram_probe, run_checks
 
-    checks = run_checks(_settings())
+    settings = _settings()
+    checks = run_checks(settings, telegram_probe=default_telegram_probe(settings))
     for check in checks:
         colour = {"ok": typer.colors.GREEN, "warn": typer.colors.YELLOW, "fail": typer.colors.RED}[
             check.level
@@ -846,19 +849,60 @@ def control_resume() -> None:
 @control_app.command("status")
 @_command
 def control_status() -> None:
-    """Show kill switch, pause and betting mode."""
+    """Show kill switch, every pause reason (auto-resume ETA, circuit breaker) and the betting mode."""
     from cs2bot.db import state as db_state
+    from cs2bot.services.autonomy import pause_overview
+    from cs2bot.utils.time import to_local
 
     s = _settings()
     with _factory(s)() as session:
         kill = db_state.get_state(session, db_state.KILL_SWITCH)
-        paused, reason = db_state.get_pause(session)
+        overview = pause_overview(session, s)
     typer.echo(f"kill switch: {'ON' if kill.get('on') else 'off'} {kill.get('reason') or ''}".rstrip())
-    typer.echo(f"paused: {'yes - ' + (reason or '') if paused else 'no'}")
+    if not overview["paused"]:
+        typer.echo("paused: no")
+    else:
+        typer.echo("paused: yes")
+        for r in overview["reasons"]:
+            how = "lifts automatically" if r["auto_resume"] else "needs the owner"
+            eta = ""
+            if r["eta"]:
+                local = to_local(datetime.fromisoformat(r["eta"]), s.timezone)
+                eta = f", expected {local:%Y-%m-%d %H:%M} Warsaw"
+            typer.echo(f"  - {r['code']} ({how}{eta}) since {r['since']}: {r['message']}")
+        if overview["circuit_open"]:
+            typer.echo("  circuit breaker OPEN: resume by hand after checking (cs2bot control resume)")
     typer.echo(
         f"mode: {'dry run' if s.executor.dry_run else 'LIVE'}; "
-        f"executor {'enabled' if s.executor.enabled else 'disabled'}"
+        f"executor {'enabled' if s.executor.enabled else 'disabled'}; "
+        f"autonomy {'on' if s.autonomy.enabled else 'off'}"
+        + (" (auto-login on)" if s.autonomy.enabled and s.autonomy.auto_login else "")
+        + f"; telegram {'on' if s.telegram.enabled else 'off'}"
     )
+
+
+# -------------------------------------------------------------------------------------------- telegram
+
+
+@telegram_app.command("test")
+@_command
+def telegram_test(message: str = typer.Option("cs2bot: Telegram test message", help="Text to send")) -> None:
+    """Send a test message to the configured chat (checks the token and the chat id)."""
+    from cs2bot.services.telegram import TelegramClient
+
+    s = _settings()
+    if not s.telegram.enabled:
+        raise CLIError("Telegram is disabled: set CS2BOT_TELEGRAM__ENABLED=true")
+    client = TelegramClient.from_settings(s)
+    if client is None:
+        raise CLIError("set CS2BOT_TELEGRAM__BOT_TOKEN and CS2BOT_TELEGRAM__CHAT_ID")
+    try:
+        ok = client.send(message)
+    finally:
+        client.close()
+    if not ok:
+        raise CLIError(f"sending failed: {client.last_error}")
+    typer.echo(f"sent to chat {s.telegram.chat_id}")
 
 
 if __name__ == "__main__":

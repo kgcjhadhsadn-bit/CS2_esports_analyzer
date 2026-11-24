@@ -20,6 +20,7 @@ from cs2bot.domain.betting import (
     ExecutorHealth,
     PlacementResult,
 )
+from cs2bot.domain.control import LoginAttempt
 
 HaltCheck = Callable[[], tuple[bool, str | None]]
 """``() -> (halted, reason)``; same shape as :func:`cs2bot.db.state.is_trading_halted` minus the session."""
@@ -49,6 +50,18 @@ class AccountExecutor(BetExecutor, Protocol):
     def fetch_bet_history(self, since: datetime) -> list[BookmakerBetRecord]: ...
 
 
+@runtime_checkable
+class AutoLoginExecutor(Protocol):
+    """An executor that can log in by itself with saved credentials (cloud autonomy).
+
+    ``auto_login`` fills AND submits the login form; it stops at an SMS / 2FA step (``TWO_FA_REQUIRED``)
+    and never automates a code. Implemented by ``BetclicExecutor``, ``ThreadBoundExecutor`` and
+    ``FakeExecutor``.
+    """
+
+    def auto_login(self, timeout_s: float | None = None) -> LoginAttempt: ...
+
+
 class ExecutorError(RuntimeError):
     """Base class of executor errors."""
 
@@ -71,6 +84,7 @@ class LoginRequiredError(ExecutorError):
 
 __all__ = [
     "AccountExecutor",
+    "AutoLoginExecutor",
     "BetExecutor",
     "BookmakerBetRecord",
     "BookmakerBetStatus",

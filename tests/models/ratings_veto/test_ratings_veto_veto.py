@@ -10,6 +10,7 @@ from pathlib import Path
 
 import pytest
 
+from cs2bot.config import DEFAULT_ACTIVE_MAP_POOL
 from cs2bot.domain.enums import MatchFormat, TeamSlot, VetoAction
 from cs2bot.domain.predictions import MapSequenceProbability
 from cs2bot.domain.records import VetoRecord, VetoStep
@@ -939,7 +940,8 @@ def test_save_load_round_trip(tmp_path: Path) -> None:
 
 
 def test_default_pool_comes_from_the_active_duty_list() -> None:
-    assert list(VetoConfig().default_map_pool) == POOL7
+    assert list(VetoConfig().default_map_pool) == list(DEFAULT_ACTIVE_MAP_POOL)
+    assert "cache" in DEFAULT_ACTIVE_MAP_POOL and "train" not in DEFAULT_ACTIVE_MAP_POOL
     # records without a pool and without a leftover step fall back to the default pool
     rec = VetoRecord(
         match_id=1,
@@ -954,7 +956,7 @@ def test_default_pool_comes_from_the_active_duty_list() -> None:
     assert model.preference(1, "nuke", BAN) > 0 > model.preference(1, "mirage", BAN)
     # an empty pool at prediction time (a MatchContext that has none yet) means the default pool too
     seqs = model.predict_sequences(1, 2, MatchFormat.BO1, [])
-    assert {s.maps[0] for s in seqs} == set(POOL7)
+    assert {s.maps[0] for s in seqs} == set(DEFAULT_ACTIVE_MAP_POOL)
     assert sum(s.probability for s in seqs) == pytest.approx(1.0)
     custom = VetoModel(VetoConfig(default_map_pool=("mirage", "nuke", "dust2")))
     assert {s.maps[0] for s in custom.predict_sequences(1, 2, MatchFormat.BO1, [])} == {

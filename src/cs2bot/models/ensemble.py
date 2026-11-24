@@ -108,6 +108,7 @@ from cs2bot.models.calibration import (
     logit,
     sigmoid,
 )
+from cs2bot.models.confidence import high_confidence_report
 from cs2bot.utils.names import normalize_map_name
 from cs2bot.utils.time import ensure_utc, utcnow
 
@@ -171,6 +172,15 @@ class EnsembleConfig(BaseModel):
     min_gain_to_split: float = 0.0
     monotone_features: tuple[str, ...] = (RATING_LOGIT_FEATURE, "rating_p", "rating_c_map")
     drop_features: tuple[str, ...] = ()
+    # deep_data: optional feature groups (name, column prefixes), each kept only when it improves the
+    # stacked out-of-fold log-loss of the pre-holdout data by at least ``screen_min_gain``
+    screen_feature_groups: bool = True
+    feature_groups: tuple[tuple[str, tuple[str, ...]], ...] = (
+        ("deep", ("diff_dp_", "t1_dp_", "t2_dp_", "dp_", "stage_", "stakes_level")),
+        ("market", ("mkt_", "sharp_")),
+    )
+    screen_min_gain: float = 0.0005
+    screen_z: float = 1.0  # the gain must also exceed this many standard errors (paired, per match)
     num_threads: int = 1
     seed: int = 20231
     # stacker / uncertainty
@@ -217,6 +227,11 @@ class FitReport(BaseModel):
     feature_importance: dict[str, float] = Field(default_factory=dict)  # top features (gain share)
     refit_on_all: bool = False
     warnings: list[str] = Field(default_factory=list)
+    # deep_data: reliability of the cross-fitted calibrated holdout in [0.75, 1] (2.5-pp bins, both
+    # teams' sides folded in; see cs2bot.models.confidence.high_confidence_report)
+    high_confidence: dict[str, Any] = Field(default_factory=dict)
+    # deep_data: the optional feature groups screened on the pre-holdout data (kept or dropped)
+    feature_groups: dict[str, Any] = Field(default_factory=dict)
 
 
 # ---------------------------------------------------------------------------------------------
@@ -285,6 +300,8 @@ class MapWinEnsemble:
         self._core: _Core | None = None
         self._calibrator: AnyCalibrator = IdentityCalibrator(eps=self.config.calibration_eps).fit([0.5], [1])
         self.report: FitReport | None = None
+        self._high_confidence: dict[str, Any] = {}
+        self._group_screen: dict[str, Any] = {}
         self.model_version = "ensemble-unfitted"
         self.data_end: datetime | None = None
 
@@ -386,13 +403,11 @@ class MapWinEnsemble:
             z = logit(frame["rating_p"].to_numpy(dtype=float), _P_CLIP)
         return np.asarray(np.nan_to_num(z, nan=0.0), dtype=float)
 
-    def _fit_core(self, x_frame: pd.DataFrame, y: np.ndarray, meta: pd.DataFrame) -> _Core:
+    def _oof_predictions(
+        self, x: np.ndarray, y: np.ndarray, meta: pd.DataFrame, features: list[str]
+    ) -> tuple[np.ndarray, int]:
+        """Expanding-window CV -> out-of-fold LightGBM predictions (NaN for the first block)."""
         cfg = self.config
-        features = [c for c in x_frame.columns if c not in set(cfg.drop_features)]
-        x = x_frame[features].to_numpy(dtype=float)
-        warnings: list[str] = []
-
-        # expanding-window CV -> out-of-fold LightGBM predictions
         n_matches = int(meta["match_id"].nunique())
         n_folds = max(1, min(cfg.n_cv_folds, n_matches // 10))
         blocks = _match_blocks(meta, n_folds + 1)
@@ -406,6 +421,86 @@ class MapWinEnsemble:
                 x[train_mask], y[train_mask], meta.loc[train_mask], features, cfg.seed + k
             )
             oof[test_mask] = booster.predict(x[test_mask], num_iteration=booster.best_iteration or None)
+        return oof, n_folds
+
+    def _stacked_oof_losses(self, x_frame: pd.DataFrame, y: np.ndarray, meta: pd.DataFrame) -> np.ndarray:
+        """Per-row log-loss of the stacked (rating + LightGBM) out-of-fold predictions of a feature set.
+
+        NaN for rows without an out-of-fold prediction (first CV block) and for mirrored rows; all NaN
+        when there are too few rows to fit the stacker. The rows with a value depend only on the CV
+        blocks, so two feature sets of the same frame are compared on the same rows.
+        """
+        out = np.full(len(y), np.nan)
+        features = list(x_frame.columns)
+        oof, _ = self._oof_predictions(x_frame.to_numpy(dtype=float), y, meta, features)
+        have = np.isfinite(oof) & ~meta["mirrored"].to_numpy()
+        if int(have.sum()) < self.config.min_oof_rows or len(np.unique(y[have])) < 2:
+            return out
+        rating_z = self._rating_logit(x_frame)
+        design = np.column_stack([rating_z[have], logit(oof[have], _P_CLIP)])
+        c, b = fit_logistic(design, y[have], ridge=self.config.stacker_ridge, lower_bounds=[0.0, 0.0])
+        p = np.clip(sigmoid(design @ np.asarray(c, dtype=float) + float(b)), 1e-15, 1 - 1e-15)
+        yh = y[have]
+        out[have] = -(yh * np.log(p) + (1.0 - yh) * np.log(1.0 - p))
+        return out
+
+    def _screen_feature_groups(
+        self, x_frame: pd.DataFrame, y: np.ndarray, meta: pd.DataFrame
+    ) -> tuple[list[str], dict[str, Any]]:
+        """Greedy forward selection of optional feature groups on out-of-fold log-loss.
+
+        The classic features are always kept. Each optional group (``EnsembleConfig.feature_groups``:
+        the deep_data block and the market block) is added only when it lowers the stacked
+        out-of-fold log-loss of the current set by at least ``screen_min_gain`` **and** by at least
+        ``screen_z`` standard errors of the paired per-match loss difference (a gain inside the noise
+        is not trusted). Runs on the rows it is given (the pre-holdout part), so the holdout metrics
+        stay honest. Returns the columns to drop and a summary for the fit report.
+        """
+        cfg = self.config
+        cols = [c for c in x_frame.columns if c not in set(cfg.drop_features)]
+        groups: dict[str, list[str]] = {}
+        assigned: set[str] = set()
+        for name, prefixes in cfg.feature_groups:
+            members = [c for c in cols if c.startswith(tuple(prefixes)) and c not in assigned]
+            assigned.update(members)
+            with_data = [c for c in members if x_frame[c].notna().any()]
+            if with_data:
+                groups[name] = with_data
+        summary: dict[str, Any] = {"groups": {}, "base_log_loss": None}
+        if not groups:
+            return sorted(assigned), summary
+        current = [c for c in cols if c not in assigned]
+        match_ids = meta["match_id"].to_numpy() if "match_id" in meta else np.arange(len(y))
+        best = self._stacked_oof_losses(x_frame[current], y, meta)
+        summary["base_log_loss"] = _nanmean(best)
+        for name, members in groups.items():
+            trial = self._stacked_oof_losses(x_frame[current + members], y, meta)
+            gain, se = _paired_gain(best, trial, match_ids)
+            keep = bool(math.isfinite(gain) and gain >= cfg.screen_min_gain and gain >= cfg.screen_z * se)
+            summary["groups"][name] = {
+                "n_columns": len(members),
+                "oof_log_loss": _nanmean(trial),
+                "gain": None if math.isnan(gain) else gain,
+                "gain_se": None if math.isnan(se) else se,
+                "kept": keep,
+            }
+            if keep:
+                current += members
+                best = trial
+        dropped = [c for c in cols if c not in set(current)]
+        return dropped, summary
+
+    def _fit_core(
+        self, x_frame: pd.DataFrame, y: np.ndarray, meta: pd.DataFrame, *, drop: Sequence[str] = ()
+    ) -> _Core:
+        cfg = self.config
+        excluded = set(cfg.drop_features) | set(drop)
+        features = [c for c in x_frame.columns if c not in excluded]
+        x = x_frame[features].to_numpy(dtype=float)
+        warnings: list[str] = []
+
+        # expanding-window CV -> out-of-fold LightGBM predictions
+        oof, n_folds = self._oof_predictions(x, y, meta, features)
 
         # stacker on the OOF rows
         have = np.isfinite(oof)
@@ -596,6 +691,7 @@ class MapWinEnsemble:
         self, x_all: pd.DataFrame, y_all: np.ndarray, meta_all: pd.DataFrame, n_rows: int
     ) -> FitReport:
         cfg = self.config
+        self._high_confidence = {}
         # time-ordered holdout
         starts = meta_all.drop_duplicates("match_id").sort_values(["as_of", "match_id"], kind="mergesort")
         last = ensure_utc(starts["as_of"].iloc[-1].to_pydatetime())
@@ -614,23 +710,35 @@ class MapWinEnsemble:
         if train_rows < cfg.min_rows // 2 or not hold_ids:
             # not enough to hold anything out: train on everything, no calibration
             warnings.append("too little data for a separate calibration holdout; identity calibration")
-            core = self._fit_core(x_all, y_all, meta_all)
+            drop = self._screen(x_all, y_all, meta_all)
+            core = self._fit_core(x_all, y_all, meta_all, drop=drop)
             self._core = core
             self._calibrator = IdentityCalibrator(eps=cfg.calibration_eps).fit([0.5], [1])
             return self._finish(core, n_rows, meta_all, is_hold=None, holdout={}, warnings=warnings)
 
         x_tr, y_tr, m_tr = x_all.loc[~is_hold], y_all[~is_hold], meta_all.loc[~is_hold]
         x_ho, y_ho, m_ho = x_all.loc[is_hold], y_all[is_hold], meta_all.loc[is_hold]
-        core = self._fit_core(x_tr.reset_index(drop=True), y_tr, m_tr.reset_index(drop=True))
+        x_tr, m_tr = x_tr.reset_index(drop=True), m_tr.reset_index(drop=True)
+        drop = self._screen(x_tr, y_tr, m_tr)
+        core = self._fit_core(x_tr, y_tr, m_tr, drop=drop)
         out = self._core_outputs(core, x_ho)
         n_hold_maps = int((~m_ho["mirrored"]).sum())
         self._calibrator = self._fit_calibrator(out["stacked"], y_ho, n_hold_maps)
         holdout = self._holdout_metrics(out, y_ho, m_ho)
         if cfg.refit_on_all:
             warnings.extend(f"pre-holdout model: {w}" for w in core.warnings)
-            core = self._fit_core(x_all, y_all, meta_all)  # its own warnings are added by _finish
+            core = self._fit_core(x_all, y_all, meta_all, drop=drop)  # own warnings added by _finish
         self._core = core
         return self._finish(core, n_rows, meta_all, is_hold=is_hold, holdout=holdout, warnings=warnings)
+
+    def _screen(self, x: pd.DataFrame, y: np.ndarray, meta: pd.DataFrame) -> list[str]:
+        """Columns to leave out after the feature-group screen (empty when screening is off)."""
+        self._group_screen = {}
+        if not self.config.screen_feature_groups:
+            return []
+        drop, summary = self._screen_feature_groups(x, y, meta)
+        self._group_screen = summary
+        return drop
 
     def _fit_calibrator(self, p: np.ndarray, y: np.ndarray, n_maps: int) -> AnyCalibrator:
         cfg = self.config
@@ -666,6 +774,7 @@ class MapWinEnsemble:
             cal[test] = calib.transform(out["stacked"][test])
         if n_maps and np.all(np.isfinite(cal[orig])):
             res["calibrated"] = _metrics(y[orig], cal[orig])
+            self._high_confidence = high_confidence_report(cal[orig], y[orig], fold=True)
         return res
 
     def _version(self, n_rows: int, features: Sequence[str]) -> str:
@@ -754,6 +863,8 @@ class MapWinEnsemble:
             feature_importance=dict(list(importance.items())[:25]),
             refit_on_all=self.config.refit_on_all and is_hold is not None,
             warnings=[*warnings, *core.warnings],
+            high_confidence=dict(self._high_confidence) if is_hold is not None else {},
+            feature_groups=dict(self._group_screen),
         )
         return self.report
 
@@ -1048,6 +1159,28 @@ class MapWinEnsemble:
     @classmethod
     def load(cls, path: str | Path) -> MapWinEnsemble:
         return cls.from_dict(json.loads(Path(path).read_text(encoding="utf-8")))
+
+
+def _nanmean(values: np.ndarray) -> float | None:
+    finite = values[np.isfinite(values)]
+    return float(finite.mean()) if finite.size else None
+
+
+def _paired_gain(base: np.ndarray, trial: np.ndarray, match_ids: np.ndarray) -> tuple[float, float]:
+    """Mean log-loss gain (base - trial) over rows scored by both, and its standard error with the
+    rows of one match pooled (maps of a series are correlated). NaN when nothing is comparable."""
+    both = np.isfinite(base) & np.isfinite(trial)
+    if not both.any():
+        return math.nan, math.nan
+    diff = base[both] - trial[both]
+    frame = pd.DataFrame({"m": match_ids[both], "d": diff}).groupby("m")["d"].sum()
+    n_rows = float(both.sum())
+    gain = float(diff.mean())
+    if len(frame) < 2:
+        return gain, math.inf
+    # per-match totals -> SE of the mean per row
+    se = float(frame.std(ddof=1) * math.sqrt(len(frame)) / n_rows)
+    return gain, se
 
 
 def _clip(p: float) -> float:

@@ -124,8 +124,10 @@ SINGLE_RULES: list[tuple[str, Case, ReasonCode]] = [
     ("unknown-start", Case(match_kw={"scheduled_at": None}), ReasonCode.OUTSIDE_TIME_WINDOW),
     # p = 0.70 at 1.80: EV = 0.7 * 0.584 - 0.3 = 0.109 is fine, the confidence is not
     ("low-probability", Case(priced_kw={"p_win": 0.70, "odds": "1.80"}), ReasonCode.LOW_PROBABILITY),
-    # p = 0.80 at 1.45: EV = 0.8 * 0.276 - 0.2 = 0.0208 < 0.03
-    ("low-ev", Case(priced_kw={"odds": "1.45"}), ReasonCode.LOW_EV),
+    # The EV rule is OFF by default (owner decision 2026-11-24: confidence only, odds ignored,
+    # min_ev = -1.0). With the optional break-even guard (min_ev = 0): p = 0.80 at 1.40 is a loss after
+    # the 12% stake tax: EV = 0.8 * 0.232 - 0.2 = -0.0144 < 0 (break-even odds 1 / (0.8 * 0.88) = 1.42)
+    ("low-ev", Case(priced_kw={"odds": "1.40"}, settings_kw={"min_ev": 0.0}), ReasonCode.LOW_EV),
     ("high-sigma", Case(priced_kw={"sigma": 0.06}), ReasonCode.HIGH_SIGMA),
     ("low-completeness", Case(match_kw={"data_completeness": 0.9}), ReasonCode.LOW_DATA_COMPLETENESS),
     ("unknown-completeness", Case(match_kw={"data_completeness": None}), ReasonCode.LOW_DATA_COMPLETENESS),
@@ -172,6 +174,7 @@ def test_several_failures_are_all_listed() -> None:
             "context_veto_reason": "stand-in AWPer, lineup unclear",
             "already_bet_keys": {bet_key(1, MAP1.key(), "team1")},
         },
+        settings_kw={"min_ev": 0.03},  # the EV rule enabled (it is off by default)
         now=T0 + timedelta(hours=1),
     ).run()
     assert not d.accepted
@@ -276,9 +279,9 @@ def test_evaluate_requires_aware_now_and_evaluate_all() -> None:
             now=datetime(2026, 11, 20, 18, 1),
         )
     decisions = evaluate_all(
-        [make_priced(), make_priced(odds="1.45")],
+        [make_priced(), make_priced(odds="1.40")],  # 1.40 is below break-even for p = 0.80
         match=match,
-        settings=DecisionSettings(),
+        settings=DecisionSettings(min_ev=0.0),  # break-even guard (the EV rule is off by default)
         betclic=BetclicSettings(),
         now=NOW,
     )
@@ -410,7 +413,9 @@ def test_non_finite_numbers_never_pass() -> None:
         link_confidence=nan,
         link_status=LinkStatus.AUTO,
     )
-    d = evaluate(broken, match=match, settings=DecisionSettings(), betclic=BetclicSettings(), now=NOW)
+    d = evaluate(
+        broken, match=match, settings=DecisionSettings(min_ev=0.0), betclic=BetclicSettings(), now=NOW
+    )
     assert not d.accepted
     assert codes(d) == [
         ReasonCode.INVALID_NUMBERS.value,
@@ -554,7 +559,7 @@ def test_naive_expiry_on_a_prediction_flag_is_read_as_utc(session: Session) -> N
 
 
 def test_min_acceptable_odds_is_bounded_by_the_tolerance_and_the_edge() -> None:
-    settings, betclic = DecisionSettings(), BetclicSettings()
+    settings, betclic = DecisionSettings(min_ev=0.03), BetclicSettings()  # the EV rule enabled
     # p = 0.8: EV >= 3 % needs odds >= 1.03 / 0.704 = 1.464 (rounded up)
     generous = make_priced(p_win=0.8, odds="1.60")
     # 2 % tolerance -> 1.568: the tolerance binds, the edge is still there at that price
@@ -575,7 +580,7 @@ def test_min_acceptable_odds_is_bounded_by_the_tolerance_and_the_edge() -> None:
         "1.464"
     )
     # per-market EV threshold
-    strict = DecisionSettings(market_overrides={"match_winner": MarketThresholds(min_ev=0.10)})
+    strict = DecisionSettings(min_ev=0.03, market_overrides={"match_winner": MarketThresholds(min_ev=0.10)})
     assert min_acceptable_odds(generous, settings=strict, betclic=betclic, odds_tolerance=0.2) == Decimal(
         "1.563"
     )  # 1.10 / 0.704 = 1.5625
@@ -585,7 +590,7 @@ def test_min_acceptable_odds_is_bounded_by_the_tolerance_and_the_edge() -> None:
         "1.288"
     )
     # the global odds range is respected
-    floor = DecisionSettings(min_odds=Decimal("1.55"))
+    floor = DecisionSettings(min_ev=0.03, min_odds=Decimal("1.55"))
     assert min_acceptable_odds(generous, settings=floor, betclic=betclic, odds_tolerance=0.2) == Decimal(
         "1.55"
     )
@@ -594,7 +599,7 @@ def test_min_acceptable_odds_is_bounded_by_the_tolerance_and_the_edge() -> None:
 def test_min_acceptable_odds_never_accepts_a_bet_that_fails_the_ev_rule() -> None:
     """Whatever the tolerance, a price at or above the result still passes the EV rule, and a
     rejected (no-edge) outcome never gets a floor below its own quote."""
-    settings, betclic = DecisionSettings(), BetclicSettings()
+    settings, betclic = DecisionSettings(min_ev=0.03), BetclicSettings()  # the EV rule enabled
     for p_win, odds in ((0.8, "1.60"), (0.9, "1.30"), (0.76, "1.55"), (0.95, "1.25")):
         priced = make_priced(p_win=p_win, odds=odds)
         for tolerance in (0.0, 0.02, 0.1, 0.5, 0.99):
@@ -635,3 +640,53 @@ def test_a_live_bookmaker_event_is_never_a_pre_match_bet(session: Session) -> No
     other = add_match(session, scheduled_at=T0 + timedelta(hours=3))
     info = load_match_decision_info(session, match_id=other.id, bookmaker_event_id=event.id, now=NOW)
     assert info.match_status is MatchStatus.SCHEDULED and info.link_status is LinkStatus.UNLINKED
+
+
+def test_ev_rule_is_off_by_default_odds_are_ignored() -> None:
+    """Owner decision 2026-11-24 ("even a 1.28 wins"): a confident pick is accepted whatever the odds,
+    also when the 12% stake tax makes its EV negative; the price floor is only the odds tolerance."""
+    assert DecisionSettings().min_ev == -1.0
+    low_odds = Case(priced_kw={"p_win": 0.89, "odds": "1.10"}).run()  # EV = 0.89 * 0.968 - 1 < 0
+    assert low_odds.priced.ev < 0
+    assert low_odds.accepted and low_odds.reasons == []
+    # a per-market override can still turn a break-even guard on for one market type
+    guarded = DecisionSettings(market_overrides={"match_winner": MarketThresholds(min_ev=0.0)})
+    assert codes(
+        Case(
+            priced_kw={"p_win": 0.89, "odds": "1.10"},
+            settings_kw={"market_overrides": guarded.market_overrides},
+        ).run()
+    ) == ["low_ev"]
+    priced = make_priced(p_win=0.89, odds="1.10")
+    floor = min_acceptable_odds(
+        priced, settings=DecisionSettings(), betclic=BetclicSettings(), odds_tolerance=0.02
+    )
+    assert floor == Decimal("1.078")  # 1.10 x 0.98, no EV floor
+
+
+def test_untrusted_calibration_rule() -> None:
+    strict = {"require_trusted_calibration": True}
+    base = Case(settings_kw=strict)
+    priced, match = make_priced(), MatchDecisionInfo(
+        match_id=1, scheduled_at=T0 + timedelta(hours=3), data_completeness=0.99, link_confidence=0.97,
+        link_status=LinkStatus.AUTO,
+    )  # fmt: skip
+    kwargs = {
+        "match": match,
+        "settings": DecisionSettings(**strict),
+        "betclic": BetclicSettings(),
+        "now": NOW,
+    }
+    assert evaluate(priced, **kwargs, trusted_markets={"match_winner"}).accepted  # type: ignore[arg-type]
+    untrusted = evaluate(priced, **kwargs, trusted_markets=set())  # type: ignore[arg-type]
+    assert codes(untrusted) == [ReasonCode.UNTRUSTED_CALIBRATION.value]
+    assert base.run().accepted  # the trusted set is unknown (None): no check
+    off = evaluate(
+        priced,
+        match=match,
+        settings=DecisionSettings(),
+        betclic=BetclicSettings(),
+        now=NOW,
+        trusted_markets=set(),
+    )
+    assert off.accepted  # the rule is off unless require_trusted_calibration

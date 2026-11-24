@@ -749,9 +749,38 @@ All changes go through `cs2bot.db.state` and write an `audit_log` row (actor `da
   "halted": true,
   "reason": "kill switch is on",
   "kill_switch": {"on": true, "reason": "manual stop", "updated_at": "2026-11-20T12:00:01Z", "updated_by": "dashboard"},
-  "paused": {"on": false, "reason": null, "updated_at": "2026-11-20T12:00:03Z", "updated_by": "dashboard"}
+  "paused": {"on": true, "reason": "daily loss limit reached: ...", "updated_at": "2026-11-20T12:00:03Z", "updated_by": "system"},
+  "pause_reasons": [
+    {
+      "code": "loss_limit_daily",
+      "label": "daily loss limit reached (lifts at the next Warsaw midnight)",
+      "message": "daily loss limit reached: realized loss today 50.00 PLN >= 50.00 PLN ...",
+      "since": "2026-11-20T12:00:03Z", "actor": "system", "count": 1,
+      "auto_resume": true, "eta": "2026-11-20T23:00:00Z", "last_check": "daily loss limit"
+    }
+  ],
+  "circuit_open": false,
+  "circuit_codes": [],
+  "autonomy": {
+    "enabled": true, "auto_login": true, "last_check_at": "2026-11-20T12:05:00Z",
+    "last_login_status": null, "last_login_at": null, "last_login_message": null, "login_blocked": false
+  },
+  "telegram": {
+    "enabled": true, "configured": true, "last_scan_at": "2026-11-20T12:05:10Z", "last_ok_at": "2026-11-20T12:00:05Z",
+    "last_error": null, "sent": 42, "last_poll_at": "2026-11-20T12:05:00Z", "commands_handled": 3
+  }
 }
 ```
+
+`pause_reasons` (cloud autonomy) lists every active pause reason. `code` is one of `manual`,
+`loss_limit_daily`, `loss_limit_weekly`, `uncertain_bet`, `login_required`, `2fa_required`,
+`balance_mismatch`, `selector_error`, `executor_unavailable`, `circuit_open`, `other`.
+`auto_resume` = the auto-resume service will lift it once its cause is resolved (autonomy enabled, the
+code allowed, its circuit breaker closed); `eta` is exact for loss limits and the next login attempt for
+login reasons. `circuit_open` / `circuit_codes`: reasons that lifted themselves too often and now wait
+for the owner. The kill-switch endpoints return only the switch. `GET /api/health` embeds the same
+object under `trading` and adds the alerts `circuit_open`, `betclic_2fa_required`,
+`auto_login_blocked` (critical), `telegram_not_configured`, `telegram_failing` (warning).
 
 ### `GET /api/control/kill-switch` · `POST /api/control/kill-switch`
 
@@ -763,9 +792,10 @@ Body: `{"on": true, "reason": "manual stop"}` (`reason` optional, <= 500 chars).
 
 ### `POST /api/control/pause` · `POST /api/control/resume`
 
-Optional body `{"reason": "taking a break"}`. Pause halts trading until resumed (the engine also
-pauses itself when a loss limit is hit). Resume clears the pause flag only - it does **not** turn
-off the kill switch. Response: the trading state (as `GET /api/control/state`).
+Optional body `{"reason": "taking a break"}`. Pause adds a `manual` pause reason (never lifted
+automatically; the engine also pauses itself with its own reason codes, e.g. when a loss limit is hit).
+Resume clears every pause reason, an open circuit breaker included - it does **not** turn off the kill
+switch. Response: the trading state (as `GET /api/control/state`).
 
 ### `GET /api/control/config`
 
@@ -786,7 +816,7 @@ off the kill switch. Response: the trading state (as `GET /api/control/state`).
       "max_bets_per_day": 10, "stake_step": "0.10"
     }
   },
-  "defaults": {"decision": {"min_ev": 0.03, "...": "all fields"}, "bankroll": {"kelly_fraction": 0.25, "...": "all fields"}},
+  "defaults": {"decision": {"min_ev": -1.0, "...": "all fields"}, "bankroll": {"kelly_fraction": 0.25, "...": "all fields"}},
   "overrides": {"decision": {"min_ev": 0.05}, "bankroll": {"kelly_fraction": 0.2}},
   "updated_at": "2026-11-20T12:00:05Z",
   "updated_by": "dashboard",
@@ -805,7 +835,7 @@ Body: `{"decision": {...} | null, "bankroll": {...} | null}`.
 
 Validation (422 with one item per problem, nothing is stored): unknown sections / fields, wrong
 types, non-finite numbers (`NaN` / `Infinity`, which Python's JSON parser would otherwise accept and
-which would silently disable a threshold), and ranges: `min_probability` (0, 1); `min_ev` [0, 1]; `max_sigma` (0, 0.5];
+which would silently disable a threshold), and ranges: `min_probability` (0, 1); `min_ev` [-1, 1] (-1 = odds ignored, the default); `max_sigma` (0, 0.5];
 `min_data_completeness`, `min_event_link_confidence` [0, 1]; `min_odds` >= 1 and
 `min_odds` < `max_odds` <= 1000; `min_minutes_before_start` [0, 10080];
 `max_hours_before_start` (0, 720]; `market_overrides` keys must be market types with thresholds in

@@ -332,7 +332,8 @@ def test_features_on_the_synthetic_universe_are_complete_and_sane(universe_store
         assert 0.0 <= f[name] <= 1.0
     # eco rounds are won far less often than full-buy rounds in the generator
     assert f["eco_force_conv_180d"] < f["full_buy_win_pct_180d"] < f["anti_eco_win_pct_180d"]
-    assert f["pool_depth"] == 7 and f["roster_continuity"] == 1.0
+    # 7-map pool; on this small universe a rarely vetoed-in map can fall below pool_min_maps
+    assert 6 <= f["pool_depth"] <= 7 and f["roster_continuity"] == 1.0
     meta = universe_store.meta_features(rec.played_at)
     assert meta["days_since_patch"] >= 0 and meta["patch_index"] >= 0
     # the strength proxy recovers the true team ordering reasonably well

@@ -15,6 +15,13 @@ HLTV is scraped from the owner's home connection, so the fetcher is deliberately
   raised and an exponential cool-down (persisted in ``<cache_dir>/_cooldown.json``) blocks further
   network fetches. There is deliberately no challenge solving, CAPTCHA handling or fingerprint
   spoofing / stealth tooling.
+* Proxy fallback (deep_data, for a VPS whose datacenter IP gets challenged): with ``proxy_url`` set and
+  ``proxy_mode="after_block"`` (default) pages are fetched directly; when the direct route hits a
+  challenge, or its cool-down is active, the same page is retried once through the proxy. The proxy
+  route has its own cool-down (``proxy_cooldown_base_s`` .. ``proxy_cooldown_max_s``, persisted in
+  ``<cache_dir>/_cooldown_proxy.json``) and its own browser profile (``<profile>-proxy``), so a block
+  on one route never hides the other. ``proxy_mode="always"`` sends every fetch through the proxy (one
+  route, the classic behaviour). Challenges are never solved on either route.
 
 Not thread-safe across threads for the browser mode (Playwright's sync API is bound to the thread that
 started it); use one fetcher per worker thread, outside any running asyncio loop.
@@ -57,6 +64,7 @@ from cs2bot.utils.time import parse_datetime, utcnow
 logger = logging.getLogger(__name__)
 
 COOLDOWN_FILE = "_cooldown.json"
+PROXY_COOLDOWN_FILE = "_cooldown_proxy.json"
 
 
 @dataclass(frozen=True)
@@ -413,6 +421,19 @@ class BrowserPageLoader:
             self._playwright = None
 
 
+def direct_settings(settings: HLTVSettings) -> HLTVSettings:
+    """``settings`` without the proxy (the direct route of ``proxy_mode="after_block"``)."""
+    return settings.model_copy(update={"proxy_url": None})
+
+
+def proxy_profile_dir(profile: Path | None) -> Path | None:
+    """Separate persistent profile for the proxy route (Chromium cannot open one profile twice, and
+    cookies earned through the proxy IP should not be replayed from the direct IP)."""
+    if profile is None:
+        return None
+    return profile.with_name(f"{profile.name}-proxy")
+
+
 class HttpPageLoader:
     """httpx loader (no JavaScript: Cloudflare challenges cannot clear in this mode)."""
 
@@ -494,7 +515,10 @@ class HLTVFetcher:
         now: Callable[[], datetime] = utcnow,
         options: FetchOptions | None = None,
         rng: random.Random | None = None,
+        proxy_page_loader: PageLoader | Callable[[str], LoadedPage | str] | None = None,
     ) -> None:
+        """``proxy_page_loader`` replaces the loader of the proxy route (tests); it is only used when
+        ``settings.proxy_url`` is set and ``settings.proxy_mode == "after_block"``."""
         self.settings = settings
         self.options = options or FetchOptions.from_settings(settings)
         self.base_url = settings.base_url.rstrip("/")
@@ -513,7 +537,19 @@ class HLTVFetcher:
         self._blocked_until: datetime | None = None
         self._consecutive_blocks = 0
         self._block_reason: str | None = None
+        self._proxy_loader = proxy_page_loader
+        self._owns_proxy_loader = proxy_page_loader is None
+        self._proxy_blocked_until: datetime | None = None
+        self._proxy_consecutive_blocks = 0
+        self._proxy_block_reason: str | None = None
+        self._proxy_notified = False
         self._load_cooldown()
+        self._load_proxy_cooldown()
+
+    @property
+    def proxy_fallback_enabled(self) -> bool:
+        """True when a blocked direct fetch is retried through ``settings.proxy_url``."""
+        return self.settings.proxy_url is not None and self.settings.proxy_mode == "after_block"
 
     # ------------------------------------------------------------------ public API
     def url_for(self, path_or_url: str) -> str:
@@ -561,12 +597,26 @@ class HLTVFetcher:
 
     @property
     def blocked_until(self) -> datetime | None:
+        """End of the direct route's cool-down (the only route unless the proxy fallback is on)."""
         return self._blocked_until
+
+    @property
+    def proxy_blocked_until(self) -> datetime | None:
+        """End of the proxy route's own cool-down (``proxy_mode="after_block"`` only)."""
+        return self._proxy_blocked_until
 
     def close(self) -> None:
         loader, self._loader = self._loader, (None if self._owns_loader else self._loader)
         if self._owns_loader and loader is not None:
             close = getattr(loader, "close", None)
+            if callable(close):
+                close()
+        proxy, self._proxy_loader = (
+            self._proxy_loader,
+            (None if self._owns_proxy_loader else self._proxy_loader),
+        )
+        if self._owns_proxy_loader and proxy is not None:
+            close = getattr(proxy, "close", None)
             if callable(close):
                 close()
 
@@ -620,14 +670,26 @@ class HLTVFetcher:
     # ------------------------------------------------------------------ network
     def _ensure_loader(self) -> PageLoader | Callable[[str], LoadedPage | str]:
         if self._loader is None:
-            if self.settings.fetch_mode == "browser":
-                self._loader = BrowserPageLoader(self.settings, self.options, clock=self._clock)
+            # with the after-block fallback the primary route is direct; "always" keeps the proxy in it
+            settings = direct_settings(self.settings) if self.proxy_fallback_enabled else self.settings
+            if settings.fetch_mode == "browser":
+                self._loader = BrowserPageLoader(settings, self.options, clock=self._clock)
             else:
-                self._loader = HttpPageLoader(self.settings)
+                self._loader = HttpPageLoader(settings)
         return self._loader
 
-    def _call_loader(self, url: str) -> LoadedPage:
-        loader = self._ensure_loader()
+    def _ensure_proxy_loader(self) -> PageLoader | Callable[[str], LoadedPage | str]:
+        if self._proxy_loader is None:
+            if self.settings.fetch_mode == "browser":
+                options = FetchOptions(**self.options.__dict__)
+                options.browser_profile_dir = proxy_profile_dir(self.options.browser_profile_dir)
+                self._proxy_loader = BrowserPageLoader(self.settings, options, clock=self._clock)
+            else:
+                self._proxy_loader = HttpPageLoader(self.settings)
+        return self._proxy_loader
+
+    def _call_loader(self, url: str, *, via_proxy: bool = False) -> LoadedPage:
+        loader = self._ensure_proxy_loader() if via_proxy else self._ensure_loader()
         attempts = max(0, self.options.transport_retries) + 1
         for attempt in range(1, attempts + 1):
             try:
@@ -652,27 +714,51 @@ class HLTVFetcher:
         raise HLTVFetchError(f"fetching {url} failed", url=url)  # pragma: no cover - loop always returns
 
     def _fetch_network(self, url: str) -> LoadedPage:
-        self._check_cooldown(url)
+        if not self.proxy_fallback_enabled:
+            return self._fetch_route(url, via_proxy=False)
+        try:
+            return self._fetch_route(url, via_proxy=False)
+        except HLTVBlockedError as exc:
+            if not self._proxy_notified:
+                logger.warning(
+                    "HLTV direct route blocked (%s): falling back to the configured proxy", exc.reason
+                )
+                self._proxy_notified = True
+            else:
+                logger.info("HLTV direct route blocked (%s); fetching %s through the proxy", exc.reason, url)
+            return self._fetch_route(url, via_proxy=True)
+
+    def _fetch_route(self, url: str, *, via_proxy: bool) -> LoadedPage:
+        if via_proxy:
+            self._check_proxy_cooldown(url)
+        else:
+            self._check_cooldown(url)
         slept = self._limiter.wait()
         self.stats.slept_s += slept
         self.stats.network_fetches += 1
         self.stats.last_url = url
         kind = classify_url(url).value
         self.stats.by_kind[kind] = self.stats.by_kind.get(kind, 0) + 1
-        logger.info("HLTV fetch %s", url)
-        loaded = self._call_loader(url)
+        logger.info("HLTV fetch %s%s", url, " (via proxy)" if via_proxy else "")
+        loaded = self._call_loader(url, via_proxy=via_proxy)
         status = loaded.status
         reason = detect_challenge(loaded.html)
         if reason is None and status in (403, 429):
             reason = f"http {status}"
         if reason is not None:
-            self._register_block(url, reason, status)
+            if via_proxy:
+                self._register_proxy_block(url, reason, status)
+            else:
+                self._register_block(url, reason, status)
         if status in (404, 410):
             raise HLTVNotFoundError(f"HLTV page not found: {url}", url=url, status=status)
         if status is not None and status >= 400:
             self.stats.errors += 1
             raise HLTVFetchError(f"HLTV answered HTTP {status} for {url}", url=url, status=status)
-        self._register_success()
+        if via_proxy:
+            self._register_proxy_success()
+        else:
+            self._register_success()
         return loaded
 
     # ------------------------------------------------------------------ cool-down
@@ -751,3 +837,83 @@ class HLTVFetcher:
             self._blocked_until = None
             self._block_reason = None
             self._save_cooldown()
+
+    # ------------------------------------------------------------------ proxy route cool-down
+    def _proxy_cooldown_path(self) -> Path:
+        return self.cache_dir / PROXY_COOLDOWN_FILE
+
+    def _load_proxy_cooldown(self) -> None:
+        try:
+            data = json.loads(self._proxy_cooldown_path().read_text(encoding="utf-8"))
+            self._proxy_blocked_until = parse_datetime(data.get("blocked_until"))
+            self._proxy_consecutive_blocks = int(data.get("consecutive_blocks", 0))
+            self._proxy_block_reason = data.get("reason")
+        except (OSError, ValueError, TypeError, AttributeError):  # missing / corrupt file: start clean
+            self._proxy_blocked_until, self._proxy_consecutive_blocks = None, 0
+
+    def _save_proxy_cooldown(self) -> None:
+        path = self._proxy_cooldown_path()
+        try:
+            if self._proxy_blocked_until is None and self._proxy_consecutive_blocks == 0:
+                path.unlink(missing_ok=True)
+                return
+            path.parent.mkdir(parents=True, exist_ok=True)
+            until = self._proxy_blocked_until
+            _atomic_write(
+                path,
+                json.dumps(
+                    {
+                        "blocked_until": until.isoformat() if until else None,
+                        "consecutive_blocks": self._proxy_consecutive_blocks,
+                        "reason": self._proxy_block_reason,
+                    }
+                ),
+            )
+        except OSError as exc:
+            logger.warning("could not persist the HLTV proxy cool-down in %s: %s", path, exc)
+
+    def _check_proxy_cooldown(self, url: str) -> None:
+        if self._proxy_blocked_until is None:
+            return
+        remaining = (self._proxy_blocked_until - self._now()).total_seconds()
+        if remaining > 0:
+            direct = (self._blocked_until - self._now()).total_seconds() if self._blocked_until else 0.0
+            raise HLTVBlockedError(
+                f"HLTV blocked on both routes: proxy cool-down active for another {remaining:.0f} s "
+                f"(last proxy block: {self._proxy_block_reason}); not fetching {url}",
+                url=url,
+                reason="cooldown",
+                retry_after_s=max(0.0, min(remaining, direct) if direct > 0 else remaining),
+            )
+
+    def _register_proxy_block(self, url: str, reason: str, status: int | None) -> None:
+        self._proxy_consecutive_blocks += 1
+        exponent = min(max(0, self._proxy_consecutive_blocks - 1), 40)
+        base = max(0.0, float(self.settings.proxy_cooldown_base_s))
+        cooldown = min(base * 2.0**exponent, max(0.0, float(self.settings.proxy_cooldown_max_s)))
+        self._proxy_blocked_until = self._now() + timedelta(seconds=cooldown)
+        self._proxy_block_reason = reason
+        self.stats.blocked += 1
+        self._save_proxy_cooldown()
+        logger.warning(
+            "HLTV block/challenge through the proxy too (%s) for %s; pausing proxy fetches for %.0f min "
+            "(proxy block #%d)",
+            reason,
+            url,
+            cooldown / 60.0,
+            self._proxy_consecutive_blocks,
+        )
+        raise HLTVBlockedError(
+            f"HLTV returned a challenge/block page through the proxy ({reason}) for {url}",
+            url=url,
+            status=status,
+            reason=reason,
+            retry_after_s=cooldown,
+        )
+
+    def _register_proxy_success(self) -> None:
+        if self._proxy_consecutive_blocks or self._proxy_blocked_until is not None:
+            self._proxy_consecutive_blocks = 0
+            self._proxy_blocked_until = None
+            self._proxy_block_reason = None
+            self._save_proxy_cooldown()

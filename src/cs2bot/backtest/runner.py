@@ -69,6 +69,7 @@ from cs2bot.domain.results import SettlementOutcome
 from cs2bot.engine import decision as engine_decision
 from cs2bot.engine import ev as engine_ev
 from cs2bot.models.calibration import brier, calibration_report, log_loss
+from cs2bot.models.confidence import ConfidenceGuard, high_confidence_report
 from cs2bot.models.ensemble import LookAheadError
 from cs2bot.utils.money import D, quantize_money
 from cs2bot.utils.time import ensure_utc, local_day_start, local_week_start, to_local, utcnow
@@ -541,6 +542,11 @@ def _fill_report(
         report.brier_bets = brier([p.y for p in bet_preds], [p.p for p in bet_preds])
         report.log_loss_bets = log_loss([p.y for p in bet_preds], [p.p for p in bet_preds])
     report.calibration = calibration_report(y_all, p_all, cfg.n_calibration_bins)
+    # deep_data: the confidence rule needs the [0.75, 1] range in 2.5-pp bins and a per-market verdict
+    report.high_confidence = high_confidence_report(p_all, y_all)
+    guard = ConfidenceGuard.from_predictions(predictions)
+    report.market_trust = {k: v.as_dict() for k, v in guard.trust.items()}
+    report.predictions = list(predictions)
     report.by_market = breakdown(accepted, predictions, lambda b: b.market_type, lambda p: p.market_type)
     report.by_month = breakdown(
         accepted,

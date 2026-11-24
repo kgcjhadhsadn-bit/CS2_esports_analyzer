@@ -313,6 +313,29 @@ function SectionForm({ section, config }: { section: Section; config: ConfigOut 
   );
 }
 
+/** The bet rule in one sentence: confidence only (odds ignored) unless an EV guard is configured. */
+export function DecisionRuleNote({ config }: { config: ConfigOut }) {
+  const minEv = Number(config.effective.decision.min_ev);
+  const minP = Number(config.effective.decision.min_probability);
+  const oddsIgnored = Number.isFinite(minEv) && minEv <= -1;
+  return (
+    <div className="alert alert-info" role="note" aria-label="Bet rule">
+      <strong>Bet rule:</strong>{" "}
+      {oddsIgnored ? (
+        <>
+          confidence only, <strong>odds ignored</strong> (EV check off). A pick is bet when the calibrated probability is at
+          least {formatPct(minP, 0)}, whatever the odds - even 1.28.
+        </>
+      ) : (
+        <>
+          calibrated probability at least {formatPct(minP, 0)} and EV at least {formatPct(minEv, 1)} after the 12% stake tax
+          {minEv === 0 ? " (break-even guard)" : ""}.
+        </>
+      )}
+    </div>
+  );
+}
+
 export default function SettingsPage() {
   const config = useConfig();
   const health = useHealth();
@@ -356,6 +379,7 @@ export default function SettingsPage() {
                 {w}
               </div>
             ))}
+            <DecisionRuleNote config={data} />
             <Card
               title="Decision thresholds"
               sub={data.updated_at ? `Last changed ${formatDateTime(data.updated_at)}${data.updated_by ? ` by ${data.updated_by}` : ""}` : "No dashboard overrides yet"}

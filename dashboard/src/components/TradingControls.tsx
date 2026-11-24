@@ -8,7 +8,7 @@ import {
   useStartBetclicLogin,
   useTradingState,
 } from "../api/hooks";
-import type { TradingState } from "../api/types";
+import type { PauseReason, TradingState } from "../api/types";
 import { formatDateTime } from "../lib/format";
 import { Badge, ConfirmDialog, ErrorState, Loading } from "./ui";
 
@@ -96,12 +96,13 @@ export function PauseResume({ state }: { state: TradingState }) {
           </button>
         )}
       </div>
-      {paused && (
+      {paused && (state.pause_reasons?.length ?? 0) === 0 && (
         <div className="small muted">
           {state.paused.reason ?? "paused"} · {formatDateTime(state.paused.updated_at)}
           {state.paused.updated_by ? ` by ${state.paused.updated_by}` : ""}
         </div>
       )}
+      {paused && (state.pause_reasons?.length ?? 0) > 0 && <PauseReasonList state={state} />}
       <ConfirmDialog
         open={dialog === "pause"}
         title="Pause trading?"
@@ -124,13 +125,109 @@ export function PauseResume({ state }: { state: TradingState }) {
         onConfirm={(reason) => resume.mutate(reason, { onSuccess: close })}
       >
         <p>
-          This clears the pause flag only.
+          This clears every pause reason (also an open circuit breaker); automatic pauses would otherwise lift
+          themselves once their cause is resolved.
           {state.kill_switch.on ? " The kill switch is still ON and keeps blocking every bet." : ""}
           {state.paused.reason?.toLowerCase().includes("loss") ? " The pause was caused by a loss limit." : ""}
         </p>
       </ConfirmDialog>
     </div>
   );
+}
+
+/** Structured pause reasons: which lift automatically (with the expected time) and which need the owner. */
+export function PauseReasonList({ state }: { state: TradingState }) {
+  const reasons = state.pause_reasons ?? [];
+  return (
+    <div className="stack" style={{ gap: "0.35rem" }} aria-label="Pause reasons">
+      {state.circuit_open && (
+        <div className="alert alert-warning" role="alert">
+          Circuit breaker open ({(state.circuit_codes ?? []).join(", ") || "?"}): a pause kept coming back, so the bot
+          stays paused until you resume.
+        </div>
+      )}
+      <ul className="plain-list small" style={{ margin: 0, paddingLeft: "1rem" }}>
+        {reasons.map((r) => (
+          <PauseReasonItem key={r.code} reason={r} />
+        ))}
+      </ul>
+    </div>
+  );
+}
+
+function PauseReasonItem({ reason }: { reason: PauseReason }) {
+  return (
+    <li>
+      <span className="row" style={{ gap: "0.35rem", display: "inline-flex" }}>
+        <code>{reason.code}</code>
+        {reason.auto_resume ? (
+          <Badge tone="info" title={reason.last_check ?? undefined}>
+            {reason.eta ? `auto · ${formatDateTime(reason.eta)}` : "auto-resume"}
+          </Badge>
+        ) : (
+          <Badge tone="warn">needs you</Badge>
+        )}
+      </span>{" "}
+      <span className="muted">
+        {reason.message}
+        {reason.since ? ` · since ${formatDateTime(reason.since)}` : ""}
+        {reason.count > 1 ? ` · ${reason.count}×` : ""}
+      </span>
+    </li>
+  );
+}
+
+/** Autonomy (auto-resume, auto-login) and Telegram status of the running bot. */
+export function AutonomyStatusCard({ state }: { state: TradingState }) {
+  const a = state.autonomy;
+  const tg = state.telegram;
+  return (
+    <div className="stack" style={{ gap: "0.5rem" }}>
+      <div className="row">
+        <strong>Autonomy</strong>
+        {a?.enabled ? <Badge tone="pos">auto-resume on</Badge> : <Badge>off</Badge>}
+        {a?.enabled && (a.auto_login ? <Badge tone="pos">auto-login on</Badge> : <Badge>auto-login off</Badge>)}
+        {a?.login_blocked && <Badge tone="neg">login stopped</Badge>}
+        {state.circuit_open && <Badge tone="neg">circuit open</Badge>}
+      </div>
+      {a?.last_login_status && (
+        <div className="small muted">
+          Last auto-login: {a.last_login_status}
+          {a.last_login_at ? ` · ${formatDateTime(a.last_login_at)}` : ""}
+          {a.last_login_message ? ` · ${a.last_login_message}` : ""}
+        </div>
+      )}
+      {a?.last_check_at && <div className="small muted">Last auto-resume check {formatDateTime(a.last_check_at)}</div>}
+      <div className="row">
+        <strong>Telegram</strong>
+        {!tg?.enabled ? (
+          <Badge>off</Badge>
+        ) : !tg.configured ? (
+          <Badge tone="warn">token / chat id missing</Badge>
+        ) : tg.last_error ? (
+          <Badge tone="neg">failing</Badge>
+        ) : (
+          <Badge tone="pos">connected</Badge>
+        )}
+      </div>
+      {tg?.enabled && (
+        <div className="small muted">
+          {tg.last_ok_at ? `Last message ${formatDateTime(tg.last_ok_at)}` : "No message sent yet"}
+          {tg.sent != null ? ` · ${tg.sent} sent` : ""}
+          {tg.last_poll_at ? ` · commands polled ${formatDateTime(tg.last_poll_at)}` : ""}
+          {tg.last_error ? ` · last error: ${tg.last_error}` : ""}
+        </div>
+      )}
+    </div>
+  );
+}
+
+/** Autonomy + Telegram status card body that loads the trading state itself. */
+export function AutonomyStatus() {
+  const state = useTradingState();
+  if (state.error && !state.data) return <ErrorState error={state.error} onRetry={() => void state.refetch()} />;
+  if (!state.data) return <Loading lines={2} />;
+  return <AutonomyStatusCard state={state.data} />;
 }
 
 /** Current trading state with kill switch + pause controls. */

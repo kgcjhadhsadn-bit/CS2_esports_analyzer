@@ -2,23 +2,47 @@
 
 Every component that can move money MUST check :func:`is_trading_halted` right before acting.
 All changes are written to ``audit_log``.
+
+Structured pauses (cloud autonomy): ``system_state["paused"]`` is::
+
+    {"on": bool, "reason": "<all messages joined with '; '>",
+     "reasons": [{"code": "loss_limit_daily", "message": "...", "since": "<ISO UTC>", "actor": "...",
+                  "count": 1, "details": {...}}, ...]}
+
+The bot stays paused while at least one reason is active. :func:`add_pause_reason` adds (or refreshes)
+one reason, :func:`resolve_pause_reasons` removes the given codes (the auto-resume service) and
+unpauses when none is left, ``set_paused(False)`` (an owner's resume) clears every reason. A pause
+stored before reasons existed reads as one ``other`` reason (owner-only). ``reason`` is kept for
+readers of the plain text (``get_pause``, the API).
 """
 
 from __future__ import annotations
 
+from collections.abc import Iterable
+from datetime import datetime
 from typing import Any
 
 from sqlalchemy.orm import Session
 
 from cs2bot.config import BankrollSettings, DecisionSettings, Settings
 from cs2bot.db.models import AuditLog, SystemState
-from cs2bot.utils.time import utcnow
+from cs2bot.domain.control import PauseCode, PauseReason, parse_pause_code
+from cs2bot.utils.logging import get_logger
+from cs2bot.utils.time import ensure_utc, utcnow
+
+log = get_logger(__name__)
 
 KILL_SWITCH = "kill_switch"
 PAUSED = "paused"
 CONFIG_OVERRIDES = "config_overrides"
 LAST_RECONCILIATION = "last_reconciliation"
 EXECUTOR_HEALTH = "executor_health"
+AUTO_LOGIN = "auto_login"  # last automatic Betclic login attempt (cs2bot.services.autonomy)
+AUTONOMY = "autonomy"  # last auto-resume check (cs2bot.services.autonomy)
+TELEGRAM = "telegram"  # Telegram notifier cursor / status (cs2bot.services.telegram)
+
+#: Longest pause text kept per reason and for the joined ``reason`` text.
+MAX_PAUSE_REASON_CHARS = 2000
 
 
 def get_state(session: Session, key: str) -> dict[str, Any]:
@@ -59,9 +83,178 @@ def get_pause(session: Session) -> tuple[bool, str | None]:
     return bool(st.get("on", False)), st.get("reason")
 
 
-def set_paused(session: Session, on: bool, *, actor: str, reason: str = "") -> None:
-    set_state(session, PAUSED, {"on": on, "reason": reason}, actor=actor)
-    audit(session, actor=actor, action="pause" if on else "resume", details={"reason": reason})
+def _bounded(text: str, limit: int = MAX_PAUSE_REASON_CHARS) -> str:
+    """Keep the start (the first reason) and the end (the newest one) of an over-long text."""
+    if len(text) <= limit:
+        return text
+    head = text[: limit // 2]
+    tail = text[-(limit // 2 - 7) :]
+    return f"{head} [...] {tail}"[:limit]
+
+
+def _combine(existing: str, new: str) -> str:
+    """``existing; new`` (bounded: the first reason and the newest one survive); no repeats."""
+    if not existing:
+        return new
+    if new in existing:
+        return existing
+    combined = f"{existing}; {new}"
+    if len(combined) > MAX_PAUSE_REASON_CHARS:
+        combined = f"{existing[: MAX_PAUSE_REASON_CHARS // 2]} [...]; {new}"[:MAX_PAUSE_REASON_CHARS]
+    return combined
+
+
+def get_pause_reasons(session: Session) -> list[PauseReason]:
+    """The active pause reasons, oldest first (empty when the bot is not paused)."""
+    row = session.get(SystemState, PAUSED)
+    if row is None:
+        return []
+    st = dict(row.value or {})
+    if not st.get("on", False):
+        return []
+    raw = st.get("reasons")
+    if not isinstance(raw, list) or not raw:
+        # stored before reasons existed (or by hand): one owner-only reason
+        return [
+            PauseReason(
+                code=PauseCode.OTHER,
+                message=str(st.get("reason") or "paused"),
+                since=ensure_utc(row.updated_at) if row.updated_at else utcnow(),
+                actor=row.updated_by or "system",
+            )
+        ]
+    out: list[PauseReason] = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        try:
+            since_raw = item.get("since")
+            since = ensure_utc(datetime.fromisoformat(since_raw)) if isinstance(since_raw, str) else None
+        except ValueError:
+            since = None
+        details = item.get("details")
+        try:
+            count = max(1, int(item.get("count") or 1))
+        except (TypeError, ValueError):
+            count = 1
+        out.append(
+            PauseReason(
+                code=parse_pause_code(item.get("code")),
+                message=str(item.get("message") or ""),
+                since=since or (ensure_utc(row.updated_at) if row.updated_at else utcnow()),
+                actor=str(item.get("actor") or "system"),
+                count=count,
+                details=dict(details) if isinstance(details, dict) else {},
+            )
+        )
+    if not out:  # "on" with an unreadable list: never silently unpause
+        out.append(
+            PauseReason(code=PauseCode.OTHER, message=str(st.get("reason") or "paused"), since=utcnow())
+        )
+    return out
+
+
+def _write_reasons(session: Session, reasons: list[PauseReason], *, actor: str) -> None:
+    on = bool(reasons)
+    text = _bounded("; ".join(r.message for r in reasons if r.message)) if on else ""
+    set_state(
+        session,
+        PAUSED,
+        {"on": on, "reason": text, "reasons": [r.model_dump(mode="json") for r in reasons]},
+        actor=actor,
+    )
+
+
+def add_pause_reason(
+    session: Session,
+    code: PauseCode | str,
+    message: str,
+    *,
+    actor: str = "system",
+    details: dict[str, Any] | None = None,
+    at: datetime | None = None,
+    replace: bool = False,
+) -> bool:
+    """Pause trading for ``code``; returns True when this call paused a running bot.
+
+    An active reason with the same code is refreshed instead of duplicated: its message gets the new
+    text appended (bounded, a text already contained is not repeated), ``count`` goes up, ``details``
+    are updated and ``since`` is kept. ``replace=True`` (a person pausing again) replaces the message
+    instead. Every call is audited (``pause``) unless the message was already there. Flushes, never
+    commits.
+    """
+    pcode = parse_pause_code(code)
+    when = ensure_utc(at) if at is not None else utcnow()
+    msg = _bounded(message.strip() or pcode.value)
+    reasons = get_pause_reasons(session)
+    was_paused = bool(reasons)
+    current = next((r for r in reasons if r.code is pcode), None)
+    if current is not None:
+        combined = msg if replace else _combine(current.message, msg)
+        changed = replace or combined != current.message
+        current.message = combined
+        current.count += 1
+        if details:
+            current.details = {**current.details, **details}
+    else:
+        reasons.append(PauseReason(code=pcode, message=msg, since=when, actor=actor, details=details or {}))
+        changed = True
+    _write_reasons(session, reasons, actor=actor)
+    if changed:
+        audit(
+            session,
+            actor=actor,
+            action="pause",
+            details={"reason": msg, "code": pcode.value, **({"details": details} if details else {})},
+        )
+    return not was_paused
+
+
+def resolve_pause_reasons(
+    session: Session, codes: Iterable[PauseCode | str], *, actor: str, note: str = ""
+) -> list[PauseReason]:
+    """Remove the active reasons with these codes; unpause (audited ``resume``) when none is left.
+
+    Returns the removed reasons. Used by the auto-resume service; an owner's resume is
+    ``set_paused(False)``. Flushes, never commits.
+    """
+    wanted = {parse_pause_code(c) for c in codes}
+    reasons = get_pause_reasons(session)
+    removed = [r for r in reasons if r.code in wanted]
+    if not removed:
+        return []
+    remaining = [r for r in reasons if r.code not in wanted]
+    _write_reasons(session, remaining, actor=actor)
+    if not remaining:
+        audit(
+            session,
+            actor=actor,
+            action="resume",
+            details={"reason": note, "auto": True, "codes": [r.code.value for r in removed]},
+        )
+    return removed
+
+
+def set_paused(
+    session: Session, on: bool, *, actor: str, reason: str = "", code: PauseCode | str = PauseCode.MANUAL
+) -> None:
+    """``on=True``: add a pause reason (default ``manual``, kept with any other active reason).
+    ``on=False``: the owner's resume - every reason is cleared (circuit breaker included) and a stopped
+    auto-login (wrong password / locked account) may try again."""
+    if on:
+        add_pause_reason(session, code, reason, actor=actor, replace=True)
+        return
+    previous = get_pause_reasons(session)
+    _write_reasons(session, [], actor=actor)
+    login = get_state(session, AUTO_LOGIN)
+    if login.get("blocked"):  # the owner has looked at it: automatic logins may try again
+        set_state(session, AUTO_LOGIN, {**login, "blocked": False, "failures": 0}, actor=actor)
+    audit(
+        session,
+        actor=actor,
+        action="resume",
+        details={"reason": reason, "cleared": [r.code.value for r in previous]},
+    )
 
 
 def is_trading_halted(session: Session) -> tuple[bool, str | None]:

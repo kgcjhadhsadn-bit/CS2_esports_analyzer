@@ -10,6 +10,13 @@ Lanes (one thread each, jobs of a lane run one at a time in definition order):
   so that profile is only ever opened by one thread at a time (Playwright is thread-bound).
 * ``train`` - the nightly retrain (``Daily`` at ``scheduler.retrain_cron``), so a long fit never
   delays odds or HLTV syncs.
+* ``notify`` - Telegram notifications (``telegram_notify``, new events from the database) and the daily
+  P&L report (``telegram_daily_report`` at ``telegram.daily_report_time``, Warsaw).
+* ``telegram`` - the Telegram command poller (``telegram_commands``: one long-polling session of
+  ``telegram.poll_session_s``, then the next run starts at once).
+
+Cloud autonomy: ``autonomy_check`` (fast lane, after settlement so UNCERTAIN bets are resolved first)
+lifts automatic pauses once their cause is resolved (:mod:`cs2bot.services.autonomy`).
 
 A failing job never stops the others: the scheduler isolates every run, records it in ``job_runs``
 and backs off. Job names contain the keywords the dashboard uses to find each job's expected
@@ -32,12 +39,13 @@ from cs2bot.config import Settings
 from cs2bot.db.jobs import JobTracker
 from cs2bot.flows.scheduler import Daily, Interval, Job, Trigger
 from cs2bot.services import ingestion
+from cs2bot.services.autonomy import AutonomyService
 from cs2bot.services.health import HealthCache, refresh_executor_health
 from cs2bot.services.registry import ModelRegistry, NotEnoughDataError
 
 log = logging.getLogger(__name__)
 
-FAST, SYNC, HLTV, TRAIN = "fast", "sync", "hltv", "train"
+FAST, SYNC, HLTV, TRAIN, NOTIFY, TELEGRAM = "fast", "sync", "hltv", "train", "notify", "telegram"
 DEFAULT_RETRAIN_AT = time(5, 0)
 EXECUTOR_HEALTH_EVERY = timedelta(minutes=15)
 RANKINGS_EVERY = timedelta(hours=12)
@@ -84,6 +92,8 @@ class Runtime:
     demo_limit: int = 5
     #: Set when ``cs2bot up`` shuts down: a running betting cycle places nothing more.
     stop_event: threading.Event = field(default_factory=threading.Event)
+    #: :class:`~cs2bot.services.telegram.TelegramClient` (None: Telegram off / not configured).
+    telegram: Any | None = None
     _odds_source: Any = field(default=None, repr=False)
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
@@ -221,6 +231,56 @@ def _executor_health(rt: Runtime, tracker: JobTracker) -> None:
         tracker.partial_error = (health.message or "executor not healthy")[:1000]
 
 
+def _autonomy(rt: Runtime, tracker: JobTracker) -> None:
+    service = AutonomyService(rt.session_factory, rt.settings, rt.executor, health_cache=rt.health_cache)
+    report = service.run_once()
+    tracker.add(report.items)
+    tracker.details = report.as_dict()
+    if report.errors:
+        tracker.partial_error = "; ".join(report.errors[:3])[:1000]
+
+
+def _telegram_notify(rt: Runtime, tracker: JobTracker) -> None:
+    from cs2bot.services.telegram import TelegramNotifier
+
+    if rt.telegram is None:
+        tracker.details = {"skipped": "telegram not configured"}
+        return
+    sent = TelegramNotifier(rt.session_factory, rt.settings, rt.telegram).scan_once()
+    tracker.add(sent)
+    tracker.details = {"sent": sent, **rt.telegram.status()}
+    if rt.telegram.last_error:
+        tracker.partial_error = f"telegram: {rt.telegram.last_error}"[:1000]
+
+
+def _telegram_daily_report(rt: Runtime, tracker: JobTracker) -> None:
+    from cs2bot.services.telegram import TelegramNotifier
+
+    if rt.telegram is None:
+        tracker.details = {"skipped": "telegram not configured"}
+        return
+    ok = TelegramNotifier(rt.session_factory, rt.settings, rt.telegram).daily_report()
+    tracker.add(1 if ok else 0)
+    if not ok:
+        tracker.partial_error = f"telegram: {rt.telegram.last_error or 'not sent'}"[:1000]
+
+
+def _telegram_commands(rt: Runtime, tracker: JobTracker) -> None:
+    from cs2bot.services.telegram import TelegramCommands
+
+    if rt.telegram is None:
+        tracker.details = {"skipped": "telegram not configured"}
+        return
+    commands = TelegramCommands(rt.session_factory, rt.settings, rt.telegram)
+    handled = commands.poll(
+        should_stop=rt.stop_event.is_set,
+        session_s=rt.settings.telegram.poll_session_s,
+        sleep=rt.stop_event.wait,
+    )
+    tracker.add(handled)
+    tracker.details = {"handled": handled}
+
+
 def _sync_job(fn: Callable[[], ingestion.ReportLike]) -> Callable[[JobTracker], None]:
     def run(tracker: JobTracker) -> None:
         ingestion.report_to_tracker(tracker, fn())
@@ -309,6 +369,35 @@ def build_jobs(rt: Runtime) -> list[Job]:
             Interval(EXECUTOR_HEALTH_EVERY),
             lane=FAST,
             enabled=rt.executor is not None,
+        ),
+        Job(
+            "autonomy_check",
+            lambda t: _autonomy(rt, t),
+            minutes(s.autonomy.check_interval_min),
+            lane=FAST,
+            enabled=s.autonomy.enabled,
+        ),
+        # notify / telegram lanes: never in the money path
+        Job(
+            "telegram_notify",
+            lambda t: _telegram_notify(rt, t),
+            every(s.telegram.notify_interval_s),
+            lane=NOTIFY,
+            enabled=rt.telegram is not None,
+        ),
+        Job(
+            "telegram_daily_report",
+            lambda t: _telegram_daily_report(rt, t),
+            Daily(s.telegram.daily_report_time, tz=tz),
+            lane=NOTIFY,
+            enabled=rt.telegram is not None and s.telegram.daily_report,
+        ),
+        Job(
+            "telegram_commands",
+            lambda t: _telegram_commands(rt, t),
+            every(1),
+            lane=TELEGRAM,
+            enabled=rt.telegram is not None and s.telegram.commands_enabled,
         ),
         # sync lane: HTTP APIs and database-only work
         Job(

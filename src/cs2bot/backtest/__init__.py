@@ -10,6 +10,13 @@
 """
 
 from cs2bot.backtest.db import load_backtest_matches, load_historical_data, run_db_backtest
+from cs2bot.backtest.deep_eval import (
+    DeepEvalReport,
+    VariantResult,
+    compare_feature_sets,
+    markdown_summary,
+    synthetic_deep_data,
+)
 from cs2bot.backtest.odds_history import DbOddsHistory, InMemoryOddsHistory, OddsHistory
 from cs2bot.backtest.pipeline import (
     PipelineConfig,
@@ -64,6 +71,7 @@ __all__ = [
     "DbOddsHistory",
     "Decider",
     "DecisionContext",
+    "DeepEvalReport",
     "EngineDecider",
     "EnginePricer",
     "EngineResolver",
@@ -88,9 +96,12 @@ __all__ = [
     "ThresholdDecider",
     "Trainer",
     "TrainingSet",
+    "VariantResult",
     "assert_no_leakage",
+    "compare_feature_sets",
     "load_backtest_matches",
     "load_historical_data",
+    "markdown_summary",
     "max_drawdown",
     "outcome_key",
     "run_backtest",
@@ -98,6 +109,7 @@ __all__ = [
     "run_synthetic_backtest",
     "series_match_prediction",
     "synthetic_backtest_matches",
+    "synthetic_deep_data",
     "synthetic_map_truth",
     "synthetic_odds_history",
     "synthetic_series_truth",

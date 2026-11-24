@@ -1,0 +1,12 @@
+# Installed by deploy/linux/provision.sh. Times are the VPS's local time (Europe/Warsaw).
+[Unit]
+Description=cs2bot nightly database backup
+
+[Timer]
+OnCalendar=*-*-* 04:15:00
+RandomizedDelaySec=10min
+# A backup missed while the VPS was off runs right after the next boot.
+Persistent=true
+
+[Install]
+WantedBy=timers.target

@@ -69,6 +69,7 @@ from cs2bot.config import BankrollSettings, BetclicSettings, Settings
 from cs2bot.db import state as db_state
 from cs2bot.db.models import BankrollLedger, Bet
 from cs2bot.domain.betting import BankrollState, BetDecision
+from cs2bot.domain.control import PauseCode
 from cs2bot.domain.enums import BetStatus, LedgerKind
 from cs2bot.engine import ledger
 from cs2bot.engine.ev import (
@@ -316,7 +317,9 @@ def check_loss_limits(
     Returns True if a daily or weekly limit is currently reached. The pause is written once per
     period (remembered in ``system_state["loss_limit_pauses"]``) so that the owner's manual resume
     is respected; this function never resumes. If the bot is already paused for another reason (a
-    balance mismatch), that reason is kept and the limit is appended to it. The current day / week
+    balance mismatch), that reason is kept and the limit is added to it. Each limit is its own structured
+    reason (``loss_limit_daily`` / ``loss_limit_weekly`` with ``details["period"]`` = the period start),
+    which :mod:`cs2bot.services.autonomy` lifts once that period is over. The current day / week
     are ``state.day_start`` / ``state.week_start`` (set by :func:`compute_state`); for a state
     without them they are derived
     from ``now`` (default: utcnow) and the timezone of a full :class:`Settings` (default
@@ -356,13 +359,16 @@ def check_loss_limits(
         return False
     memo = db_state.get_state(session, LOSS_LIMIT_STATE_KEY)
     fresh = [hit for hit in hits if memo.get(hit[0]) != hit[1]]
+    for kind, period, msg in fresh:
+        # one structured reason per limit (the auto-resume service lifts each at its period's end);
+        # an existing pause (e.g. a balance mismatch) keeps its reason
+        code = PauseCode.LOSS_LIMIT_DAILY if kind == "daily" else PauseCode.LOSS_LIMIT_WEEKLY
+        reason = f"{msg} - lifts at the start of the next {'day' if kind == 'daily' else 'week'} (Warsaw)"
+        ledger.pause_trading(session, reason, actor=actor, code=code, details={"period": period})
+        logger.warning("trading paused: %s", reason)
     if fresh:
-        reason = "; ".join(msg for _, _, msg in hits) + " - resume manually from the dashboard"
-        # an existing pause (e.g. a balance mismatch) keeps its reason; the limit is appended to it
-        ledger.pause_trading(session, reason, actor=actor)
         memo.update({kind: period for kind, period, _ in fresh})
         db_state.set_state(session, LOSS_LIMIT_STATE_KEY, memo, actor=actor)
-        logger.warning("trading paused: %s", reason)
     return True
 
 

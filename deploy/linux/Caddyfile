@@ -1,0 +1,66 @@
+# Caddy: HTTPS reverse proxy for the cs2bot dashboard (docker-compose.cloud.yml, service "caddy").
+#
+# CS2BOT_PUBLIC_HOST (from .env) is the site: a domain (bot.example.pl) gets a free, automatically
+# renewed Let's Encrypt / ZeroSSL certificate (CS2BOT_TLS_MODE=auto; ports 80 + 443 must be reachable
+# and the domain's A record must point at the VPS). An IP address uses Caddy's own CA
+# (CS2BOT_TLS_MODE=internal): encrypted, but the browser warns once because it does not know that CA.
+#
+# Login is the dashboard's own password (CS2BOT_API__PASSWORD). The Host header is passed through
+# unchanged; the app accepts it because the container entrypoint puts CS2BOT_PUBLIC_HOST on its
+# allow-list (and https://CS2BOT_PUBLIC_HOST on its origin list for the CSRF check).
+#
+# Check after an edit:  docker compose exec caddy caddy validate --config /etc/caddy/Caddyfile
+# Apply:                docker compose restart caddy
+
+{
+	# Clients that send no SNI (e.g. https://<IP>) get the certificate of the configured site.
+	default_sni {$CS2BOT_PUBLIC_HOST}
+	# The container cannot (and need not) install Caddy's root certificate anywhere.
+	skip_install_trust
+	servers {
+		# Only TCP 80/443 are published and allowed by the firewall: no HTTP/3 (UDP).
+		protocols h1 h2
+	}
+}
+
+(tls_auto) {
+	# Automatic HTTPS: ACME certificate for the domain, renewed by Caddy (default issuers).
+	tls {
+		protocols tls1.2 tls1.3
+	}
+}
+
+(tls_internal) {
+	tls internal {
+		protocols tls1.2 tls1.3
+	}
+}
+
+{$CS2BOT_PUBLIC_HOST} {
+	import tls_{$CS2BOT_TLS_MODE:auto}
+
+	encode zstd gzip
+
+	header {
+		Strict-Transport-Security "max-age=31536000"
+		X-Content-Type-Options "nosniff"
+		-Server
+	}
+
+	request_body {
+		max_size 5MB
+	}
+
+	reverse_proxy app:8000 {
+		# The bot answers slowly while it trains or places a bet; do not cut the request short.
+		transport http {
+			dial_timeout 10s
+			response_header_timeout 2m
+		}
+	}
+
+	log {
+		output stdout
+		format console
+	}
+}

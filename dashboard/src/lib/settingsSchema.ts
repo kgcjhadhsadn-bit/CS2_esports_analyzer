@@ -25,7 +25,7 @@ export interface FieldSpec {
 
 export const DECISION_FIELDS: FieldSpec[] = [
   { key: "min_probability", label: "Min probability", kind: "float", min: 0, max: 1, minOpen: true, maxOpen: true, step: "0.01", percent: true, hint: "P(win | not refunded) must be at least this" },
-  { key: "min_ev", label: "Min EV", kind: "float", min: 0, max: 1, step: "0.005", percent: true, hint: "Expected value per 1 PLN after the stake tax" },
+  { key: "min_ev", label: "Min EV", kind: "float", min: -1, max: 1, step: "0.005", percent: true, hint: "-1 = odds ignored (confidence only, the owner's rule); 0 = break-even guard after the 12% stake tax" },
   { key: "max_sigma", label: "Max sigma", kind: "float", min: 0, max: 0.5, minOpen: true, step: "0.005", hint: "Maximum model uncertainty of the outcome probability" },
   { key: "min_data_completeness", label: "Min data completeness", kind: "float", min: 0, max: 1, step: "0.01", percent: true, hint: "Share of the inputs the model needs that are available" },
   { key: "min_event_link_confidence", label: "Min Betclic link confidence", kind: "float", min: 0, max: 1, step: "0.01", percent: true, hint: "Auto links below this are never bet" },
@@ -105,7 +105,7 @@ export interface MarketOverrideRow {
 
 const THRESHOLD_RANGES: Record<ThresholdKey, FieldSpec> = {
   min_probability: { key: "min_probability", label: "min p", kind: "float", min: 0, max: 1, minOpen: true, maxOpen: true, hint: "" },
-  min_ev: { key: "min_ev", label: "min EV", kind: "float", min: 0, max: 1, hint: "" },
+  min_ev: { key: "min_ev", label: "min EV", kind: "float", min: -1, max: 1, hint: "" },
   max_sigma: { key: "max_sigma", label: "max σ", kind: "float", min: 0, max: 0.5, minOpen: true, hint: "" },
 };
 

@@ -1,0 +1,13 @@
+# Installed by deploy/linux/provision.sh (@DIR@ / @USER@ are replaced). Run by cs2bot-prune.timer.
+[Unit]
+Description=cs2bot weekly Docker clean-up (old images and build cache; never volumes)
+Wants=docker.service
+After=docker.service
+
+[Service]
+Type=oneshot
+User=@USER@
+WorkingDirectory=@DIR@
+ExecStart=/bin/bash @DIR@/deploy/linux/prune.sh
+Nice=10
+TimeoutStartSec=1h

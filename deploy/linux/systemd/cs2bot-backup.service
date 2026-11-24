@@ -1,0 +1,14 @@
+# Installed by deploy/linux/provision.sh (@DIR@ / @USER@ are replaced). Run by cs2bot-backup.timer.
+[Unit]
+Description=cs2bot nightly database backup (pg_dump)
+Wants=docker.service
+After=docker.service
+
+[Service]
+Type=oneshot
+User=@USER@
+WorkingDirectory=@DIR@
+ExecStart=/bin/bash @DIR@/deploy/linux/backup.sh --label nightly
+Nice=10
+IOSchedulingClass=idle
+TimeoutStartSec=2h

@@ -29,6 +29,7 @@ from types import TracebackType
 from typing import TypeVar
 
 from cs2bot.domain.betting import BetOrder, ExecutorHealth, PlacementResult, PlacementStatus
+from cs2bot.domain.control import LoginAttempt, LoginStatus
 from cs2bot.executor.base import AccountExecutor, BookmakerBetRecord, ExecutorClosedError
 from cs2bot.utils.logging import get_logger
 from cs2bot.utils.time import utcnow
@@ -124,6 +125,23 @@ class ThreadBoundExecutor:
 
     def fetch_bet_history(self, since: datetime) -> list[BookmakerBetRecord]:
         return self._call(lambda ex: ex.fetch_bet_history(since), timeout_s=self.call_timeout_s)
+
+    def auto_login(self, timeout_s: float | None = None) -> LoginAttempt:
+        """Forward the automatic login (cloud autonomy); ``FAILED`` if the wrapped executor has none."""
+
+        def run(ex: AccountExecutor) -> LoginAttempt:
+            fn = getattr(ex, "auto_login", None)
+            if not callable(fn):
+                return LoginAttempt(
+                    status=LoginStatus.FAILED,
+                    message=f"{type(ex).__name__} has no auto_login",
+                    at=utcnow(),
+                )
+            result = fn(timeout_s)
+            assert isinstance(result, LoginAttempt)
+            return result
+
+        return self._call(run)
 
     def close(self) -> None:
         """Close the wrapped executor on its own thread, then stop the worker (idempotent)."""

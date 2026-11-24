@@ -44,7 +44,9 @@ from cs2bot.ingest.pandascore.models import (
     PSTournamentRosters,
 )
 from cs2bot.ingest.pandascore.sync import (
+    DISABLED_NOTE,
     PandaScoreSyncOptions,
+    pandascore_enabled,
     pandascore_round_records,
     sync_match,
     sync_modified,
@@ -53,6 +55,7 @@ from cs2bot.ingest.pandascore.sync import (
 )
 
 __all__ = [
+    "DISABLED_NOTE",
     "ClientStats",
     "PSGame",
     "PSGamePlayer",
@@ -88,6 +91,7 @@ __all__ = [
     "map_round_outcome",
     "map_tier",
     "overtime_rounds",
+    "pandascore_enabled",
     "pandascore_round_records",
     "parse_prizepool_usd",
     "stage_label",

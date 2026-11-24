@@ -2,9 +2,11 @@
 
 Counter-Strike 2 Tier 1/2 pre-match analyzer: collects PandaScore / HLTV / demo data, models every
 match (ratings, veto, round simulation, player props, ensemble, calibration, Claude context layer),
-prices every Betclic.pl market and bets automatically when the calibrated probability is high and
-the EV after the Polish 12% stake tax is positive. Runs locally on the owner's Windows PC
-(PostgreSQL in Docker Desktop, the Python app natively via uv, dashboard on 127.0.0.1:8000).
+prices every Betclic.pl market and bets automatically when the calibrated probability is high
+(confidence only, odds ignored: `decision.min_ev = -1.0` since 2026-11-24). Main runtime: a Polish
+VPS, fully autonomous (auto-login, auto-resume of automatic pauses with a circuit breaker, Telegram
+notifications + commands; `services/autonomy.py`, `services/telegram.py`); the Windows-PC install
+(PostgreSQL in Docker Desktop, the Python app natively via uv, dashboard on 127.0.0.1:8000) remains.
 
 ## Where things are
 
@@ -25,6 +27,8 @@ the EV after the Polish 12% stake tax is positive. Runs locally on the owner's W
 - No network in tests: saved fixtures, respx, fakes, local HTML. Browser tests carry `@pytest.mark.browser`, PostgreSQL tests `@pytest.mark.postgres` (need `CS2BOT_TEST_DATABASE_URL`).
 - Never log secrets (settings secrets are `SecretStr`).
 - Anything that can move money checks `db.state.is_trading_halted()` right before acting.
+- Automatic pauses carry a `PauseCode` (`db.state.add_pause_reason` / `engine.ledger.pause_trading(code=...)`);
+  only `manual` / `circuit_open` / the kill switch need the owner. Never automate SMS / 2FA codes.
 - Full type hints (mypy `disallow_untyped_defs`), ruff line length 110, idempotent DB writes, no look-ahead leakage in model code.
 - `deploy/windows/*.ps1` must stay Windows PowerShell 5.1 compatible and pure ASCII.
 

@@ -161,6 +161,33 @@ texts:
     - "zamknięt"
     - "nie jest już dostępn"
     - "wycofan"
+  # Auto-login outcomes (login_error / login_2fa_step text). Checked in this order: login_account_locked,
+  # login_bad_credentials, login_2fa. Locked / bad credentials stop the retries until the owner acts.
+  login_account_locked:
+    - "konto zostało zablokowane"
+    - "konto jest zablokowane"
+    - "konto zablokowane"
+    - "konto zostało zawieszone"
+    - "konto jest zawieszone"
+    - "samowykluczeni"
+    - "zbyt wiele nieudanych prób"
+  login_bad_credentials:
+    - "nieprawidłowy login lub hasło"
+    - "nieprawidłowe dane logowania"
+    - "nieprawidłowy e-mail lub hasło"
+    - "błędny login"
+    - "błędne hasło"
+    - "nieprawidłowe hasło"
+    - "niepoprawne dane"
+    - "niepoprawny login"
+  login_2fa:
+    - "kod sms"
+    - "kod weryfikacyjny"
+    - "kod jednorazowy"
+    - "weryfikacja dwuetapowa"
+    - "weryfikacji dwuetapowej"
+    - "uwierzytelnianie dwuskładnikowe"
+    - "wysłaliśmy kod"
   login_required:
     - "zaloguj się"
     - "sesja wygasła"
@@ -240,12 +267,46 @@ elements:
       - {role: textbox, name: "/e-?mail|login|nazwa użytkownika|użytkownik/i"}
       - {css: "input[type='email']"}
   login_password_input:
-    description: Login form password field (pre-fill only; the form is never submitted by the bot).
+    description: >-
+      Login form password field. Pre-filled for the owner by `cs2bot executor login`; filled AND
+      submitted only by the auto-login (autonomy.auto_login, cloud runtime).
     verified: false
     optional: true
     locators:
       - {css: "input[autocomplete='current-password']"}
       - {css: "input[type='password']"}
+  login_submit_button:
+    description: >-
+      The login form's own "Zaloguj się" button (auto-login only). Searched inside the login dialog so
+      the header button of the same name is not clicked again; without a match the bot presses Enter in
+      the password field.
+    verified: false
+    optional: true
+    locators:
+      - {css: "[data-qa='login-submit'], [data-qa='login-form-submit']"}
+      - {css: "form button[type='submit']"}
+      - {css: "[role='dialog'] button", has_text: "/zaloguj/i"}
+  login_2fa_step:
+    description: >-
+      Anything shown when Betclic asks for an SMS / 2FA code after the password (auto-login stops there,
+      pauses with 2fa_required and alerts the owner; codes are never automated).
+    verified: false
+    optional: true
+    locators:
+      - {css: "input[autocomplete='one-time-code']"}
+      - {css: "input[name='otp'], input[name='smsCode'], input[name='code'], input[name='verificationCode']"}
+      - {role: textbox, name: "/kod sms|kod weryfikacyjny|kod jednorazowy|kod autoryzacyjny/i"}
+      - {css: "[role='dialog']", has_text: "/kod sms|weryfikacj[a-z]* dwu|kod weryfikacyjny|wysłaliśmy (sms|kod)/i"}
+  login_error:
+    description: >-
+      Error message of the login form after a submit (classified with texts.login_account_locked /
+      login_bad_credentials / login_2fa; an unknown message counts as a failed attempt, retried later).
+    verified: false
+    optional: true
+    locators:
+      - {css: "[data-qa='login-error'], [data-qa='login-form-error']"}
+      - {css: "[role='dialog'] [role='alert']"}
+      - {css: ".loginForm_error, .login_error, .form-error, .error-message"}
   cookie_banner_dismiss:
     description: Cookie banner button that rejects optional cookies (clicked only if visible after a page load).
     verified: false

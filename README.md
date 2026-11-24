@@ -2,11 +2,17 @@
 
 A pre-match analyzer for **Counter-Strike 2 Tier 1/2 matches** that prices every CS2 market on
 **Betclic.pl** with a statistical / simulation model and bets automatically - only when the model
-is confident **and** the price has positive expected value after the Polish 12% stake tax.
+is confident. Since 2026-11-24 the owner's rule is **confidence only, odds ignored**: a pick is bet when
+the calibrated probability is at least 75%, whatever the odds (`decision.min_ev = -1.0`; set `0.0` for a
+break-even guard after the Polish 12% stake tax).
 
-It runs **entirely on the owner's Windows PC**: PostgreSQL in Docker Desktop, the Python app natively
-(so the Betclic login can happen in a real, visible browser window), and a local dashboard at
-http://127.0.0.1:8000.
+The main runtime is a **Polish VPS, fully autonomous** (Docker, Chromium on an Xvfb display, Caddy
+HTTPS for the dashboard; see [docs/VPS_SETUP.md](docs/VPS_SETUP.md)): it logs in to Betclic by itself,
+lifts its own automatic pauses once their cause is resolved (with a circuit breaker), and reports and
+takes commands over **Telegram**. Only an SMS / 2FA code and turning the kill switch off need the owner
+([docs/OPERATIONS.md](docs/OPERATIONS.md#autonomous-operation-vps)). The original install **on the
+owner's Windows PC** (PostgreSQL in Docker Desktop, the app natively, dashboard at
+http://127.0.0.1:8000) still works.
 
 ## What it does
 
@@ -17,8 +23,12 @@ http://127.0.0.1:8000.
   Claude reads the news and adds bounded context adjustments and a written rationale for each bet.
 - **Prices every Betclic market** (match / map winners, handicaps, totals, rounds, pistols, player
   kills, ...) and compares the model with the odds, after tax.
-- **Bets selectively:** probability, EV, uncertainty and data-quality thresholds; 1/4 Kelly stakes
-  with hard caps, daily / weekly loss limits, a kill switch, pause / resume, dry run.
+- **Bets on confidence:** probability, uncertainty and data-quality thresholds (the EV check is off by
+  default, odds are ignored); stakes with hard caps, daily / weekly loss limits, a kill switch,
+  pause / resume with structured reasons that lift themselves when resolved, dry run.
+- **Runs unattended:** auto-login (stops at SMS / 2FA), auto-resume with a circuit breaker, Telegram
+  notifications (every bet, settlements, daily P&L, pauses, errors) and commands (`/status`, `/pause`,
+  `/resume`, `/stop`, `/go` ...).
 - **Places bets** on the owner's Betclic account through a dedicated browser profile, settles them,
   tracks the ledger, ROI and closing-line value, and shows everything on the dashboard.
 
@@ -33,7 +43,8 @@ http://127.0.0.1:8000.
   analyses everything but bets rarely.
 - **HLTV has no official API** and is protected by Cloudflare; scraping is slow and polite and can
   still be blocked. Betclic's website changes break selectors from time to time.
-- **The PC must be on and awake** before matches.
+- **The PC must be on and awake** before matches (Windows install); the VPS runs around the clock but
+  Betclic may block datacenter IPs (a Polish residential proxy is the fallback).
 - **18+ only. Gamble responsibly**, and only with money you can afford to lose.
 
 ## Architecture
@@ -102,7 +113,8 @@ Run as `uv run cs2bot <command>` from the repository folder.
 | `cs2bot settle` | Settle finished bets, closing odds, CLV, ledger |
 | `cs2bot backtest --from YYYY-MM-DD --to YYYY-MM-DD` | Walk-forward backtest |
 | `cs2bot executor login` / `executor health` / `executor balance` | Open the Betclic login window / checks |
-| `cs2bot control kill-switch on\|off` / `control pause` / `control resume` | Safety controls |
+| `cs2bot control kill-switch on\|off` / `control pause` / `control resume` / `control status` | Safety controls (status: every pause reason, auto-resume ETA, circuit breaker) |
+| `cs2bot telegram test` | Send a Telegram test message (checks token and chat id) |
 
 ## Development
 

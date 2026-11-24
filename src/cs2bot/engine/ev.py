@@ -335,7 +335,9 @@ def kelly_for_net_odds(
         return -1.0
     edge = b * p_win - p_lose - cost
     if cost <= 0:
-        return max(-1.0, min(1.0, edge / (b * settled)))
+        # edge / (b * settled), written so that a tiny (subnormal) settled probability cannot underflow
+        # the denominator to zero
+        return max(-1.0, min(1.0, (p_win - p_lose / b) / settled))
     if edge <= 0:  # no edge: a negative number that still increases with the odds
         return max(-1.0, edge / (b * (settled + cost)))
 

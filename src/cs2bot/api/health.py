@@ -517,6 +517,32 @@ def _trading_alerts(trading: TradingStateOut, alerts: _Alerts) -> None:
     if trading.paused.on:
         reason = f": {trading.paused.reason}" if trading.paused.reason else ""
         alerts.add("warning", "trading_paused", f"Trading paused{reason}"[:300])
+    if trading.circuit_open:
+        alerts.add(
+            "critical",
+            "circuit_open",
+            "Circuit breaker open (" + ", ".join(trading.circuit_codes or ["?"]) + "): a pause kept coming "
+            "back - check it, then resume",
+        )
+    if any(r.code == "2fa_required" for r in trading.pause_reasons):
+        alerts.add(
+            "critical",
+            "betclic_2fa_required",
+            "Betclic asks for an SMS / 2FA code: log in once by hand (login button / VNC)",
+        )
+    if trading.autonomy is not None and trading.autonomy.login_blocked:
+        alerts.add(
+            "critical",
+            "auto_login_blocked",
+            f"Betclic auto-login stopped ({trading.autonomy.last_login_status}): fix the credentials",
+        )
+    tg = trading.telegram
+    if tg is not None and tg.enabled and not tg.configured:
+        alerts.add(
+            "warning", "telegram_not_configured", "Telegram is enabled but the token / chat id is missing"
+        )
+    elif tg is not None and tg.configured and tg.last_error:
+        alerts.add("warning", "telegram_failing", f"Telegram messages fail: {tg.last_error}"[:300])
 
 
 def _loss_limit_alerts(session: Session, ctx: ApiContext, now: datetime, alerts: _Alerts) -> None:
@@ -563,7 +589,7 @@ def compute_health(ctx: ApiContext) -> HealthOut:
         session.execute(text("SELECT 1"))
         reachable = True
         db = DbHealth(ok=True, latency_ms=round((time.perf_counter() - started) * 1000, 2))
-        trading = trading_state(session)
+        trading = trading_state(session, settings)
         _trading_alerts(trading, alerts)
         jobs = job_health(session, settings.scheduler, now)
         apply_scheduler(jobs, sched, ctx, alerts)

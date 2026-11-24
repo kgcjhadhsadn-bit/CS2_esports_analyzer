@@ -1,0 +1,11 @@
+# Installed by deploy/linux/provision.sh. Times are the VPS's local time (Europe/Warsaw).
+[Unit]
+Description=cs2bot weekly Docker clean-up
+
+[Timer]
+OnCalendar=Sun *-*-* 05:40:00
+RandomizedDelaySec=15min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

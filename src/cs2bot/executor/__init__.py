@@ -13,6 +13,7 @@ Tests and integration work use :class:`FakeExecutor` (same interface, no browser
 
 from cs2bot.executor.base import (
     AccountExecutor,
+    AutoLoginExecutor,
     BetExecutor,
     BookmakerBetRecord,
     BookmakerBetStatus,
@@ -51,6 +52,7 @@ from cs2bot.executor.tuning import ExecutorTuning
 
 __all__ = [
     "AccountExecutor",
+    "AutoLoginExecutor",
     "BetExecutor",
     "BetclicExecutor",
     "BookmakerBetRecord",

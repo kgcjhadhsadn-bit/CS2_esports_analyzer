@@ -74,6 +74,7 @@ from pydantic import SecretStr
 
 from cs2bot.config import Settings
 from cs2bot.domain.betting import BetOrder, ExecutorHealth, PlacementResult, PlacementStatus
+from cs2bot.domain.control import LoginAttempt, LoginStatus
 from cs2bot.executor.base import (
     BookmakerBetRecord,
     BookmakerBetStatus,
@@ -89,7 +90,7 @@ from cs2bot.executor.lock import ProfileLockedError
 from cs2bot.executor.matching import Candidate, MatchKind, pick_candidate
 from cs2bot.executor.safety import HumanPacer
 from cs2bot.executor.selectors import ResolvedElement, SelectorNotFoundError, SelectorSet, load_selectors
-from cs2bot.executor.session import BrowserSession, PlaywrightFactory
+from cs2bot.executor.session import BrowserSession, PlaywrightFactory, effective_headless
 from cs2bot.executor.textutils import (
     find_polish_decimals,
     first_regex_group,
@@ -147,6 +148,12 @@ POST_CLICK_DEFINITE: frozenset[PlacementStatus] = frozenset(
         PlacementStatus.LOGIN_REQUIRED,
         PlacementStatus.KILL_SWITCH,
     }
+)
+#: Classification order of a login-form message after an automatic submit (``texts`` section).
+LOGIN_MESSAGE_ORDER: tuple[tuple[str, LoginStatus], ...] = (
+    ("login_account_locked", LoginStatus.ACCOUNT_LOCKED),
+    ("login_bad_credentials", LoginStatus.BAD_CREDENTIALS),
+    ("login_2fa", LoginStatus.TWO_FA_REQUIRED),
 )
 DEFAULT_LOCKED_CLASSES = ("is-locked", "is-disabled", "is-suspended", "disabled", "locked")
 _BET_ID_TOKEN = re.compile(r"[A-Za-z0-9][A-Za-z0-9-]{3,}")
@@ -400,10 +407,10 @@ class BetclicExecutor:
         the logged-in indicator appears, ``False`` on timeout. Credentials are never logged.
         """
         self._ensure_open()
-        if self.settings.executor.headless:
+        if effective_headless(self.settings):
             log.warning(
-                "executor.headless is true: the login window is invisible "
-                "(set CS2BOT_EXECUTOR__HEADLESS=false)"
+                "the browser runs headless: the login window is invisible (set "
+                "CS2BOT_EXECUTOR__HEADLESS=false; on a server use Xvfb / VNC, see docs/OPERATIONS.md)"
             )
         page = self._session.ensure_page()
         self._goto(page, self._safe_url(self.selectors.urls.login))
@@ -450,6 +457,96 @@ class BetclicExecutor:
         called it stays in force (the executor is about to be closed).
         """
         self._login_abort.set()
+
+    def auto_login(self, timeout_s: float | None = None) -> LoginAttempt:
+        """Fill AND submit the Betclic login form with the saved credentials (cloud autonomy).
+
+        Only with ``betclic.credentials_source`` env/keyring (``NO_CREDENTIALS`` otherwise). Outcomes:
+        ``ALREADY_LOGGED_IN`` / ``LOGGED_IN``; ``TWO_FA_REQUIRED`` when Betclic asks for an SMS / 2FA code
+        (the bot stops right there: no code is ever read, typed or bypassed); ``BAD_CREDENTIALS`` /
+        ``ACCOUNT_LOCKED`` from the form's error message (the caller stops retrying);
+        ``FORM_NOT_FOUND`` when the fields cannot be found; ``FAILED`` for anything else (no outcome
+        within ``timeout_s``, default ``executor.login_submit_timeout_s``, or a browser error).
+        Credentials are never logged, and no screenshot is taken of the filled form.
+        """
+        self._ensure_open()
+        wait_s = self.settings.executor.login_submit_timeout_s if timeout_s is None else timeout_s
+        try:
+            page = self._session.ensure_page()
+            self._goto(page, self._safe_url(self.selectors.urls.login))
+            if self._login_state(page) is LoginState.LOGGED_IN:
+                return self._login_attempt(LoginStatus.ALREADY_LOGGED_IN, "already logged in")
+            credentials = self._load_credentials()
+            if credentials is None:
+                return self._login_attempt(
+                    LoginStatus.NO_CREDENTIALS,
+                    "no Betclic credentials configured (betclic.credentials_source env/keyring with "
+                    "username and password)",
+                )
+            username, password, source = credentials
+            t = self.tuning
+            if self.selectors.probe(page, "login_username_input") is None:
+                button = self.selectors.try_resolve(page, "login_button", t.element_timeout_s)
+                if button is not None:
+                    self._pacer.pause(0.5)
+                    button.first.click()
+            user_field = self.selectors.try_resolve(page, "login_username_input", t.element_timeout_s)
+            pass_field = self.selectors.try_resolve(page, "login_password_input", t.optional_timeout_s)
+            if user_field is None or pass_field is None:
+                return self._login_attempt(
+                    LoginStatus.FORM_NOT_FOUND,
+                    "login form fields not found (selectors 'login_username_input' / 'login_password_input')",
+                )
+            self._pacer.pause(0.3)
+            user_field.first.fill(username)
+            self._pacer.pause(0.3)
+            pass_field.first.fill(password.get_secret_value())
+            self._pacer.pause(0.4)
+            submit = self.selectors.try_resolve(page, "login_submit_button", t.optional_timeout_s)
+            if submit is not None:
+                submit.first.click()
+            else:
+                pass_field.first.press("Enter")
+            log.info("submitted the Betclic login form (credentials from %s)", source)
+            attempt = self._await_login_outcome(page, wait_s)
+        except (BrowserStartError, ProfileLockedError, PlaywrightError, OSError, ValueError) as exc:
+            attempt = self._login_attempt(LoginStatus.FAILED, f"browser error: {_short_error(exc)}")
+        log.log(
+            logging.INFO if attempt.status.logged_in else logging.WARNING,
+            "Betclic auto-login: %s (%s)",
+            attempt.status.value,
+            attempt.message,
+        )
+        return attempt
+
+    def _await_login_outcome(self, page: Page, timeout_s: float) -> LoginAttempt:
+        """Poll the page after a login submit: logged in, an SMS / 2FA step or an error message."""
+        deadline = time.monotonic() + max(0.0, timeout_s)
+        while True:
+            if self.selectors.probe(page, "logged_in_indicator") is not None:
+                return self._login_attempt(LoginStatus.LOGGED_IN, "logged in")
+            if self.selectors.probe(page, "login_2fa_step") is not None:
+                return self._login_attempt(
+                    LoginStatus.TWO_FA_REQUIRED,
+                    "Betclic asks for an SMS / 2FA code - the bot stops here; log in once by hand",
+                )
+            error = self.selectors.probe(page, "login_error")
+            if error is not None:
+                text = " ".join(t for t in (_soft_text(el) for el in error.all(limit=5)) if t).strip()
+                if text:
+                    for category, status in LOGIN_MESSAGE_ORDER:
+                        if self.selectors.classify(text, [category]) is not None:
+                            return self._login_attempt(status, f"Betclic says: {text[:200]}")
+                    return self._login_attempt(LoginStatus.FAILED, f"login error: {text[:200]}")
+            if time.monotonic() >= deadline:
+                return self._login_attempt(
+                    LoginStatus.FAILED, f"no login outcome within {timeout_s:.0f}s after submitting the form"
+                )
+            page.wait_for_timeout(self.tuning.poll_interval_s * 1000)
+
+    @staticmethod
+    def _login_attempt(status: LoginStatus, message: str) -> LoginAttempt:
+        return LoginAttempt(status=status, message=message, at=utcnow())
 
     def health_check(self) -> ExecutorHealth:
         """Browser starts, logged in, balance readable, key selectors resolvable (listing + one event)."""

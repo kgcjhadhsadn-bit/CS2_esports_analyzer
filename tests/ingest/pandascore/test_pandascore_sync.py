@@ -789,11 +789,12 @@ def test_rate_limit_stops_the_run_and_keeps_progress(
 def test_missing_token_is_reported_not_raised(
     session: Session, api: FakePandaScore, settings: Settings
 ) -> None:
+    # deep_data: PandaScore is optional - no token means "disabled" (a note, not an error)
     client = PandaScoreClient(settings.pandascore, sleep=lambda _s: None, rate_limiter=NoWait())
     report = sync_upcoming(session, client, settings, now=NOW)
-    assert not report.ok and not report.blocked and api.requests == []
-    assert report.failed == 1 and len(report.errors) == 1  # the run stops at the first auth failure
-    assert "CS2BOT_PANDASCORE__API_TOKEN" in report.errors[0]
+    assert report.ok and not report.blocked and api.requests == []
+    assert report.failed == 0 and report.errors == [] and report.details["disabled"] is True
+    assert "no API token" in report.warnings[0]
 
 
 def test_list_failure_midway_keeps_earlier_pages(

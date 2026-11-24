@@ -1,0 +1,180 @@
+# cs2bot on a Linux VPS (PLAN.md 0b): PostgreSQL + the bot + Caddy (HTTPS for the dashboard).
+# Setup guide: docs/VPS_SETUP.md. The Windows-PC install uses docker-compose.yml instead.
+#
+#   deploy / update:  deploy/linux/deploy.sh          (build, up -d, wait until healthy)
+#   status:           deploy/linux/status.sh          logs: deploy/linux/logs.sh [service]
+#   stop:             docker compose stop             (data is kept; COMPOSE_FILE in .env selects this file)
+#   DANGER:           docker compose down -v          deletes the database and certificate volumes
+#
+# Every value comes from .env next to this file (chmod 600, created by deploy/linux/provision.sh).
+# Published to the internet: ports 80 and 443 of Caddy only. PostgreSQL is reachable only by the app
+# (internal network), the API only through Caddy, VNC (vnc.sh) only on the VPS's own 127.0.0.1.
+#
+# Secrets in .env: Docker Compose interpolates "$" in .env values. Wrap a value that contains "$" in
+# single quotes (CS2BOT_BETCLIC__PASSWORD='pa$$word'); generated secrets never contain "$".
+
+name: cs2bot-cloud
+
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "20m"
+    max-file: "5"
+
+services:
+  postgres:
+    # Same pinned image as docker-compose.yml. Never change the major version (16) without a dump
+    # (deploy/linux/backup.sh) + restore (deploy/linux/restore.sh).
+    image: postgres:16.16-bookworm
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-cs2bot}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env (provision.sh generates it)}
+      POSTGRES_DB: ${POSTGRES_DB:-cs2bot}
+      POSTGRES_INITDB_ARGS: "--encoding=UTF8 --locale=C.UTF-8 --data-checksums"
+      TZ: UTC
+      PGTZ: UTC
+    command:
+      - postgres
+      # Sized for a 4 vCPU / 8 GB VPS that also runs the bot and Chromium. 16 GB RAM: 2GB / 6GB.
+      - -c
+      - shared_buffers=${POSTGRES_SHARED_BUFFERS:-1GB}
+      - -c
+      - effective_cache_size=${POSTGRES_EFFECTIVE_CACHE_SIZE:-3GB}
+      - -c
+      - work_mem=${POSTGRES_WORK_MEM:-32MB}
+      - -c
+      - maintenance_work_mem=${POSTGRES_MAINTENANCE_WORK_MEM:-256MB}
+      - -c
+      - max_connections=50
+      - -c
+      - random_page_cost=1.1
+      - -c
+      - checkpoint_timeout=15min
+      - -c
+      - checkpoint_completion_target=0.9
+      - -c
+      - max_wal_size=2GB
+      - -c
+      - wal_compression=on
+      - -c
+      - timezone=UTC
+      - -c
+      - log_timezone=UTC
+      - -c
+      - log_min_duration_statement=2000
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    shm_size: 512mb
+    networks:
+      - backend
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -p 5432 -U \"$${POSTGRES_USER}\" -d \"$${POSTGRES_DB}\""]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 60s
+    stop_grace_period: 1m
+    logging: *default-logging
+
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        APP_UID: ${APP_UID:-10001}
+        APP_GID: ${APP_GID:-10001}
+    image: cs2bot:latest
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    env_file:
+      - path: .env
+        required: true
+    environment:
+      # Fixed for the container (these override .env).
+      CS2BOT_DATABASE__URL: >-
+        postgresql+psycopg://${POSTGRES_USER:-cs2bot}:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}@postgres:5432/${POSTGRES_DB:-cs2bot}
+      # Inside the container network only (Caddy proxies to it); config.py then requires the password.
+      CS2BOT_API__HOST: 0.0.0.0
+      CS2BOT_API__PORT: "8000"
+      CS2BOT_API__PASSWORD: ${CS2BOT_API__PASSWORD:?set CS2BOT_API__PASSWORD in .env (provision.sh generates it)}
+      CS2BOT_API__SESSION_SECRET: ${CS2BOT_API__SESSION_SECRET:?set CS2BOT_API__SESSION_SECRET in .env}
+      # Domain / IP of the dashboard: the entrypoint derives the API's Host allow-list and https origin.
+      CS2BOT_PUBLIC_HOST: ${CS2BOT_PUBLIC_HOST:?set CS2BOT_PUBLIC_HOST (domain or IP) in .env}
+      # Visible Betclic browser on the Xvfb display started by the entrypoint (less bot-like).
+      CS2BOT_EXECUTOR__HEADLESS: ${CS2BOT_EXECUTOR__HEADLESS:-false}
+      DISPLAY: ":99"
+      CS2BOT_ENVIRONMENT: ${CS2BOT_ENVIRONMENT:-prod}
+      TZ: UTC
+    volumes:
+      # Bind mounts owned by APP_UID (deploy.sh creates them): browser profiles incl. the Betclic
+      # session and placement journal, models, caches, screenshots, demos / a copy of the bot's output.
+      - ./data:/app/data
+      - ./logs:/app/logs
+      # Betclic market rules and selectors: edit on the VPS, then `docker compose restart app`.
+      - ./config:/app/config:ro
+    tmpfs:
+      # Fresh /tmp at every start (no stale Xvfb lock); Playwright's temporary files live here too.
+      - /tmp:rw,nosuid,nodev,size=2g,mode=1777
+    # Chromium needs a large /dev/shm (Docker's default 64 MB crashes tabs).
+    shm_size: 1gb
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    ports:
+      # x11vnc (deploy/linux/vnc.sh), only while you use it, only on the VPS's loopback: reach it
+      # through an SSH tunnel (docs/VPS_SETUP.md). Never change this to a public address.
+      - "127.0.0.1:${VNC_HOST_PORT:-5900}:5900"
+    networks:
+      - backend
+      - frontend
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "--max-time", "8", "http://127.0.0.1:8000/api/ping"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 15m
+    # `cs2bot up` needs up to ~90 s for a clean shutdown (running jobs, browser, scheduler).
+    stop_grace_period: 2m
+    logging: *default-logging
+
+  caddy:
+    image: caddy:2.11.9-alpine
+    restart: unless-stopped
+    depends_on:
+      - app
+    environment:
+      CS2BOT_PUBLIC_HOST: ${CS2BOT_PUBLIC_HOST:?set CS2BOT_PUBLIC_HOST (domain or IP) in .env}
+      # auto = Let's Encrypt / ZeroSSL certificate for a domain; internal = Caddy's own CA (an IP
+      # address or a test name; the browser warns once).
+      CS2BOT_TLS_MODE: ${CS2BOT_TLS_MODE:-auto}
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./deploy/linux/Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    security_opt:
+      - no-new-privileges:true
+    networks:
+      - frontend
+    stop_grace_period: 30s
+    logging: *default-logging
+
+networks:
+  # The database network has no route to the internet and no published ports.
+  backend:
+    internal: true
+  frontend: {}
+
+volumes:
+  pgdata:
+    name: cs2bot_cloud_pgdata
+  caddy_data:
+    name: cs2bot_cloud_caddy_data
+  caddy_config:
+    name: cs2bot_cloud_caddy_config

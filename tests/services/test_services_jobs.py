@@ -16,7 +16,7 @@ from cs2bot.db.jobs import JobTracker
 from cs2bot.domain.enums import BetStatus, JobStatus
 from cs2bot.domain.sync import SyncReport
 from cs2bot.executor import FakeExecutor
-from cs2bot.flows.jobs import FAST, HLTV, SYNC, TRAIN, Runtime, build_jobs, parse_daily_cron
+from cs2bot.flows.jobs import FAST, HLTV, NOTIFY, SYNC, TELEGRAM, TRAIN, Runtime, build_jobs, parse_daily_cron
 from cs2bot.flows.scheduler import Daily, Scheduler
 from cs2bot.ingest.hltv import HLTVBlockedError
 from cs2bot.odds import StaticOddsSource
@@ -63,7 +63,10 @@ def test_job_names_lanes_and_enabled_flags(world: World) -> None:
         "bet_run",
         "settle_bets",
     ]  # the money path, in order
-    assert {j.lane for j in jobs.values()} == {FAST, SYNC, HLTV, TRAIN}
+    assert {j.lane for j in jobs.values()} == {FAST, SYNC, HLTV, TRAIN, NOTIFY, TELEGRAM}
+    # cloud autonomy and Telegram are off unless configured
+    assert not jobs["autonomy_check"].enabled and not jobs["telegram_notify"].enabled
+    assert not jobs["telegram_commands"].enabled and not jobs["telegram_daily_report"].enabled
     assert all(jobs[n].lane == HLTV for n in jobs if "hltv" in n or n.startswith("demos"))
     assert isinstance(jobs["models_retrain"].trigger, Daily)
     # no token, no analyzer, no executor -> those jobs are off; the money path is always on

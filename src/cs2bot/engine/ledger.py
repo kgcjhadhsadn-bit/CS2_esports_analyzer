@@ -37,7 +37,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal
-from typing import Literal
+from typing import Any, Literal
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -46,6 +46,7 @@ from cs2bot.config import BankrollSettings, Settings
 from cs2bot.db import state
 from cs2bot.db.models import BankrollLedger, Bet
 from cs2bot.domain.betting import PlacementResult, bet_status_after_placement
+from cs2bot.domain.control import PauseCode
 from cs2bot.domain.enums import BetStatus, LedgerKind
 from cs2bot.domain.results import SettlementOutcome
 from cs2bot.engine.ev import TaxModel, TaxSource, payout_breakdown, refund_amount, stake_tax
@@ -296,30 +297,30 @@ def record_withdrawal(
 
 
 #: Longest pause reason :func:`pause_trading` keeps when it adds to an existing one.
-MAX_PAUSE_REASON_CHARS = 2000
+MAX_PAUSE_REASON_CHARS = state.MAX_PAUSE_REASON_CHARS
 
 
-def pause_trading(session: Session, reason: str, *, actor: str = "system") -> bool:
-    """Pause trading with ``reason``; an existing pause keeps its reason and gets this one appended.
+def pause_trading(
+    session: Session,
+    reason: str,
+    *,
+    actor: str = "system",
+    code: PauseCode | str = PauseCode.OTHER,
+    details: dict[str, Any] | None = None,
+) -> bool:
+    """Pause trading with ``reason`` under the machine-readable ``code`` (:class:`PauseCode`).
 
-    Safety controls (balance mismatch, loss limits) must never hide each other: the owner resumes
-    from the dashboard after reading the pause reason, so a second problem found while the bot is
-    already paused has to show up there too, not only in the audit log. Returns True when this call
-    paused a running bot, False when it only extended the reason of an existing pause (or the
+    Safety controls (balance mismatch, loss limits) must never hide each other: an existing pause keeps
+    its reasons and this one is added (``db.state.add_pause_reason``; the same code is merged into one
+    entry, a text that is already part of the pause is not repeated), so the dashboard and Telegram show
+    every problem. The auto-resume service lifts each code separately once its cause is resolved.
+    Returns True when this call paused a running bot, False when the bot was already paused (or the
     reason was already there). Flushes nothing itself (``db.state`` writes through the session).
     """
     paused, existing = state.get_pause(session)
-    if not paused:
-        state.set_paused(session, True, actor=actor, reason=reason)
-        return True
-    current = existing or ""
-    if reason in current:
+    if paused and reason in (existing or ""):
         return False
-    combined = f"{current}; {reason}" if current else reason
-    if len(combined) > MAX_PAUSE_REASON_CHARS:  # keep the start (the first reason) and the newest one
-        combined = f"{current[: MAX_PAUSE_REASON_CHARS // 2]} [...]; {reason}"[:MAX_PAUSE_REASON_CHARS]
-    state.set_paused(session, True, actor=actor, reason=combined)
-    return False
+    return state.add_pause_reason(session, code, reason, actor=actor, details=details)
 
 
 def _unconfirmed_stakes(session: Session) -> Decimal:
@@ -434,9 +435,16 @@ def reconcile(
                     f"balance mismatch at {when:%Y-%m-%d %H:%M} UTC: Betclic shows {observed} PLN, the "
                     f"ledger expected {ledger_balance} PLN (difference {diff:+} PLN). The ledger now "
                     "follows Betclic - check the account for deposits, withdrawals or bets the bot does "
-                    "not know, then resume from the dashboard"
+                    "not know (the auto-resume service accepts the booked adjustment when autonomy is on)"
                 ),
                 actor=actor,
+                code=PauseCode.BALANCE_MISMATCH,
+                details={
+                    "difference": str(diff),
+                    "observed_balance": str(observed),
+                    "ledger_balance": str(ledger_balance),
+                    "entry_id": entry_id,
+                },
             )
     details["paused"] = paused
     state.set_state(session, state.LAST_RECONCILIATION, details, actor=actor)

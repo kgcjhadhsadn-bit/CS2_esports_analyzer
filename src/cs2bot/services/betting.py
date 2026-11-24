@@ -74,6 +74,7 @@ from cs2bot.domain.betting import (
     PlacementStatus,
     PricedOutcome,
 )
+from cs2bot.domain.control import PauseCode
 from cs2bot.domain.enums import BetStatus, MatchFormat, MatchStatus
 from cs2bot.domain.predictions import MatchPrediction
 from cs2bot.engine import bankroll, decision, ledger
@@ -568,6 +569,8 @@ class _Cycle:
     start: datetime
     should_stop: Callable[[], bool] | None = None
     stop_reason: str | None = None
+    #: market types with trusted calibration (``decision.require_trusted_calibration``); None = unknown
+    trusted_markets: set[str] | None = None
     _t0: float = field(default_factory=time.monotonic)
 
     def now(self) -> datetime:
@@ -623,7 +626,7 @@ def run_betting_cycle(
             executor if settings.executor.enabled else None,
             bundle,
             report,
-            cycle=_Cycle(start=now, should_stop=should_stop),
+            cycle=_Cycle(start=now, should_stop=should_stop, trusted_markets=trusted_markets(bundle)),
             dry=dry,
             analyzer=analyzer,
             max_prediction_age=max_prediction_age,
@@ -766,7 +769,12 @@ def _bet_match(
             )
             decisions.extend(
                 decision.evaluate_all(
-                    items, match=info, settings=dec_settings, betclic=settings.betclic, now=now
+                    items,
+                    match=info,
+                    settings=dec_settings,
+                    betclic=settings.betclic,
+                    now=now,
+                    trusted_markets=cycle.trusted_markets,
                 )
             )
         bet_specs: dict[str, set[str]] = defaultdict(set)
@@ -1015,6 +1023,7 @@ def _place_one(
         bet.screenshot_path = result.screenshot_path
     bet.extra = {**dict(bet.extra or {}), "placement_message": result.message[:1000]}
     pause_reason: str | None = None
+    pause_code = PauseCode.OTHER
     if status is BetStatus.FAILED:
         bet.error = f"{result.status.value}: {result.message}"[:2000]
         report.failed += 1
@@ -1031,6 +1040,7 @@ def _place_one(
             },
         )
         pause_reason = _repeated_uncertain_reason(session, bet)
+        pause_code = PauseCode.UNCERTAIN_BET
     elif status is BetStatus.DRY_RUN:
         report.dry_run_ok += 1
     elif status is BetStatus.PLACED:
@@ -1050,8 +1060,13 @@ def _place_one(
             else "Betclic page layout changed (selector error)"
         )
         pause_reason = f"{what}: {result.message}"[:500]
+        pause_code = (
+            PauseCode.LOGIN_REQUIRED
+            if result.status is PlacementStatus.LOGIN_REQUIRED
+            else PauseCode.SELECTOR_ERROR
+        )
     if pause_reason is not None:
-        ledger.pause_trading(session, pause_reason, actor=ACTOR)
+        ledger.pause_trading(session, pause_reason, actor=ACTOR, code=pause_code, details={"bet_id": bet.id})
     session.commit()
     if pause_reason is not None:
         raise _StopPlacing(f"trading paused: {pause_reason}")
@@ -1065,6 +1080,26 @@ def _place_one(
         # paper bets are invisible to compute_state; reserve them locally so caps hold in this cycle
         return bankroll.reserve_stake(state, match.id, dec.stake)
     return _sizing_state(session, settings, now=now, dry=dry)
+
+
+def trusted_markets(bundle: Any) -> set[str] | None:
+    """Market types whose calibration the model bundle marks as trusted, or ``None`` when unknown.
+
+    Used only with ``decision.require_trusted_calibration``. TODO(final review): deep_data exposes the
+    per-market "trusted" verdict (``cs2bot.models.confidence`` / ``BacktestReport.market_trust``); wire
+    its final attribute here once docs/dev/reports/deep_data.md documents it. Until then a bundle
+    attribute ``market_trust`` (``{market_type: {"trusted": bool}}`` or ``{market_type: bool}``) is read
+    when present; otherwise ``None`` = no check.
+    """
+    trust = getattr(bundle, "market_trust", None)
+    if not isinstance(trust, dict):
+        return None
+    out: set[str] = set()
+    for market, verdict in trust.items():
+        ok = verdict.get("trusted") if isinstance(verdict, dict) else verdict
+        if ok is True:
+            out.add(str(market))
+    return out
 
 
 def _repeated_uncertain_reason(session: Session, bet: Bet) -> str | None:
@@ -1090,7 +1125,8 @@ def _repeated_uncertain_reason(session: Session, bet: Bet) -> str | None:
         return None
     return (
         f"{others + 1} bet placements are unconfirmed (UNCERTAIN, latest bet {bet.id}): check 'Moje zakłady' "
-        "on Betclic and the receipt selectors in config/betclic_selectors.yaml, then resume"
+        "on Betclic and the receipt selectors in config/betclic_selectors.yaml (lifts automatically once "
+        "settlement has resolved them from the Betclic bet history)"
     )
 
 

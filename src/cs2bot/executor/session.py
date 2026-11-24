@@ -7,12 +7,18 @@
 * Playwright's sync API is bound to the thread that started it: every call must come from that thread
   (:class:`~cs2bot.executor.base.ExecutorThreadError` otherwise). Use
   :class:`~cs2bot.executor.threaded.ThreadBoundExecutor` to share one executor between threads.
-* If the owner closes the browser window, the next call relaunches it with the same profile.
+* If the owner closes the browser window, the next call relaunches it with the same profile; the same
+  happens after a Chromium crash (the context's ``close`` event marks it closed, the next job relaunches).
+* Linux server (cloud runtime): a visible browser needs an X display. The VPS runs it headful on Xvfb
+  (``DISPLAY=:99``, less bot-like than headless); with no display at all it falls back to headless
+  (``executor.headless_without_display``, see :func:`effective_headless`).
 """
 
 from __future__ import annotations
 
 import contextlib
+import os
+import sys
 import threading
 from collections.abc import Callable
 from pathlib import Path
@@ -57,11 +63,37 @@ def parse_proxy_url(url: str) -> dict[str, str]:
     return proxy
 
 
+def has_display(environ: dict[str, str] | None = None, platform: str | None = None) -> bool:
+    """Whether a visible browser can open a window: always on Windows / macOS, on Linux only with an X
+    (``DISPLAY``, e.g. Xvfb) or Wayland (``WAYLAND_DISPLAY``) display."""
+    env = os.environ if environ is None else environ
+    plat = sys.platform if platform is None else platform
+    if not plat.startswith("linux"):
+        return True
+    return bool(env.get("DISPLAY") or env.get("WAYLAND_DISPLAY"))
+
+
+def effective_headless(
+    settings: Settings, *, environ: dict[str, str] | None = None, platform: str | None = None
+) -> bool:
+    """``executor.headless``, or True when a visible browser is configured but there is no display and
+    ``executor.headless_without_display`` allows the fallback (a server without Xvfb)."""
+    if settings.executor.headless:
+        return True
+    return bool(settings.executor.headless_without_display and not has_display(environ, platform))
+
+
 def build_launch_options(settings: Settings, tuning: ExecutorTuning, profile_dir: Path) -> dict[str, Any]:
-    """Keyword arguments for ``chromium.launch_persistent_context`` (pure; unit-tested)."""
+    """Keyword arguments for ``chromium.launch_persistent_context`` (pure apart from the display check)."""
+    headless = effective_headless(settings)
+    if headless and not settings.executor.headless:
+        log.warning(
+            "no X display (DISPLAY is not set): starting the Betclic browser headless - run it under "
+            "Xvfb (xvfb-run / DISPLAY=:99) for a visible browser"
+        )
     options: dict[str, Any] = {
         "user_data_dir": str(profile_dir),
-        "headless": settings.executor.headless,
+        "headless": headless,
         "locale": BROWSER_LOCALE,
         "timezone_id": BROWSER_TIMEZONE,
         "viewport": {"width": tuning.viewport_width, "height": tuning.viewport_height},

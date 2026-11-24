@@ -160,11 +160,11 @@ def check_trading_state(settings: Settings) -> list[Check]:
     try:
         with make_session_factory(engine)() as session:
             halted, reason = db_state.is_trading_halted(session)
+            codes = [r.code.value for r in db_state.get_pause_reasons(session)]
     finally:
         engine.dispose()
-    checks.append(
-        Check("trading", "warn" if halted else "ok", f"halted: {reason}" if halted else "not halted")
-    )
+    detail = f"halted: {reason}" + (f" [reasons: {', '.join(codes)}]" if codes else "")
+    checks.append(Check("trading", "warn" if halted else "ok", detail if halted else "not halted"))
     return checks
 
 
@@ -213,8 +213,135 @@ def check_dashboard(settings: Settings) -> Check:
     return Check("dashboard build", "warn", f"{dist} not built: run `npm ci && npm run build` in dashboard/")
 
 
-def run_checks(settings: Settings, *, chromium_finder: Callable[[], str | None] | None = None) -> list[Check]:
-    """All checks in display order."""
+def check_telegram(settings: Settings, *, probe: Callable[[], dict[str, object]] | None = None) -> Check:
+    """Telegram enabled -> token and chat id set, and (when a ``probe`` is given, e.g. the client's
+    ``getMe``) the token accepted by Telegram. Never prints the token."""
+    tg = settings.telegram
+    if not tg.enabled:
+        return Check("telegram", "warn", "disabled: no notifications or remote control (CS2BOT_TELEGRAM__*)")
+    missing = [
+        name
+        for name, value in (
+            ("CS2BOT_TELEGRAM__BOT_TOKEN", tg.bot_token),
+            ("CS2BOT_TELEGRAM__CHAT_ID", tg.chat_id),
+        )
+        if not value
+    ]
+    if missing:
+        return Check("telegram", "fail", f"enabled but {' and '.join(missing)} not set")
+    if not str(tg.chat_id).lstrip("-").isdigit() and not str(tg.chat_id).startswith("@"):
+        return Check("telegram", "fail", "chat id must be a number (from @userinfobot) or @channelname")
+    if probe is None:
+        return Check("telegram", "ok", f"token set, chat id {tg.chat_id}")
+    me = probe()
+    name = me.get("username") if isinstance(me, dict) else None
+    return Check("telegram", "ok", f"bot @{name} reachable, chat id {tg.chat_id}")
+
+
+def default_telegram_probe(settings: Settings) -> Callable[[], dict[str, object]] | None:
+    """``getMe`` through a real client (network); None when Telegram is not configured."""
+    from cs2bot.services.telegram import TelegramClient
+
+    client = TelegramClient.from_settings(settings)
+    if client is None:
+        return None
+
+    def probe() -> dict[str, object]:
+        try:
+            return dict(client.get_me())
+        finally:
+            client.close()
+
+    return probe
+
+
+def check_autonomy(settings: Settings) -> list[Check]:
+    """Autonomy / auto-login: the credentials it needs are configured (never printed)."""
+    auto = settings.autonomy
+    if not auto.enabled:
+        return [
+            Check("autonomy", "warn", "off: automatic pauses wait for the owner (CS2BOT_AUTONOMY__ENABLED)")
+        ]
+    checks = [
+        Check(
+            "autonomy",
+            "ok",
+            f"on: auto-resume {'on' if auto.auto_resume else 'off'}, circuit breaker "
+            f"{auto.circuit_breaker_limit} per {auto.circuit_breaker_window_h:g} h",
+        )
+    ]
+    if not auto.auto_login:
+        checks.append(Check("auto-login", "warn", "off: a logged-out session waits for the owner"))
+        return checks
+    betclic = settings.betclic
+    if betclic.credentials_source == "none":
+        checks.append(
+            Check(
+                "auto-login", "fail", "on but CS2BOT_BETCLIC__CREDENTIALS_SOURCE is none (use env or keyring)"
+            )
+        )
+    elif betclic.credentials_source == "env" and (betclic.username is None or betclic.password is None):
+        checks.append(
+            Check(
+                "auto-login", "fail", "CS2BOT_BETCLIC__USERNAME and CS2BOT_BETCLIC__PASSWORD must both be set"
+            )
+        )
+    elif betclic.credentials_source == "keyring":
+        checks.append(_guard("auto-login", lambda: _check_keyring(settings)))
+    else:
+        checks.append(Check("auto-login", "ok", "credentials set (env)"))
+    return checks
+
+
+def _check_keyring(settings: Settings) -> Check:
+    import importlib
+
+    try:
+        keyring = importlib.import_module("keyring")
+    except ImportError:
+        return Check(
+            "auto-login", "fail", "credentials_source=keyring but the keyring package is not installed"
+        )
+    betclic = settings.betclic
+    username = betclic.username.get_secret_value() if betclic.username is not None else None
+    if username:
+        found = bool(keyring.get_password(betclic.keyring_service, username))
+    else:
+        credential = keyring.get_credential(betclic.keyring_service, None)
+        found = credential is not None and bool(credential.password)
+    return Check(
+        "auto-login",
+        "ok" if found else "fail",
+        f"keyring service {betclic.keyring_service!r}: {'credential found' if found else 'no credential'}",
+    )
+
+
+def check_display(settings: Settings) -> Check:
+    """A visible Betclic browser on a Linux server needs Xvfb (DISPLAY)."""
+    from cs2bot.executor.session import effective_headless, has_display
+
+    if settings.executor.headless:
+        return Check("browser display", "ok", "headless browser (executor.headless)")
+    if has_display():
+        return Check(
+            "browser display", "ok", f"visible browser on display {os.environ.get('DISPLAY') or 'desktop'}"
+        )
+    if effective_headless(settings):
+        return Check(
+            "browser display", "warn", "no DISPLAY: the browser falls back to headless (run under Xvfb)"
+        )
+    return Check(
+        "browser display", "fail", "no DISPLAY and headless_without_display=false: Chromium cannot start"
+    )
+
+
+def run_checks(
+    settings: Settings,
+    *,
+    chromium_finder: Callable[[], str | None] | None = None,
+    telegram_probe: Callable[[], dict[str, object]] | None = None,
+) -> list[Check]:
+    """All checks in display order (``telegram_probe``: e.g. :func:`default_telegram_probe`)."""
     checks: list[Check] = []
     try:
         db = check_database(settings)
@@ -230,6 +357,12 @@ def run_checks(settings: Settings, *, chromium_finder: Callable[[], str | None] 
     checks.append(_guard("disk space", lambda: check_disk(settings)))
     checks.append(_guard("models", lambda: check_models(settings)))
     checks.append(_guard("dashboard build", lambda: check_dashboard(settings)))
+    checks.append(_guard("browser display", lambda: check_display(settings)))
+    checks.append(_guard("telegram", lambda: check_telegram(settings, probe=telegram_probe)))
+    try:
+        checks.extend(check_autonomy(settings))
+    except Exception as exc:
+        checks.append(Check("autonomy", "fail", f"check crashed: {type(exc).__name__}: {exc}"))
     if all(c.level == "ok" for c in db):
         try:
             checks.extend(check_trading_state(settings))

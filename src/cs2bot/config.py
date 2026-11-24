@@ -42,9 +42,10 @@ OptionalStr = Annotated[str | None, BeforeValidator(_blank_to_none)]
 
 # The CS2 Active Duty pool changes a few times per year. This is only the *default*; the meta
 # module detects the pool actually being played from recent Tier 1/2 results, and
-# config/patches.yaml holds the pool history (whose latest entry differs from this list - see
-# docs/dev/reports/integration.md; the synthetic universe and many tests are pinned to this one).
-DEFAULT_ACTIVE_MAP_POOL: list[str] = ["ancient", "anubis", "dust2", "inferno", "mirage", "nuke", "train"]
+# config/patches.yaml holds the pool history (its latest entry must equal this list).
+# Verified 2026-11-24 (deep_data): Train left Active Duty on 2026-01-21 (Anubis back), Cache replaced
+# Overpass on 2026-07-08; still the pool of the PGL Major Singapore (2026-11-25).
+DEFAULT_ACTIVE_MAP_POOL: list[str] = ["ancient", "anubis", "cache", "dust2", "inferno", "mirage", "nuke"]
 
 
 class DatabaseSettings(BaseModel):
@@ -94,6 +95,12 @@ class HLTVSettings(BaseModel):
     cooldown_base_s: float = 900.0  # first cool-down after a block; doubles on each repeat
     cooldown_max_s: float = 43_200.0
     block_resources: bool = True  # skip images / media / fonts (less traffic for HLTV and us)
+    # How ``proxy_url`` is used by the page fetcher (deep_data): "after_block" = direct first, and only
+    # when HLTV shows a challenge / the direct route is cooling down, retry through the proxy (which
+    # has its own cool-down and its own browser profile); "always" = every fetch through the proxy.
+    proxy_mode: Literal["after_block", "always"] = "after_block"
+    proxy_cooldown_base_s: float = 1800.0
+    proxy_cooldown_max_s: float = 43_200.0
 
 
 class DemoSettings(BaseModel):
@@ -169,6 +176,12 @@ class ModelSettings(BaseModel):
     round_model_half_life_days: float = 365.0
     kill_model_half_life_days: float = 120.0
     top_fragger_samples: int = 20_000
+    # deep_data: optional sharp-bookmaker benchmark (cs2bot.odds.sharp). None = disabled (no paid feed
+    # is configured); a path = JSON file of de-vigged sharp quotes used for CLV and the market features.
+    sharp_odds_file: OptionalStr = None
+    # deep_data: per-market high-confidence guard written by the backtest (cs2bot.models.confidence);
+    # the decision layer may require ``trusted`` markets (see docs/dev/reports/deep_data.md).
+    confidence_guard_file: Path = Path("data/models/confidence_guard.json")
 
 
 class MarketThresholds(BaseModel):

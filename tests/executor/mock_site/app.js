@@ -83,9 +83,40 @@ function openLogin() {
     h("h2", { text: "Logowanie" }),
     h("input", { id: "loginUser", name: "login", autocomplete: "username", placeholder: "E-mail lub login", oninput: sendForm }),
     h("input", { id: "loginPass", type: "password", autocomplete: "current-password", placeholder: "Hasło", oninput: sendForm }),
-    h("button", { id: "loginSubmit", class: "btn is-primary", text: "Zaloguj się", onclick: () => api("/api/login", {}) }),
+    h("div", { id: "loginError", class: "loginForm_error", role: "alert", hidden: true }),
+    h("button", { id: "loginSubmit", class: "btn is-primary", text: "Zaloguj się", onclick: submitLogin }),
   );
   document.body.appendChild(modal);
+}
+
+// The server answers a submitted login with {result: "ok" | "2fa" | "error", message}. "2fa" replaces the
+// form with an SMS-code step (the bot must stop there); "error" shows the message in the form.
+async function submitLogin() {
+  const res = await api("/api/login", {
+    username: document.getElementById("loginUser").value,
+    password: document.getElementById("loginPass").value,
+  });
+  const modal = document.getElementById("loginModal");
+  if (!modal) return;
+  if (res.result === "ok") {
+    closeLogin();
+    ui.data = await api("/api/state?path=" + encodeURIComponent(location.pathname));
+    render();
+    return;
+  }
+  if (res.result === "2fa") {
+    modal.innerHTML = "";
+    modal.appendChild(h("h2", { text: "Weryfikacja dwuetapowa" }));
+    modal.appendChild(h("p", { class: "twoFactor_info", text: "Wpisz kod SMS, który wysłaliśmy na Twój numer telefonu." }));
+    modal.appendChild(h("input", { id: "smsCode", name: "otp", autocomplete: "one-time-code", inputmode: "numeric", "aria-label": "Kod SMS" }));
+    modal.appendChild(h("button", { class: "btn is-primary", text: "Potwierdź" }));
+    return;
+  }
+  const error = document.getElementById("loginError");
+  if (error && res.result === "error") {
+    error.textContent = res.message || "Błąd logowania";
+    error.hidden = false;
+  }
 }
 
 function closeLogin() {

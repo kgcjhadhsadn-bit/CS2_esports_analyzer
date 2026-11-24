@@ -1,0 +1,27 @@
+# Build context of the cloud image (Dockerfile). Allow-list style: everything is excluded except
+# what the image needs, so secrets (.env), runtime data and local caches can never end up in a layer.
+*
+
+!pyproject.toml
+!uv.lock
+!README.md
+!alembic.ini
+!src/
+!config/
+!dashboard/
+!deploy/linux/docker-entrypoint.sh
+!deploy/linux/selftest.py
+
+# Never inside the image, even below an allowed directory.
+**/__pycache__/
+**/*.py[cod]
+**/.mypy_cache/
+**/.ruff_cache/
+**/.pytest_cache/
+**/.env
+**/.env.*
+dashboard/node_modules/
+dashboard/dist/
+dashboard/.vite/
+dashboard/coverage/
+dashboard/.env.local

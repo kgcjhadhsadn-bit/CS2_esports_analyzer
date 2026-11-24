@@ -51,8 +51,8 @@ def _between(field: str, lo: float, hi: float, *, lo_open: bool = False, hi_open
 def _thresholds_error(prefix: str, th: MarketThresholds) -> str | None:
     if th.min_probability is not None and not 0 < th.min_probability < 1:
         return f"{prefix}.min_probability must be in (0, 1)"
-    if th.min_ev is not None and not 0 <= th.min_ev <= 1:
-        return f"{prefix}.min_ev must be in [0, 1]"
+    if th.min_ev is not None and not -1 <= th.min_ev <= 1:
+        return f"{prefix}.min_ev must be in [-1, 1] (-1 = odds ignored)"
     if th.max_sigma is not None and not 0 < th.max_sigma <= 0.5:
         return f"{prefix}.max_sigma must be in (0, 0.5]"
     return None
@@ -98,7 +98,8 @@ def _check_positive_decimal(field: str, hi: Decimal, *, allow_zero: bool) -> Che
 # field -> checks; the odds check runs when either odds field is overridden
 _DECISION_CHECKS: dict[str, list[Check]] = {
     "min_probability": [_between("min_probability", 0, 1, lo_open=True, hi_open=True)],
-    "min_ev": [_between("min_ev", 0, 1)],
+    # -1 switches the EV rule off (confidence only, odds ignored - the owner's rule since 2026-11-24)
+    "min_ev": [_between("min_ev", -1, 1)],
     "max_sigma": [_between("max_sigma", 0, 0.5, lo_open=True)],
     "min_data_completeness": [_between("min_data_completeness", 0, 1)],
     "min_event_link_confidence": [_between("min_event_link_confidence", 0, 1)],

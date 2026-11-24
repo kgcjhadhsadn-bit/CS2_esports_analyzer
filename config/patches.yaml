@@ -172,13 +172,15 @@ patches:
     date: 2026-07-08
     kind: map_pool
     impact: major
-    date_verified: false
+    date_verified: true
     title: "Premier Season 5: Cache replaces Overpass in Active Duty"
     map_pool: [ancient, anubis, cache, dust2, inferno, mirage, nuke]
     notes: >
       Cache (added to other modes on 2026-04-29) enters Active Duty, Overpass leaves; announced by
-      Valve on 2026-06-22. The day is UNVERIFIED: op.gg's patch log and escharts.com give 07-08
-      (the majority), esports.gg 07-09, the announcement named the end of Season 4 on 07-06.
+      Valve on 2026-06-22. Day verified 2026-11-24 (deep_data): op.gg's patch log, escharts.com and
+      turbosmurfs.gg (citing Valve's post, checked 2026-10-21) give 07-08; esports.gg says 07-09, the
+      announcement named the end of Season 4 on 07-06. As of 2026-11-24 this is still the Active Duty
+      pool (no later change found; the PGL Major Singapore 2026-11-25 is played on it).
       Same update: C4 explosion damage reworked.
 
   - id: 2026-07-21-bomb-clears-utility

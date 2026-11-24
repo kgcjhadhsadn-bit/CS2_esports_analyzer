@@ -8,7 +8,7 @@ import { useBankroll, useBets, useHealth, useMatches } from "../api/hooks";
 import type { Bankroll, BankrollMode, LossLimit } from "../api/types";
 import { AlertList } from "../components/AlertList";
 import { BetsTable, MatchesTable } from "../components/tables";
-import { TradingControls } from "../components/TradingControls";
+import { AutonomyStatus, TradingControls } from "../components/TradingControls";
 import { Badge, Card, Meter, QueryView, Segmented, Stat } from "../components/ui";
 import { formatDateTime, formatMoney, signClass } from "../lib/format";
 import { useNow } from "../lib/useNow";
@@ -109,6 +109,10 @@ export default function OverviewPage() {
           <TradingControls />
         </Card>
       </div>
+
+      <Card title="Autonomy & Telegram" sub="Automatic pauses lift themselves; the kill switch and manual pauses never do">
+        <AutonomyStatus />
+      </Card>
 
       <Card
         title="Alerts"

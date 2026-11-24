@@ -62,7 +62,8 @@ def test_full_engine_pipeline(session: Session, settings: Settings) -> None:
         now=NOW,
     )
     assert [d.accepted for d in decisions] == [True, False, False]
-    assert {decision.reason_code(r) for r in decisions[1].reasons} >= {"low_probability", "low_ev"}
+    # odds are ignored (min_ev = -1.0, owner decision 2026-11-24): only the confidence fails
+    assert {decision.reason_code(r) for r in decisions[1].reasons} == {"low_probability"}
 
     state = bankroll.compute_state(session, settings, now=NOW)
     bankroll_settings = db_state.effective_bankroll_settings(session, settings)

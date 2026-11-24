@@ -10,6 +10,9 @@ A row is a flat ``dict[str, float]`` (NaN = not available) made of:
   record type cannot tell these apart, so live predictions made before the veto look exactly like
   deciders did in training) and, optionally, ``team1_starts_ct``;
 * map and patch meta: :meth:`FeatureStore.map_features`, :meth:`FeatureStore.meta_features`;
+* the deep block (deep_data, when ``store.deep`` is built): ``diff_dp_*`` team factors (plus
+  ``t1_dp_*`` / ``t2_dp_*`` with ``DeepConfig.team_columns="all"``) and the match-level ``dp_*`` /
+  ``stage_*`` / ``stakes_level`` / ``mkt_*`` / ``sharp_*`` columns of :mod:`cs2bot.features.deep`;
 * rating features when a :class:`RatingProvider` is given: ``rating_p``, ``rating_logit``,
   ``rating_sigma`` and one ``rating_c_<component>`` per numeric entry of
   ``MapWinEstimate.components``.
@@ -122,8 +125,12 @@ def match_map_features(
     team1_start_side: Side | None = None,
     exclude_match_id: int | None = None,
     rating_provider: RatingProvider | None = None,
+    stage: str | None = None,
 ) -> dict[str, float]:
     """The feature row of one map between two teams, using only data strictly before ``as_of``.
+
+    ``exclude_match_id`` is also the match whose static metadata (stage, venue, tournament) and
+    pre-``as_of`` market prices feed the deep block; ``stage`` overrides the stored stage text.
 
     This is the single code path behind :func:`build_training_rows` and
     :func:`features_for_match_map`, so training and live rows cannot drift apart. ``picked_by=None``
@@ -170,6 +177,29 @@ def match_map_features(
         out["team1_starts_ct"] = (1.0 if team1_start_side is Side.CT else 0.0) if known else NAN
     out.update(store.map_features(map_name, as_of, exclude_match_id=exclude_match_id))
     out.update(store.meta_features(as_of))
+    if store.deep is not None:
+        lineup1 = tuple(team1_lineup) or store.last_lineup(team1_id, as_of, exclude_match_id=exclude_match_id)
+        lineup2 = tuple(team2_lineup) or store.last_lineup(team2_id, as_of, exclude_match_id=exclude_match_id)
+        d1, d2, dm = store.deep.features(
+            team1_id,
+            team2_id,
+            map_name,
+            as_of,
+            match_id=exclude_match_id,
+            exclude_match_id=exclude_match_id,
+            team1_lineup=lineup1,
+            team2_lineup=lineup2,
+            is_lan=is_lan,
+            stage=stage,
+        )
+        if store.deep.config.team_columns == "all":
+            for name, value in d1.items():
+                out[f"t1_{name}"] = value
+            for name, value in d2.items():
+                out[f"t2_{name}"] = value
+        for name, value in d1.items():
+            out[f"diff_{name}"] = value - d2[name]
+        out.update(dm)
     if rating_provider is not None:
         estimate = rating_estimate(rating_provider, team1_id, team2_id, map_name, as_of, is_lan=is_lan)
         out.update(rating_features(estimate))
@@ -224,6 +254,7 @@ def features_for_match_map(
         team1_start_side=ctx.start_sides.get(name),
         exclude_match_id=ctx.match_id,
         rating_provider=rating_provider,
+        stage=ctx.stage,
     )
 
 

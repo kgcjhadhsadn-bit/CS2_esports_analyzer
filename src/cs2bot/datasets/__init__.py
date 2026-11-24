@@ -7,6 +7,7 @@ Public interface (see docs/dev/reports/datasets_features.md):
 * demo-derived extras: :func:`load_team_demo_stats`, :func:`load_role_frames`,
   :func:`available_position_seconds`
 * one match: :func:`load_match_context`, :func:`data_completeness`, :func:`load_match_actuals`
+* deep factors (deep_data): :class:`DeepData` and its loaders (:mod:`cs2bot.datasets.deep`)
 """
 
 from cs2bot.datasets._common import SOURCE_PRIORITY
@@ -17,6 +18,20 @@ from cs2bot.datasets.context import (
     completeness_breakdown,
     data_completeness,
     load_match_context,
+)
+from cs2bot.datasets.deep import (
+    ClutchRecord,
+    CoachChangeRecord,
+    DeepData,
+    DuelRecord,
+    MarketPoint,
+    MatchMetaRecord,
+    TeamMetaRecord,
+    load_clutch_records,
+    load_coach_changes,
+    load_duel_records,
+    load_match_meta,
+    load_team_meta,
 )
 from cs2bot.datasets.demo import (
     RoleFrames,
@@ -35,20 +50,32 @@ from cs2bot.datasets.loaders import (
 
 __all__ = [
     "SOURCE_PRIORITY",
+    "ClutchRecord",
+    "CoachChangeRecord",
     "CompletenessConfig",
+    "DeepData",
+    "DuelRecord",
+    "MarketPoint",
+    "MatchMetaRecord",
     "MatchNotFoundError",
     "RoleFrames",
     "TeamDemoMapRecord",
+    "TeamMetaRecord",
     "available_position_seconds",
     "completeness_breakdown",
     "data_completeness",
+    "load_clutch_records",
+    "load_coach_changes",
+    "load_duel_records",
     "load_map_results",
     "load_match_actuals",
     "load_match_context",
+    "load_match_meta",
     "load_player_map_records",
     "load_role_frames",
     "load_round_records",
     "load_team_demo_stats",
+    "load_team_meta",
     "load_veto_records",
     "to_frame",
 ]

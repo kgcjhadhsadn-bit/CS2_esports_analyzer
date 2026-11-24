@@ -579,11 +579,51 @@ class SwitchState(BaseModel):
     updated_by: str | None = None
 
 
+class PauseReasonOut(BaseModel):
+    """One structured pause reason (cloud autonomy)."""
+
+    code: str  # loss_limit_daily, uncertain_bet, login_required, 2fa_required, manual, circuit_open ...
+    label: str
+    message: str
+    since: datetime | None = None
+    actor: str | None = None
+    count: int = 1
+    auto_resume: bool = False  # the auto-resume service will lift it once its cause is resolved
+    eta: datetime | None = None  # expected auto-resume (loss limits: exact; login: next attempt)
+    last_check: str | None = None  # what the last autonomy check found
+
+
+class AutonomyStatusOut(BaseModel):
+    enabled: bool
+    auto_login: bool
+    last_check_at: datetime | None = None
+    last_login_status: str | None = None
+    last_login_at: datetime | None = None
+    last_login_message: str | None = None
+    login_blocked: bool = False  # wrong password / locked account: waiting for the owner
+
+
+class TelegramStatusOut(BaseModel):
+    enabled: bool
+    configured: bool  # token and chat id set
+    last_scan_at: datetime | None = None
+    last_ok_at: datetime | None = None
+    last_error: str | None = None
+    sent: int | None = None
+    last_poll_at: datetime | None = None
+    commands_handled: int | None = None
+
+
 class TradingStateOut(BaseModel):
     halted: bool
     reason: str | None = None
     kill_switch: SwitchState
     paused: SwitchState
+    pause_reasons: list[PauseReasonOut] = Field(default_factory=list)
+    circuit_open: bool = False
+    circuit_codes: list[str] = Field(default_factory=list)
+    autonomy: AutonomyStatusOut | None = None
+    telegram: TelegramStatusOut | None = None
 
 
 class ConfigSections(BaseModel):

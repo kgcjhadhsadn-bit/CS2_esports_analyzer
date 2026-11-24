@@ -20,6 +20,7 @@ from decimal import Decimal
 from typing import Any
 
 from cs2bot.domain.betting import BetOrder, ExecutorHealth, PlacementResult, PlacementStatus
+from cs2bot.domain.control import LoginAttempt, LoginStatus
 from cs2bot.executor.base import (
     BookmakerBetRecord,
     BookmakerBetStatus,
@@ -47,6 +48,7 @@ class FakeExecutor:
         history: Iterable[BookmakerBetRecord] = (),
         login_succeeds: bool = True,
         enforce_idempotency: bool = True,
+        auto_login_results: Iterable[LoginStatus] = (),
     ) -> None:
         self.script: deque[ScriptItem] = deque(script)
         self.balance = balance
@@ -63,6 +65,9 @@ class FakeExecutor:
         self.results: list[PlacementResult] = []
         self.closed = False
         self._seq = 0
+        #: Scripted outcomes of ``auto_login`` (consumed in order); empty: like the owner's login
+        #: (``login_succeeds``). ``LOGGED_IN`` logs the fake in.
+        self.auto_login_results: deque[LoginStatus] = deque(auto_login_results)
 
     # ------------------------------------------------------------------ scripting
 
@@ -126,6 +131,19 @@ class FakeExecutor:
         if self.login_succeeds:
             self.logged_in = True
         return self.logged_in
+
+    def auto_login(self, timeout_s: float | None = None) -> LoginAttempt:
+        self._check_open()
+        self.calls.append(("auto_login", timeout_s))
+        if self.logged_in:
+            status = LoginStatus.ALREADY_LOGGED_IN
+        elif self.auto_login_results:
+            status = self.auto_login_results.popleft()
+        else:
+            status = LoginStatus.LOGGED_IN if self.login_succeeds else LoginStatus.FAILED
+        if status.logged_in:
+            self.logged_in = True
+        return LoginAttempt(status=status, message=f"fake auto-login: {status.value}", at=utcnow())
 
     def fetch_bet_history(self, since: datetime) -> list[BookmakerBetRecord]:
         self._check_open()

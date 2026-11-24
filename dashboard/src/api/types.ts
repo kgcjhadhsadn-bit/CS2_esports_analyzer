@@ -702,11 +702,51 @@ export interface SwitchState {
   updated_by: string | null;
 }
 
+/** One structured pause reason (cloud autonomy). `auto_resume`: lifted automatically once resolved. */
+export interface PauseReason {
+  code: string;
+  label: string;
+  message: string;
+  since: Iso | null;
+  actor: string | null;
+  count: number;
+  auto_resume: boolean;
+  eta: Iso | null;
+  last_check: string | null;
+}
+
+export interface AutonomyStatus {
+  enabled: boolean;
+  auto_login: boolean;
+  last_check_at: Iso | null;
+  last_login_status: string | null;
+  last_login_at: Iso | null;
+  last_login_message: string | null;
+  login_blocked: boolean;
+}
+
+export interface TelegramStatus {
+  enabled: boolean;
+  configured: boolean;
+  last_scan_at: Iso | null;
+  last_ok_at: Iso | null;
+  last_error: string | null;
+  sent: number | null;
+  last_poll_at: Iso | null;
+  commands_handled: number | null;
+}
+
 export interface TradingState {
   halted: boolean;
   reason: string | null;
   kill_switch: SwitchState;
   paused: SwitchState;
+  /** Missing on older API versions; the kill-switch endpoints return only the switch. */
+  pause_reasons?: PauseReason[];
+  circuit_open?: boolean;
+  circuit_codes?: string[];
+  autonomy?: AutonomyStatus | null;
+  telegram?: TelegramStatus | null;
 }
 
 export interface MarketThresholds {

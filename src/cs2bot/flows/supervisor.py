@@ -9,17 +9,20 @@ Start-up order (:func:`run_up`):
    call, in the executor's own thread). A :class:`~cs2bot.executor.FakeExecutor` is never created
    here: tests inject one through ``executor_factory``;
 4. the Claude context analyzer (disabled without a key: template rationales, no flags);
+4b. cloud autonomy: the Telegram client (``telegram.enabled`` with token + chat id; a "started" message
+   goes out once everything runs) and a reset of a stopped auto-login (a restart is how the owner
+   applies corrected credentials);
 5. the scheduler (``flows.jobs.build_jobs``) and the API on ``settings.api.host:port`` (``api.make_server``
    with ``login_launcher``, ``executor_health_provider``, ``scheduler_status_provider``,
    ``event_remapper``); the dashboard URL is printed.
 
-Shutdown: Ctrl+C (SIGINT -> ``KeyboardInterrupt``), SIGTERM or, on Windows, SIGBREAK set the stop
-event; the main thread only waits on that event with a short timeout, which keeps Ctrl+C working on
-Windows. The API is stopped first (no new commands), then the scheduler (running jobs finish their
-current step; bets are committed before every click so an interrupted cycle is safe), then the
-executor (closes Chromium, releases the profile lock) and the analyzer. The whole shutdown is bounded
-(``SHUTDOWN_BUDGET_S``) to stay inside the 90 s the Windows start script waits. Exit code 0 = a
-normal stop; non-zero = could not start or crashed.
+Shutdown: Ctrl+C (SIGINT -> ``KeyboardInterrupt``), SIGTERM (``docker stop`` on the VPS) or, on Windows,
+SIGBREAK set the stop event (a "stopping" Telegram message is sent first); the main thread only waits on
+that event with a short timeout, which keeps Ctrl+C working on Windows. The API is stopped first (no new
+commands), then the scheduler (running jobs finish their current step; bets are committed before every
+click so an interrupted cycle is safe), then the executor (closes Chromium, releases the profile lock)
+and the analyzer. The whole shutdown is bounded (``SHUTDOWN_BUDGET_S``) to stay inside the 90 s the
+Windows start script waits. Exit code 0 = a normal stop; non-zero = could not start or crashed.
 """
 
 from __future__ import annotations
@@ -147,6 +150,7 @@ def run_up(
     session_factory: sessionmaker[Session] | None = None,
     executor_factory: Callable[[Settings, sessionmaker[Session]], Any] | None = None,
     analyzer_factory: Callable[[Settings], Any] | None = None,
+    telegram_factory: Callable[[Settings], Any] | None = None,
     runtime_overrides: dict[str, Any] | None = None,
     check_migrations: bool = True,
     train_if_missing: bool = True,
@@ -205,7 +209,10 @@ def run_up(
         except Exception:
             log.exception("the Claude context layer could not start; continuing without it")
 
+    telegram = _start_telegram(settings, telegram_factory)
+    _reset_auto_login(session_factory)
     health = HealthCache()
+    runtime_kwargs: dict[str, Any] = {"telegram": telegram, **(runtime_overrides or {})}
     runtime = Runtime(
         settings=settings,
         session_factory=session_factory,
@@ -214,7 +221,7 @@ def run_up(
         analyzer=analyzer,
         health_cache=health,
         stop_event=stop,  # a betting cycle running at Ctrl+C places nothing more
-        **(runtime_overrides or {}),
+        **runtime_kwargs,
     )
     scheduler: Scheduler | None = None
     server: Any | None = None
@@ -243,6 +250,7 @@ def run_up(
             url = dashboard_url(settings, _bound_port(server))
         mode = "DRY RUN (no real bets)" if settings.executor.dry_run else "LIVE - real money"
         echo(f"cs2bot is running. Dashboard: {url}  Betting mode: {mode}. Press Ctrl+C to stop.")
+        _notify_lifecycle(runtime, _startup_text(settings, session_factory, mode))
         if on_started is not None:
             on_started(UpHandles(runtime=runtime, scheduler=scheduler, server=server, stop=stop, url=url))
         while not stop.wait(0.5):
@@ -258,12 +266,76 @@ def run_up(
         exit_code = EXIT_ERROR
     finally:
         stop.set()
+        _notify_lifecycle(runtime, f"cs2bot is stopping ({'error' if exit_code else 'normal stop'}).")
         _shutdown(server, api_thread, scheduler, runtime, executor, analyzer)
+        if runtime.telegram is not None:
+            _safe_close("telegram", runtime.telegram)
         restore_signals()
         if engine is not None:
             engine.dispose()
     echo("cs2bot stopped.")
     return exit_code
+
+
+def _start_telegram(settings: Settings, factory: Callable[[Settings], Any] | None) -> Any | None:
+    """The Telegram client when enabled and configured (else None; problems are logged, never fatal)."""
+    if not settings.telegram.enabled:
+        return None
+    try:
+        if factory is not None:
+            return factory(settings)
+        from cs2bot.services.telegram import TelegramClient
+
+        client = TelegramClient.from_settings(settings)
+        if client is None:
+            log.warning("telegram.enabled but the bot token or chat id is missing: no Telegram")
+        return client
+    except Exception:
+        log.exception("the Telegram client could not start; continuing without it")
+        return None
+
+
+def _reset_auto_login(session_factory: sessionmaker[Session]) -> None:
+    """A restart re-reads the credentials: a stopped auto-login (wrong password ...) may try again."""
+    try:
+        from cs2bot.services.autonomy import clear_login_block
+
+        with session_factory() as session:
+            clear_login_block(session, actor="startup")
+            session.commit()
+    except Exception:
+        log.warning("could not reset the auto-login state", exc_info=True)
+
+
+def _startup_text(settings: Settings, session_factory: sessionmaker[Session], mode: str) -> str:
+    lines = [f"cs2bot started. Betting mode: {mode}."]
+    try:
+        from cs2bot.db import state as db_state
+
+        with session_factory() as session:
+            if db_state.is_kill_switch_on(session):
+                lines.append("Kill switch is ON (send /go to allow betting).")
+            reasons = db_state.get_pause_reasons(session)
+            if reasons:
+                lines.append("Paused: " + ", ".join(r.code.value for r in reasons) + " (see /status).")
+    except Exception:
+        log.warning("could not read the trading state for the startup message", exc_info=True)
+    if settings.autonomy.enabled:
+        lines.append(
+            "Autonomy on: automatic pauses lift themselves"
+            + (", auto-login on." if settings.autonomy.auto_login else ".")
+        )
+    return "\n".join(lines)
+
+
+def _notify_lifecycle(runtime: Runtime, text: str) -> None:
+    client = runtime.telegram
+    if client is None or not runtime.settings.telegram.notify_lifecycle:
+        return
+    try:
+        client.send(text)
+    except Exception:  # send never raises, but a test double might
+        log.warning("could not send the Telegram lifecycle message", exc_info=True)
 
 
 def _login_launcher(executor: Any | None) -> Callable[[], object] | None:

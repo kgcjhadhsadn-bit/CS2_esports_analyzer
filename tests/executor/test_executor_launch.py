@@ -156,7 +156,10 @@ def _order(**overrides: Any) -> BetOrder:
 # ----------------------------------------------------------------------------- launch options
 
 
-def test_build_launch_options_defaults(settings: Settings, tmp_path: Path) -> None:
+def test_build_launch_options_defaults(
+    settings: Settings, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("DISPLAY", ":99")  # a desktop / Xvfb display (see the headless fallback test)
     opts = build_launch_options(settings, TUNING, tmp_path / "profile")
     assert opts["user_data_dir"] == str(tmp_path / "profile")
     assert opts["headless"] is False  # visible by default (owner's desktop)

@@ -10,6 +10,8 @@ from cs2bot.domain.records import MapResultRecord, VetoRecord, VetoStep
 from cs2bot.testing.synthetic import SynthUniverse, generate_universe
 
 T0 = datetime(2025, 1, 1, 12, 0, tzinfo=UTC)
+# Legacy (pre-2026) Active Duty pool the veto tests are written against; the synthetic universes are
+# pinned to it so the tests do not depend on DEFAULT_ACTIVE_MAP_POOL (which tracks the live pool).
 POOL7 = ["ancient", "anubis", "dust2", "inferno", "mirage", "nuke", "train"]
 
 
@@ -29,6 +31,7 @@ def universe(
         map_offset_sd=map_offset_sd,
         drift_sd_per_30d=drift_sd_per_30d,
         with_kills=False,
+        map_pool=POOL7,
     )
 
 

@@ -197,6 +197,11 @@ class MockState:
     decline_calls: int = 0
     login_form: dict[str, str] = field(default_factory=dict)
     login_submits: int = 0
+    # Submitted login (auto-login tests): "ok" logs in (when the credentials match ``login_credentials``,
+    # if set), "2fa" shows an SMS-code step, "locked" an account-blocked message, "silent" no answer.
+    login_mode: str = "ok"
+    login_credentials: tuple[str, str] | None = None
+    login_payloads: list[dict[str, str]] = field(default_factory=list)
     bets: list[MockBet] = field(default_factory=list)
     next_bet_no: int = 1001
     history_page_size: int = 5
@@ -412,8 +417,21 @@ class MockBetclicServer:
             return {"ok": True}
         if path == "/api/login":
             st.login_submits += 1
+            payload = {"username": str(body.get("username", "")), "password": str(body.get("password", ""))}
+            st.login_payloads.append(payload)
+            if st.login_mode == "silent":
+                return {"result": "pending"}
+            if st.login_mode == "locked":
+                message = "Twoje konto zostało zablokowane. Skontaktuj się z nami."
+                return {"result": "error", "message": message}
+            if st.login_credentials is not None and (payload["username"], payload["password"]) != tuple(
+                st.login_credentials
+            ):
+                return {"result": "error", "message": "Nieprawidłowy login lub hasło."}
+            if st.login_mode == "2fa":
+                return {"result": "2fa"}
             st.logged_in = True
-            return {"ok": True}
+            return {"result": "ok", "ok": True}
         return {"error": "unknown endpoint"}
 
     def _place(self, body: dict[str, Any]) -> dict[str, Any]:

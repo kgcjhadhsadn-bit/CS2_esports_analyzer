@@ -7,7 +7,7 @@ import { useHealth, useJobRuns } from "../api/hooks";
 import type { Health, JobHealth, JobStatus } from "../api/types";
 import { AlertList } from "../components/AlertList";
 import { AgeBadge, JobStatusBadge } from "../components/badges";
-import { BetclicLoginButton } from "../components/TradingControls";
+import { AutonomyStatusCard, BetclicLoginButton, PauseReasonList } from "../components/TradingControls";
 import { Badge, Card, Chips, Empty, Pager, QueryView, toggleRowProps } from "../components/ui";
 import type { BadgeTone } from "../components/ui";
 import { formatAge, formatDateTime, formatMoney, formatNumber, formatRelative, humanize } from "../lib/format";
@@ -395,6 +395,18 @@ export default function HealthPage() {
             <Card title="Alerts">
               <AlertList alerts={data.alerts} />
             </Card>
+            {data.trading && (
+              <Card title="Trading state & autonomy">
+                <div className="stack">
+                  {data.trading.paused.on && (data.trading.pause_reasons?.length ?? 0) > 0 ? (
+                    <PauseReasonList state={data.trading} />
+                  ) : (
+                    <span className="small muted">{data.trading.halted ? data.trading.reason : "Not paused."}</span>
+                  )}
+                  <AutonomyStatusCard state={data.trading} />
+                </div>
+              </Card>
+            )}
             <div className="grid grid-2">
               <ExecutorCard health={data} />
               <FreshnessCard health={data} />

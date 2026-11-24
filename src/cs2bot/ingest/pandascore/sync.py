@@ -40,6 +40,11 @@ Assumptions (no live token was available; see ``models.py`` for the payload sour
   ``Match.extra['pandascore']['forfeit_winner_team_id']`` - the same convention as the HLTV sync.
 * Rosters come from ``/tournaments/{id}/rosters``. They may list more than five players (substitutes);
   a pre-match lineup is only written when exactly five (active) players are listed.
+
+PandaScore is optional (deep_data, PLAN.md section 0): with no API token every sync function returns
+an empty report (``details["disabled"] = True``, one warning) without touching the network or the
+database, and the process logs a single "PandaScore disabled" note instead of an error per run.
+HLTV then supplies schedules, teams and tiers (:func:`cs2bot.ingest.scope.derive_tier`).
 """
 
 from __future__ import annotations
@@ -96,6 +101,9 @@ from cs2bot.utils.time import ensure_utc, utcnow
 logger = logging.getLogger(__name__)
 
 DetailMode = Literal["in_scope", "all", "never"]
+
+DISABLED_NOTE = "PandaScore disabled: no API token configured (HLTV is the data source)"
+_disabled_logged = False
 
 _HLTV_KEY = "hltv"  # Match.extra / MapPlayed.extra section written by cs2bot.ingest.hltv
 _OPEN_STATUSES = (MatchStatus.SCHEDULED, MatchStatus.LIVE, MatchStatus.POSTPONED)
@@ -203,6 +211,25 @@ class _Core:
 # ============================================================================================ public
 
 
+def pandascore_enabled(client: PandaScoreClient | None) -> bool:
+    """True when ``client`` exists and has an API token (PandaScore is optional)."""
+    return client is not None and bool(getattr(client, "has_token", False))
+
+
+def _disabled_report(client: PandaScoreClient, job: str) -> SyncReport | None:
+    """An empty "disabled" report when the client has no token, else None (logged once per process)."""
+    global _disabled_logged
+    if pandascore_enabled(client):
+        return None
+    if not _disabled_logged:
+        logger.info(DISABLED_NOTE)
+        _disabled_logged = True
+    report = SyncReport(job=job)
+    report.details["disabled"] = True
+    report.add_warning(DISABLED_NOTE)
+    return report
+
+
 def sync_upcoming(
     session: Session,
     client: PandaScoreClient,
@@ -219,6 +246,8 @@ def sync_upcoming(
     ``PandaScoreSyncOptions.reconcile_missing``): that is how cancellations and far-away reschedules
     reach the database.
     """
+    if (disabled := _disabled_report(client, "pandascore.sync_upcoming")) is not None:
+        return disabled
     run = _start(client, settings, options, now, "pandascore.sync_upcoming")
     title = run.options.videogame_title
     hours = settings.scope.max_hours_ahead
@@ -273,6 +302,8 @@ def sync_past(
     cannot be listed completely ends the run (its error is in the report), so a re-run can resume
     from ``report.details['completed_until']``.
     """
+    if (disabled := _disabled_report(client, "pandascore.sync_past")) is not None:
+        return disabled
     run = _start(client, settings, options, now, "pandascore.sync_past")
     for lo, hi in _windows(since, until or run.now, run.options.past_window_days):
         matches = client.iter_past_matches(
@@ -303,6 +334,8 @@ def sync_modified(
     A cheap incremental catch-all: reschedules, cancellations and late result corrections all bump
     ``modified_at``.
     """
+    if (disabled := _disabled_report(client, "pandascore.sync_modified")) is not None:
+        return disabled
     run = _start(client, settings, options, now, "pandascore.sync_modified")
     matches = client.iter_modified_matches(
         since,
@@ -325,6 +358,8 @@ def sync_match(
     now: datetime | None = None,
 ) -> SyncReport:
     """Fetch and upsert one match, with game details and rosters whatever its scope."""
+    if (disabled := _disabled_report(client, "pandascore.sync_match")) is not None:
+        return disabled
     run = _start(client, settings, options, now, "pandascore.sync_match")
     what = f"match {pandascore_match_id}"
     try:

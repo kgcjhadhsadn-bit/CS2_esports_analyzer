@@ -17,11 +17,15 @@ Design decisions
   at or before the match day, at most ``RANK_MAX_AGE_DAYS`` old); without such a row the rank is unknown
   and only the tier decides. This keeps a backfill from pulling in 2023 matches of teams that only
   became good in 2026.
+* **Tier without PandaScore** (deep_data). PandaScore is optional; for HLTV-only matches the tier is
+  derived from HLTV's match stars and the teams' HLTV ranks at match time (:func:`derive_tier`). The
+  stars are HLTV's own importance rating (0-5), which grows with the teams' ranking and the event.
 """
 
 from __future__ import annotations
 
 from collections.abc import Iterable
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 
 from sqlalchemy import select
@@ -35,13 +39,72 @@ from cs2bot.utils.time import utcnow
 RANK_MAX_AGE_DAYS = 45
 
 __all__ = [
+    "DEFAULT_TIER_RULES",
     "RANK_MAX_AGE_DAYS",
+    "HLTVTierRules",
+    "derive_tier",
     "is_in_scope",
     "match_tier",
     "refresh_match_scope",
     "refresh_upcoming_scope",
     "team_rank_as_of",
 ]
+
+
+@dataclass(frozen=True)
+class HLTVTierRules:
+    """Thresholds of :func:`derive_tier` (first matching tier wins).
+
+    Assumption (no labelled data): HLTV gives 4-5 stars only to matches between elite teams at big
+    events, 2-3 stars to matches with a top-20/30 team, 1 star to matches with a top-50-ish team.
+    The rank rules mirror PandaScore's tiers: S = both teams top 15, A = both top 30 or one top 10,
+    B = one team top 50 (the scope threshold), C = one team top 100.
+    """
+
+    s_stars: int = 4
+    s_both_rank: int = 15
+    a_stars: int = 2
+    a_both_rank: int = 30
+    a_best_rank: int = 10
+    b_stars: int = 1
+    b_best_rank: int = 50
+    c_best_rank: int = 100
+
+
+DEFAULT_TIER_RULES = HLTVTierRules()
+
+
+def derive_tier(
+    stars: int | None,
+    team1_rank: int | None,
+    team2_rank: int | None,
+    rules: HLTVTierRules = DEFAULT_TIER_RULES,
+) -> Tier:
+    """Tier of a match from HLTV data alone; ``Tier.UNRANKED`` when nothing is known.
+
+    ``stars`` = HLTV match stars (None / negative = unknown), ranks = HLTV world ranks at match time
+    (None / <= 0 = unranked). Never raises on junk input.
+    """
+    try:
+        st = int(stars) if stars is not None else -1
+    except (TypeError, ValueError):
+        st = -1
+    ranks = [r for r in (team1_rank, team2_rank) if isinstance(r, int) and r > 0]
+    best = min(ranks) if ranks else None
+    both = max(ranks) if len(ranks) == 2 else None
+    if st >= rules.s_stars or (both is not None and both <= rules.s_both_rank):
+        return Tier.S
+    if (
+        st >= rules.a_stars
+        or (both is not None and both <= rules.a_both_rank)
+        or (best is not None and best <= rules.a_best_rank)
+    ):
+        return Tier.A
+    if st >= rules.b_stars or (best is not None and best <= rules.b_best_rank):
+        return Tier.B
+    if best is not None and best <= rules.c_best_rank:
+        return Tier.C
+    return Tier.UNRANKED
 
 
 def _scope_settings(settings: ScopeSettings | Settings) -> ScopeSettings:

@@ -1,7 +1,9 @@
 # Operating cs2bot
 
-Day-to-day operation on the owner's Windows PC. Installation is in
-[WINDOWS_SETUP.md](WINDOWS_SETUP.md); scope and design in [../PLAN.md](../PLAN.md) and
+Day-to-day operation. The bot runs either on a **Polish VPS, fully autonomous** (the main runtime
+since 2026-11-24: Docker, Xvfb, Telegram; installation in [VPS_SETUP.md](VPS_SETUP.md), autonomy in
+[Autonomous operation](#autonomous-operation-vps)) or on the owner's Windows PC (installation in
+[WINDOWS_SETUP.md](WINDOWS_SETUP.md)). Scope and design in [../PLAN.md](../PLAN.md) and
 [ARCHITECTURE.md](ARCHITECTURE.md); the dashboard API in [API.md](API.md).
 
 All commands below run in a PowerShell window in the repository folder (e.g. `C:\cs2bot`). The
@@ -30,7 +32,8 @@ a second bot; `update.ps1` and `restore-db.ps1` hold the same lock while they wo
 The built-in scheduler runs jobs in **lanes**: each lane is one thread running its jobs one at a
 time, so a slow data download never delays odds collection or betting. The lanes are `fast` (the
 money path), `sync` (PandaScore and other HTTP / database work), `hltv` (everything that uses the
-HLTV browser profile) and `train` (the nightly retrain). Intervals come from the
+HLTV browser profile), `train` (the nightly retrain), `notify` (Telegram notifications and the daily
+report) and `telegram` (the Telegram command poller). Intervals come from the
 `CS2BOT_SCHEDULER__*` settings (defaults below); every run is recorded in the `job_runs` table and
 shown on **Dashboard > Health** (the exact job names are listed there and at `GET /api/jobs`).
 
@@ -47,6 +50,10 @@ shown on **Dashboard > Health** (the exact job names are listed there and at `GE
 | Nightly retrain | daily 05:00 Warsaw | `RETRAIN_CRON="0 5 * * *"` (only `M H * * *`) | train | Refits ratings, veto, round, kill and ensemble models on data up to that moment and swaps them in. |
 | HLTV rankings | every 12 h | - | hltv | Current HLTV ranking (the top-50 scope rule) and the rank history. |
 | Executor health | every 15 min | - | fast | Login state, balance and selector checks of the Betclic browser (shown on Health). |
+| Auto-resume (`autonomy_check`) | every 5 min | `CS2BOT_AUTONOMY__CHECK_INTERVAL_MIN=5` (only with `AUTONOMY__ENABLED=true`) | fast | Checks every automatic pause reason and lifts the resolved ones; auto-login when logged out; circuit breaker. See [Autonomous operation](#autonomous-operation-vps). |
+| Telegram notifications (`telegram_notify`) | every 30 s | `CS2BOT_TELEGRAM__NOTIFY_INTERVAL_S=30` | notify | Sends new bets, settlements, pause / resume / kill-switch / login events and failing jobs. |
+| Daily report (`telegram_daily_report`) | daily 21:00 Warsaw | `CS2BOT_TELEGRAM__DAILY_REPORT_TIME=21:00` | notify | P&L today and this week, bets placed / settled, balance, pause state. |
+| Telegram commands (`telegram_commands`) | continuous (long polling) | `CS2BOT_TELEGRAM__COMMANDS_ENABLED=true` | telegram | `/status /balance /bets /pause /resume /stop /go /help` from your chat only. |
 
 The betting window is `CS2BOT_DECISION__MIN_MINUTES_BEFORE_START` (10) to
 `CS2BOT_DECISION__MAX_HOURS_BEFORE_START` (48) before the scheduled start. Live (in-play) betting is
@@ -69,15 +76,96 @@ Every component that can move money checks the controls immediately before actin
 | Control | Effect | How |
 |---|---|---|
 | **Kill switch** | Stops all betting at once, also between the steps of a placement that is in progress. Stays on until you switch it off. Data jobs keep running. | Dashboard (big red button), or `uv run cs2bot control kill-switch on` / `off` |
-| **Pause / Resume** | Halts betting until resumed. The bot pauses **itself** when a loss limit is hit, when the Betclic login expired, or when the page selectors broke - the reason is shown on the dashboard. Resume clears the pause only; it never turns off the kill switch. | Dashboard, or `uv run cs2bot control pause` / `resume` |
-| **Loss limits** | When the realised loss of the day (week) reaches `DAILY_LOSS_LIMIT_FRACTION` (`WEEKLY_...`) x the bankroll at the start of that day (week), betting pauses until you resume. Stakes are also sized so that even if every open bet loses, the day's loss stays within the limit. Days follow Warsaw time. | `CS2BOT_BANKROLL__DAILY_LOSS_LIMIT_FRACTION=0.05`, `..._WEEKLY_...=0.10`, dashboard Settings |
+| **Pause / Resume** | Halts betting until resumed. The bot pauses **itself** when a loss limit is hit, when the Betclic login expired, when the page selectors broke, after two unconfirmed placements or a balance mismatch - every reason is stored with a code and shown on the dashboard (`cs2bot control status`, Telegram `/status`). With autonomy on, these automatic pauses lift themselves once the cause is resolved (see below); a **manual** pause never does. Resume clears every reason; it never turns off the kill switch. | Dashboard, Telegram `/pause` `/resume`, or `uv run cs2bot control pause` / `resume` |
+| **Loss limits** | When the realised loss of the day (week) reaches `DAILY_LOSS_LIMIT_FRACTION` (`WEEKLY_...`) x the bankroll at the start of that day (week), betting pauses until you resume (with autonomy on: until the next Warsaw midnight / Monday 00:00). Stakes are also sized so that even if every open bet loses, the day's loss stays within the limit. Days follow Warsaw time. | `CS2BOT_BANKROLL__DAILY_LOSS_LIMIT_FRACTION=0.05`, `..._WEEKLY_...=0.10`, dashboard Settings |
 | **Caps** | Max stake per bet (2% of bankroll), max exposure per match (4%), max bets per day (10), never two selections of one market. | `CS2BOT_BANKROLL__*`, dashboard Settings |
 | **Dry run** | Everything except the final click; bets are recorded as `dry_run` and settled on paper; no ledger entries, no effect on the limits. | `CS2BOT_EXECUTOR__DRY_RUN=true` in `.env`, restart |
 | **Idempotency** | A bet is written to the database (and committed) before the click and is never placed twice for the same prediction, also after a crash. A placement whose outcome is unclear (`UNCERTAIN`) is never retried; settlement reconciles it with Betclic's bet history. A **second** unconfirmed placement while the first is still open **pauses** the bot (the confirmation step is probably broken): check "Moje zakłady" and the receipt selectors, then resume. | built in |
 | **Stale predictions** | A match is never bet on a prediction made for other teams / another format, after it left the Tier 1/2 scope, or while its prediction could not be refreshed (teams or lineups gone, an error) - the betting log notes "not bet: ...". | built in |
 
-In an emergency: kill switch on the dashboard, or `stop.cmd`. Betclic itself is always the final
-truth for money: compare with "Moje zakłady".
+In an emergency: kill switch on the dashboard, Telegram `/stop`, or `stop.cmd`. Betclic itself is
+always the final truth for money: compare with "Moje zakłady".
+
+## Autonomous operation (VPS)
+
+On the VPS nobody watches the bot. Three settings make it run on its own (all off by default, set in
+the VPS `.env`):
+
+```
+CS2BOT_AUTONOMY__ENABLED=true          # automatic pauses lift themselves (auto-resume service)
+CS2BOT_AUTONOMY__AUTO_LOGIN=true       # fill AND submit the Betclic login form when logged out
+CS2BOT_BETCLIC__CREDENTIALS_SOURCE=env # with CS2BOT_BETCLIC__USERNAME / PASSWORD
+CS2BOT_TELEGRAM__ENABLED=true          # with BOT_TOKEN (@BotFather) and CHAT_ID (@userinfobot)
+```
+
+**The bet rule** (owner decision 2026-11-24): confidence only, odds ignored - a pick is bet when the
+calibrated probability is at least `decision.min_probability` (75%), whatever the odds (even 1.28).
+`decision.min_ev = -1.0` switches the EV check off; set `0.0` for a break-even guard after the 12% tax.
+
+**Browser on the server:** the Betclic executor runs a *visible* Chromium (`CS2BOT_EXECUTOR__HEADLESS=false`)
+on the Xvfb virtual display of the container (`DISPLAY=:99`) - less bot-like than headless. Without
+any display it falls back to headless (`CS2BOT_EXECUTOR__HEADLESS_WITHOUT_DISPLAY=true`, a warning is
+logged). The odds collector and HLTV use headless browsers. A crashed Chromium is started again by the
+next job (same profile, same session). `cs2bot doctor` checks the display.
+
+### Pause reasons and when they lift
+
+Every automatic pause stores a machine-readable reason with its time. The `autonomy_check` job (every
+5 minutes) checks each one and lifts it once its cause is resolved; every auto-resume is written to the
+audit log and sent to Telegram.
+
+| Reason code | Set when | Lifts automatically when |
+|---|---|---|
+| `loss_limit_daily` | the day's realised loss reached the daily limit | the next Warsaw midnight |
+| `loss_limit_weekly` | the week's realised loss reached the weekly limit | Monday 00:00 Warsaw time |
+| `uncertain_bet` | a second placement could not be confirmed while the first was still open | settlement has found / resolved every unconfirmed bet in Betclic's bet history |
+| `login_required` | Betclic shows the bot as logged out | an auto-login succeeds, or you logged in (dashboard login button / VNC) |
+| `2fa_required` | the auto-login reached an SMS / 2FA code step | you logged in by hand once (the bot retries the login every `TWOFA_RETRY_INTERVAL_MIN`, 240 min, in case the step disappears) |
+| `balance_mismatch` | Betclic's balance differs from the ledger by more than the tolerance | the difference is booked as a reconciliation entry (Betclic's balance is read again; "auto-resume everything"); waits while unconfirmed placements could explain a shortfall |
+| `selector_error` / `executor_unavailable` | the Betclic page layout changed / the executor failed | a full executor health check passes again |
+| `manual` | you paused (dashboard, Telegram `/pause`, CLI) | **never** - only your resume |
+| `circuit_open` | the same reason lifted itself `CIRCUIT_BREAKER_LIMIT` (3) times within `CIRCUIT_BREAKER_WINDOW_H` (24 h) and came back again | **never** - check what keeps happening, then resume |
+
+The **kill switch** is not a pause reason: only you turn it off (dashboard, Telegram `/go`, CLI).
+Logins that fail are retried every `LOGIN_RETRY_INTERVAL_MIN` (15 min, doubling after each failure, at
+most once a day); a wrong password, a locked account or missing credentials stop the retries until you
+fix it and resume (or restart the bot).
+
+### What still needs you
+
+1. **An SMS / 2FA code.** The bot never reads, types or bypasses codes. Telegram says "Betclic asks for
+   an SMS / 2FA code"; log in once by hand (the dashboard's "Open Betclic login" button shows the
+   server's browser over the VNC-over-SSH tunnel described in VPS_SETUP.md). The pause lifts at the
+   next check.
+2. **Turning the kill switch off** after you (or something you asked for) turned it on: `/go`.
+
+Also yours, by design: a manual pause, an open circuit breaker, and a stopped auto-login (wrong
+password / locked account).
+
+### Telegram
+
+Messages (each can be switched off with `CS2BOT_TELEGRAM__NOTIFY_*`):
+
+| Message | Meaning / what to do |
+|---|---|
+| `Bet placed: A vs B` (`DRY RUN bet` in dry-run mode) | market, selection, odds, stake, model probability `p` and EV |
+| `Bet WON / LOST / VOID` | settlement with payout and P&L |
+| `Daily report` | P&L today / this week, bets placed and settled, balance, pause state |
+| `PAUSED by system [code]` | an automatic pause; with autonomy on it lifts itself (see the table) |
+| `Auto-resume: ...` / `RESUMED automatically` | a reason was resolved / every reason is gone - betting continues |
+| `CIRCUIT BREAKER OPEN for '...'` | a pause kept coming back: check the cause (logs, dashboard Health), then `/resume` |
+| `Betclic asks for an SMS / 2FA code` | log in by hand once (see above) |
+| `Betclic auto-login STOPPED (bad_credentials / account_locked)` | fix the password in `.env` (restart) or check the account at Betclic, then `/resume` |
+| `KILL SWITCH ON by ...` | all betting stopped until `/go` |
+| `Balance mismatch: ...` | money moved that the bot does not know (deposit, withdrawal, a bet placed by hand); booked automatically |
+| `Unconfirmed placement (UNCERTAIN)` | check "Moje zakłady"; settlement reconciles it |
+| `Job ... failed: ...` | a data job fails (at most one message per job every 6 h); see the Health page / logs |
+| `cs2bot started` / `cs2bot is stopping` | the process started / stops (deploys, reboots) |
+
+Commands (only from `CHAT_ID`; other chats are ignored and logged; commands older than 10 minutes are
+ignored): `/status`, `/balance`, `/bets`, `/pause [reason]`, `/resume` (lifts every pause, never the
+kill switch), `/stop` (kill switch ON), `/go` (kill switch OFF), `/help`. Test the setup with
+`cs2bot telegram test`.
 
 ## Daily routine (5 minutes)
 
@@ -164,7 +252,7 @@ Main knobs (PLAN.md section 6):
 | Setting | Default | Raise it to... |
 |---|---|---|
 | `decision.min_probability` | 0.75 | bet only on outcomes the model is surer about |
-| `decision.min_ev` | 0.03 | demand a larger edge after tax (fewer bets) |
+| `decision.min_ev` | -1.0 (odds ignored) | 0.0 = break-even guard after the 12% tax; higher = demand an edge (fewer bets) |
 | `decision.max_sigma` | 0.05 | (lower it) skip outcomes with uncertain estimates |
 | `decision.min_data_completeness` | 0.95 | skip matches with missing line-ups / history |
 | `decision.market_overrides` | - | stricter thresholds for one market type (e.g. player kills) |
@@ -230,7 +318,8 @@ not shrink by itself after data is deleted.
 | Start / stop | `deploy\windows\start.cmd` / `deploy\windows\stop.cmd` |
 | Betclic login | `deploy\windows\betclic-login.cmd` |
 | Status checks | `uv run cs2bot doctor`, `uv run cs2bot executor health`, `uv run cs2bot executor balance` |
-| Safety | `uv run cs2bot control kill-switch on` / `off`, `control pause`, `control resume` |
+| Safety | `uv run cs2bot control kill-switch on` / `off`, `control pause`, `control resume`, `control status` (every pause reason, auto-resume ETA, circuit breaker) |
+| Telegram | `uv run cs2bot telegram test` (sends a test message) |
 | Data by hand | `uv run cs2bot ingest upcoming`, `ingest results`, `ingest news`, `ingest rankings`, `ingest match <hltv_id>`, `ingest backfill --since 2023-09-27`, `ingest hltv-browser` |
 | Demos | `uv run cs2bot demos process --limit 20` |
 | Odds | `uv run cs2bot odds collect --once`, `uv run cs2bot odds unmapped` |

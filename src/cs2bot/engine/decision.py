@@ -17,7 +17,11 @@ thresholds can be overridden per market type through ``market_overrides[<MarketT
 * the match is no longer a plain scheduled match (live, finished, cancelled, postponed): this bot
   is pre-match only (``MatchDecisionInfo.match_status``, when known);
 * ``p_win_given_settled < min_probability`` (the confidence check ignores refunded outcomes);
-* ``EV < min_ev`` (per-unit EV after the stake tax, see :mod:`cs2bot.engine.ev`);
+* ``EV < min_ev`` (per-unit EV after the stake tax, see :mod:`cs2bot.engine.ev`). A ``min_ev`` of -1
+  or lower disables the check - the owner's rule since 2026-11-24 is "confidence only, odds ignored"
+  (``DecisionSettings.min_ev = -1.0``); set 0.0 for a break-even guard;
+* ``require_trusted_calibration`` and a market type the calibration layer does not trust (only when
+  the caller passes ``trusted_markets``; ``None`` = not known, no check);
 * ``sigma > max_sigma``, where the pricing sigma (an uncertainty of the *unconditional* ``p_win``)
   is first put on the scale of the probability the confidence check uses:
   ``sigma / (1 - p_void - p_push)``. Without this, a market that is void half of the time (map 3
@@ -35,7 +39,7 @@ thresholds can be overridden per market type through ``market_overrides[<MarketT
 from __future__ import annotations
 
 import math
-from collections.abc import Iterable
+from collections.abc import Collection, Iterable
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from decimal import ROUND_UP, Decimal
@@ -63,6 +67,13 @@ NON_BLOCKING_BET_STATUSES: frozenset[BetStatus] = frozenset({BetStatus.FAILED, B
 #: Match statuses a pre-match bet may be placed in (UNKNOWN = the source did not say).
 BETTABLE_MATCH_STATUSES: frozenset[MatchStatus] = frozenset({MatchStatus.SCHEDULED, MatchStatus.UNKNOWN})
 _PROB_EPS = 1e-9
+#: ``min_ev`` at or below this value disables the EV rule (EV per unit staked is never below -1).
+EV_CHECK_DISABLED_AT = -1.0
+
+
+def ev_check_enabled(min_ev: float) -> bool:
+    """False when ``min_ev`` switches the EV rule off (confidence-only betting, odds ignored)."""
+    return min_ev > EV_CHECK_DISABLED_AT
 
 
 class ReasonCode(StrEnum):
@@ -82,6 +93,7 @@ class ReasonCode(StrEnum):
     PRICING_MISMATCH = "pricing_mismatch"
     INVALID_NUMBERS = "invalid_numbers"
     MATCH_NOT_SCHEDULED = "match_not_scheduled"
+    UNTRUSTED_CALIBRATION = "untrusted_calibration"
 
 
 def make_reason(code: ReasonCode, detail: str) -> str:
@@ -165,8 +177,13 @@ def evaluate(
     settings: DecisionSettings,
     betclic: BetclicSettings,
     now: datetime,
+    trusted_markets: Collection[str] | None = None,
 ) -> BetDecision:
-    """Apply every rule to one priced outcome; ``accepted`` only if no rule fails."""
+    """Apply every rule to one priced outcome; ``accepted`` only if no rule fails.
+
+    ``trusted_markets``: market type values (``MarketType.value``) whose calibration the calibration
+    layer marks as trusted; enforced only with ``settings.require_trusted_calibration``.
+    """
     if now.tzinfo is None:
         raise ValueError("now must be timezone-aware (use cs2bot.utils.time.utcnow())")
     quote, outcome = priced.quote, priced.outcome
@@ -285,8 +302,19 @@ def evaluate(
                 f"p(win | settled) {p_settled:.3f} < {th.min_probability:.3f}",
             )
         )
-    if not priced.ev >= th.min_ev:
+    if ev_check_enabled(th.min_ev) and not priced.ev >= th.min_ev:
         reasons.append(make_reason(ReasonCode.LOW_EV, f"EV {priced.ev:+.4f} < {th.min_ev:.4f}"))
+    if (
+        settings.require_trusted_calibration
+        and trusted_markets is not None
+        and spec.market_type.value not in trusted_markets
+    ):
+        reasons.append(
+            make_reason(
+                ReasonCode.UNTRUSTED_CALIBRATION,
+                f"calibration of market type '{spec.market_type.value}' is not trusted yet",
+            )
+        )
     sigma_settled = settled_sigma(outcome)
     if not sigma_settled <= th.max_sigma:
         detail = f"sigma {sigma_settled:.4f} > {th.max_sigma:.4f}"
@@ -355,7 +383,8 @@ def min_acceptable_odds(
     longer pass the decision rules: the result is the highest of
 
     * ``quote odds x (1 - odds_tolerance)``,
-    * the odds at which the EV equals the market's ``min_ev`` (:func:`cs2bot.engine.ev.min_odds_for_ev`),
+    * the odds at which the EV equals the market's ``min_ev`` (:func:`cs2bot.engine.ev.min_odds_for_ev`)
+      - skipped when the EV rule is disabled (``min_ev <= -1``, odds ignored),
     * ``settings.min_odds``,
 
     rounded UP to three decimals. For an outcome that should not be bet at all (no chance to win, or
@@ -367,6 +396,8 @@ def min_acceptable_odds(
     quoted = priced.quote.odds
     floor = (quoted * (Decimal(1) - Decimal(repr(odds_tolerance)))).quantize(ODDS_STEP, rounding=ROUND_UP)
     th = thresholds_for(priced.quote.spec.market_type, settings)
+    if not ev_check_enabled(th.min_ev):
+        return max(floor, settings.min_odds.quantize(ODDS_STEP, rounding=ROUND_UP))
     edge_floor = min_odds_for_ev(priced.outcome, betclic, min_ev=th.min_ev)
     if edge_floor is None:
         return max(quoted, settings.min_odds)
@@ -380,9 +411,13 @@ def evaluate_all(
     settings: DecisionSettings,
     betclic: BetclicSettings,
     now: datetime,
+    trusted_markets: Collection[str] | None = None,
 ) -> list[BetDecision]:
     """:func:`evaluate` every priced outcome of one match."""
-    return [evaluate(p, match=match, settings=settings, betclic=betclic, now=now) for p in priced]
+    return [
+        evaluate(p, match=match, settings=settings, betclic=betclic, now=now, trusted_markets=trusted_markets)
+        for p in priced
+    ]
 
 
 # ----------------------------------------------------------------------------------------------

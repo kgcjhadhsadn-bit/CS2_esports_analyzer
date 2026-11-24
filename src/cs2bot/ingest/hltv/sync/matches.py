@@ -390,6 +390,9 @@ def _apply_match_fields(
     rank1 = page.team1_rank if page.team1_rank is not None else rank_as_of(session, team1, when, now=now)
     rank2 = page.team2_rank if page.team2_rank is not None else rank_as_of(session, team2, when, now=now)
     tier = tournament.tier if tournament is not None and tournament.tier is not Tier.UNRANKED else match.tier
+    if tier in (None, Tier.UNRANKED):
+        # PandaScore is optional (deep_data): derive the tier from HLTV stars and ranks
+        tier = _derived_tier(match, hints, rank1, rank2)
     match.in_scope = bool(match.in_scope) or in_scope(tier, rank1, rank2, settings.scope)
     match.last_synced_at = now
     our_rank1, our_rank2 = orient.ours(page.team1_rank, page.team2_rank)
@@ -417,6 +420,21 @@ def _apply_match_fields(
             **dict(hints),
         },
     )
+
+
+def _derived_tier(match: Match, hints: Mapping[str, Any], rank1: int | None, rank2: int | None) -> Tier:
+    """Tier from HLTV stars / ranks (:func:`cs2bot.ingest.scope.derive_tier`), written to ``match.tier``
+    (with ``extra.hltv.tier_source = "derived"``) when the match has no tier from PandaScore."""
+    from cs2bot.ingest.scope import derive_tier
+
+    stars = hints.get("stars")
+    if stars is None:
+        stars = ((match.extra or {}).get(EXTRA_KEY) or {}).get("stars")
+    tier = derive_tier(stars if isinstance(stars, int) else None, rank1, rank2)
+    if tier is not Tier.UNRANKED and match.tier in (None, Tier.UNRANKED):
+        match.tier = tier
+        match.extra = merge_extra(match.extra, {"tier_source": "derived"})
+    return tier
 
 
 def _sync_vetoes(session: Session, match: Match, page: MatchPage, orient: _Orientation) -> None:

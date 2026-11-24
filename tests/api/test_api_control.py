@@ -127,7 +127,8 @@ def test_config_put_overrides(client: TestClient, session_factory) -> None:
         "max_bets_per_day": 4,
         "stake_step": "0.50",
     }
-    assert body["effective"]["decision"]["min_ev"] == 0.05 and body["defaults"]["decision"]["min_ev"] == 0.03
+    assert body["effective"]["decision"]["min_ev"] == 0.05
+    assert body["defaults"]["decision"]["min_ev"] == -1.0  # odds ignored by default
     assert body["effective"]["bankroll"]["stake_step"] == "0.50" and body["updated_by"] == "dashboard"
     with session_factory() as s:
         from cs2bot.config import Settings
@@ -155,7 +156,7 @@ def test_config_put_overrides(client: TestClient, session_factory) -> None:
     [
         ({"decision": {"min_evv": 0.05}}, "min_evv"),
         ({"decision": {"min_ev": "lots"}}, "min_ev"),
-        ({"decision": {"min_ev": -0.2}}, "min_ev"),
+        ({"decision": {"min_ev": -1.5}}, "min_ev"),
         ({"decision": {"min_probability": 1.0}}, "min_probability"),
         ({"decision": {"max_odds": "1.005"}}, "max_odds"),
         ({"decision": {"min_odds": "0.9"}}, "min_odds"),
