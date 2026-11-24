@@ -1,6 +1,6 @@
 # dashboard: implementation report
 
-**Tests:** `cd dashboard && npm ci && npm run lint && npm test && npm run build` - 64 passed, 0 failed (12 Vitest files); lint 0 warnings; `tsc --noEmit` + `vite build` clean. `.venv/bin/python -m pytest tests/foundation -q` - 37 passed.
+**Tests:** `cd dashboard && npm ci && npm run lint && npm test && npm run build` - 79 passed, 0 failed (14 Vitest files; 64 before review round 1); lint 0 warnings; `tsc --noEmit` + `vite build` clean. `.venv/bin/python -m pytest tests/foundation -q` - 37 passed.
 
 ## Summary
 
@@ -72,13 +72,15 @@ These names must stay stable:
   - `api.<endpoint>(...)`, `apiRequest<T>(method, path, {query, body, signal})`
   - `ApiError {status, detail, validationErrors}`
   - `buildQuery(params)`, `onUnauthorized(listener)`
-- `src/api/hooks.ts`: `use<Endpoint>()` query hooks, mutations (`useKillSwitch`, `usePause`, `useResume`, `useSaveConfig`, `useStartBetclicLogin`, `useReviewAction`), and query keys `qk`.
+- `src/api/hooks.ts`: `use<Endpoint>()` query hooks, mutations (`useKillSwitch`, `usePause`, `useResume`, `useSaveConfig`, `useStartBetclicLogin`, `useReviewAction`), query keys `qk`, and `useMinDataCompleteness()` (effective `decision.min_data_completeness` from the shared config query; `DEFAULT_MIN_DATA_COMPLETENESS` = 0.95 until it loads).
 - `src/lib/format.ts`:
   - `formatMoney(v, {signed})` (pl-PL PLN), `formatOdds`, `formatPct`, `formatSignedPct`
   - `formatDateTime` / `formatDate` / `formatTime` (Europe/Warsaw), `formatAge(seconds)`, `formatRelative`
   - `warsawDateToUtcIso(date, endOfDay)`, `teamName`, `specKeyLabel`
 - `src/lib/markdown.tsx`: `SafeMarkdown({text})`, `safeHref(url)`. This is the only way untrusted text (the Claude rationale) is rendered; `dangerouslySetInnerHTML` is banned by lint.
-- `src/lib/analysis.ts`: `parseAnalysis(payload) -> AnalysisView | null` (defensive `MatchPrediction` parser), `roundTotalBars`, `roundMarginBars`, `pmfStats`, `probOver`.
+- `src/lib/analysis.ts`: `parseAnalysis(payload) -> AnalysisView | null` (defensive `MatchPrediction` parser), `roundTotalBars`, `roundMarginBars`, `pmfStats`, `probOver`, `fillIntegerGaps(bars)` (zero bars in integer gaps, a lone value padded; used by `Histogram`).
+- `src/components/match/OddsHistoryChart.tsx`: `groupOddsSeries(series)`, `mergeSeries(series, until?)` (step series on one time axis; `until` carries the last prices forward to that instant), `<OddsHistoryChart groups selectedKey onSelect until? />`.
+- `src/pages/ReviewPage.tsx`: `candidateAction(candidate)`, `manualRelinkBody(matchId, "auto" | "same" | "swapped")` ("auto" omits `teams_swapped` so the API detects the order).
 - `src/test/utils.tsx`: `mockApi({"GET /api/health": body | {status, body} | handler})` returns `{calls, fetchMock}`; `renderWithProviders(ui, {route})`.
 
 ## Known limitations
@@ -103,3 +105,31 @@ These names must stay stable:
 ## New dependency requests
 
 - None for Python. npm: `react-router-dom` bumped from 6.28.1 to 6.30.6 (security fix, same major version), pinned in `dashboard/package.json` / `package-lock.json`.
+
+## Review round 1
+
+Independent review against `docs/dev/briefs/dashboard.md` (incl. the Addendum: build against the reviewed API). I read every source file, re-ran `npm ci`, lint, tests and build, and repeated the end-to-end smoke run (ad-hoc script, not in the repo): a real uvicorn API on the API test seed (`tests/api/api_seed.py`) serving the rebuilt `dist`, headless Chromium (`/opt/pw-browsers/chromium`) visiting every page in light and dark mode, engaging and releasing the kill switch through the dialogs - zero console errors.
+
+**Verified (no change needed):**
+- `src/api/types.ts` against the OpenAPI schema generated from `cs2bot.api.create_app` (field names and nullability of every response schema, programmatic comparison): all match; the API has not changed since the dashboard was built. The analysis payload types and `parseAnalysis` match `cs2bot.domain.predictions.MatchPrediction` (team1-first score keys, slot distributions conditional on the map being played, pistol keys "1"/"13", half keys "1"/"2", low/high = -1/+1 sigma scenarios).
+- Client rules: `credentials: "include"`, `X-Requested-With: cs2bot` on every request, 401 -> login with a sanitised `?next=`, errors as toasts, 4xx not retried.
+- Math shown to the owner: round-total / round-margin histograms from the joint score pmf, handicap cover probabilities (team1 -4.5 covers = P(margin > 4.5), +4.5 = P(margin > -4.5)), Wilson error bars, drawdown below a running peak starting at 0, P&L bars from 0, Warsaw date bounds across both DST switches, EV/tax labels, model p = P(win | not refunded).
+- Settings editor ranges mirror `src/cs2bot/api/configedit.py`; a PUT resends every non-default field of the section (the API replaces the section's overrides).
+- Untrusted text: the rationale goes through `SafeMarkdown` only, flag rationales / errors / toasts are text nodes, links only for http(s) (`safeHref`), `dangerouslySetInnerHTML` banned by lint.
+
+**Issues found and fixed:**
+1. **(major, money safety) Kill switch dialog could send the opposite action.** The dialog derived its action from the live trading state, which polls every 15 s. If the switch changed while the "Engage the kill switch?" dialog was open (engine or another tab), the dialog silently turned into "Release kill switch" under the cursor and confirming released it. The action is now fixed when the dialog opens (`target`); confirming always sends what the dialog said. Test: `OverviewPage.test.tsx` "keeps the dialog's action when the switch changes underneath it".
+2. **(major, money safety) Manual relink always sent `teams_swapped: false`.** The review page's "Relink to match id" form had an unchecked "teams swapped" checkbox whose value was always sent, overriding the API's orientation detection from the team names. Relinking to a match that Betclic lists the other way round stored the wrong orientation, so selections would be keyed to the wrong team. The form now has a "Team order" select defaulting to "detect from names" (omits `teams_swapped`), with explicit "same" / "swapped" options; the confirmation names the choice. Tests: `ReviewPage.test.tsx` (request bodies) and `manualRelinkBody`.
+3. **(major) Log out did nothing visible.** `logout` cleared the whole query cache (`qc.clear()`), removing the `/auth/me` query from under its mounted observer, then invalidated a query that no longer existed: nothing re-rendered and the owner stayed on the page. It now sets the logged-out state on the `/auth/me` query and removes only the other cached data; a failed logout shows a toast instead of pretending. Test: `App.test.tsx` "shows the login page right after logging out".
+4. **(minor) Histograms with a single value drew no bar; sparse pmfs drew multi-unit bars.** Recharts sizes bars on a numeric axis by the smallest gap between data points. `fillIntegerGaps` adds zero bars in integer gaps and pads a lone value (seen in the smoke run: a one-score map pmf rendered an empty chart). Tests in `analysis.test.ts`.
+5. **(minor) Odds history ended at the last price change.** A selection whose price never changed (one snapshot) drew nothing, and every series stopped at the last change. `mergeSeries(series, until)` now carries the last prices forward to min(now, match start); the history also polls every 60 s like the match. Tests: `OddsHistoryChart.test.ts`.
+6. **(minor) Data-completeness badges used a hard-coded 0.95.** They now use the effective `decision.min_data_completeness` (dashboard overrides included) via `useMinDataCompleteness`, so green means "passes the engine's check". Test: `MatchDetailPage.test.tsx`.
+7. **(minor, a11y) Player kill projection rows were mouse-only** (missed by the earlier `toggleRowProps` fix). Now focusable with Enter / Space and `aria-expanded`. Test: `MatchDetailPage.test.tsx`.
+8. **(minor) Performance page defaulted to real money** even in dry-run (the default mode), showing an empty book; it now defaults to the API's mode like the overview. Test: `PerformancePage.test.tsx` (also covers `drawdownSeries` and `reliabilityPoints`, previously untested). The drawdown chart's empty state no longer says "No settled bets yet" when there is exactly one.
+9. `docs/DASHBOARD.md` updated (relink team order, polling, completeness threshold, performance default).
+
+**Remaining concerns (not fixed):**
+- The tier filter on the Matches page still filters the loaded page only (the API has no `tier` parameter; see the foundation change requests).
+- The `/api/control/config` request made for the completeness threshold toasts on failure like any query; when the API is down every page already shows errors, so this adds at most one more de-duplicated toast.
+- The Betclic login status is polled only while a window is open; the `betclic_login_required` alert disappears on the next health poll (<= 15 s) after a successful login, not immediately.
+- React Router 6 advisories and dev-only `npm audit` findings as listed under Known limitations.
