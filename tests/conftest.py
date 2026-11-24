@@ -22,6 +22,35 @@ from cs2bot.db.session import make_engine
 from cs2bot.testing.synthetic import SynthUniverse, generate_universe
 
 
+def pytest_configure(config: pytest.Config) -> None:
+    """Give every pytest-xdist worker its own PostgreSQL test database.
+
+    The PostgreSQL tests drop and create tables in the database named by CS2BOT_TEST_DATABASE_URL, so
+    parallel workers sharing it would destroy each other's tables. Each worker ``gwN`` uses (and creates
+    if needed) ``<database>_gwN`` instead. Without the permission to create databases the shared one is
+    kept (then run the postgres tests with ``-n 0``).
+    """
+    url = os.environ.get("CS2BOT_TEST_DATABASE_URL")
+    worker = os.environ.get("PYTEST_XDIST_WORKER")
+    if not url or not worker:
+        return
+    from sqlalchemy import create_engine, text
+    from sqlalchemy.engine import make_url
+
+    base = make_url(url)
+    name = f"{base.database}_{worker}"
+    try:
+        admin = create_engine(base, isolation_level="AUTOCOMMIT")
+        with admin.connect() as conn:
+            exists = conn.execute(text("SELECT 1 FROM pg_database WHERE datname = :n"), {"n": name}).scalar()
+            if not exists:
+                conn.execute(text(f'CREATE DATABASE "{name}"'))
+        admin.dispose()
+    except Exception:
+        return
+    os.environ["CS2BOT_TEST_DATABASE_URL"] = base.set(database=name).render_as_string(hide_password=False)
+
+
 @pytest.fixture(autouse=True)
 def _isolated_env(
     monkeypatch: pytest.MonkeyPatch, tmp_path_factory: pytest.TempPathFactory
