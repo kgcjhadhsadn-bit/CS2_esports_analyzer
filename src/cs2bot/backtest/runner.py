@@ -70,7 +70,7 @@ from cs2bot.engine import decision as engine_decision
 from cs2bot.engine import ev as engine_ev
 from cs2bot.models.calibration import brier, calibration_report, log_loss
 from cs2bot.models.ensemble import LookAheadError
-from cs2bot.utils.money import quantize_money
+from cs2bot.utils.money import D, quantize_money
 from cs2bot.utils.time import ensure_utc, local_day_start, local_week_start, to_local, utcnow
 
 logger = logging.getLogger(__name__)
@@ -78,6 +78,8 @@ logger = logging.getLogger(__name__)
 __all__ = ["BacktestConfig", "SimulatedBankroll", "run_backtest"]
 
 _ZERO = Decimal("0")
+#: Look-ahead errors always propagate; every other failure of an injected step is contained.
+_LEAKAGE = (LeakageError, LookAheadError)
 
 
 class BacktestConfig(BaseModel):
@@ -302,16 +304,34 @@ def run_backtest(
             if len(training.map_results) < cfg.min_training_maps:
                 report.n_matches_skipped += 1
                 continue
-            predictor = trainer(training)
-            last_train = t
-            report.n_retrains += 1
-            version = str(getattr(predictor, "model_version", type(predictor).__name__))
-            if version not in versions:
-                versions.append(version)
+            try:
+                fresh = trainer(training)
+            except _LEAKAGE:
+                raise
+            except Exception as exc:  # a failed retrain keeps the previous model (or skips the match)
+                logger.warning("training at %s failed: %s", t.isoformat(), exc)
+                report.n_training_errors += 1
+                last_train = t  # retry at the next retrain point, not before every match
+                if predictor is None:
+                    report.n_matches_skipped += 1
+                    continue
+            else:
+                predictor = fresh
+                last_train = t
+                report.n_retrains += 1
+                version = str(getattr(predictor, "model_version", type(predictor).__name__))
+                if version not in versions:
+                    versions.append(version)
         else:
             observe = getattr(predictor, "observe", None)
             if callable(observe):
-                observe(data.until(t))
+                try:
+                    observe(data.until(t))
+                except _LEAKAGE:
+                    raise
+                except Exception as exc:  # keep predicting with the model as it was
+                    logger.warning("online update at %s failed: %s", t.isoformat(), exc)
+                    report.n_training_errors += 1
         _check_trained_through(predictor, t)
 
         context = match.context
@@ -330,7 +350,7 @@ def run_backtest(
         )
         try:
             prediction = predictor.predict(query)
-        except (LeakageError, LookAheadError):
+        except _LEAKAGE:
             raise
         except Exception as exc:  # one broken match must not abort the backtest
             logger.warning("prediction failed for match %s: %s", match.match_id, exc)
@@ -356,19 +376,29 @@ def run_backtest(
         ]
         report.n_quotes += len(quotes)
         for quote in quotes:
+            key = outcome_key(quote.spec, quote.selection_key)
             try:
                 outcome = pricer(prediction, quote)
+                priced = engine_ev.price(outcome, quote, tax)
+            except _LEAKAGE:
+                raise
             except (UnpriceableMarket, ValueError, KeyError) as exc:
                 report.n_unpriceable += 1
-                logger.debug("unpriceable %s: %s", outcome_key(quote.spec, quote.selection_key), exc)
+                logger.debug("unpriceable %s: %s", key, exc)
+                continue
+            except Exception as exc:  # a broken pricer must not abort the backtest
+                report.n_unpriceable += 1
+                report.n_step_errors += 1
+                logger.warning("pricing %s of match %s failed: %s", key, match.match_id, exc)
                 continue
             report.n_priced += 1
-            priced = engine_ev.price(outcome, quote, tax)
-            resolution = (
-                resolver(quote.spec, quote.selection_key, match.actuals)
-                if match.actuals is not None
-                else SettlementOutcome.UNKNOWN
-            )
+            resolution = SettlementOutcome.UNKNOWN
+            if match.actuals is not None:
+                try:
+                    resolution = resolver(quote.spec, quote.selection_key, match.actuals)
+                except Exception as exc:  # unknown settlement = refund, never a guess
+                    report.n_step_errors += 1
+                    logger.warning("settling %s of match %s failed: %s", key, match.match_id, exc)
             p_settled = outcome.p_win_given_settled
             month = f"{to_local(t, st.timezone):%Y-%m}"
             pred_rec: PredictionRecord | None = None
@@ -388,13 +418,25 @@ def run_backtest(
                 data_completeness=cfg.data_completeness,
                 already_bet_keys=frozenset(already.get(match.match_id, set())),
             )
-            decision = decider(priced, ctx)
+            try:
+                decision = decider(priced, ctx)
+            except _LEAKAGE:
+                raise
+            except Exception as exc:
+                report.n_step_errors += 1
+                rejections["decision_error"] += 1
+                logger.warning("deciding %s of match %s failed: %s", key, match.match_id, exc)
+                continue
             if not decision.accepted:
                 for reason in decision.reasons:
                     rejections[engine_decision.reason_code(reason)] += 1
                 continue
             report.n_accepted += 1
-            closing = odds.closing_quote(match.match_id, outcome_key(quote.spec, quote.selection_key))
+            try:
+                closing = odds.closing_quote(match.match_id, key)
+            except Exception as exc:  # CLV is a report metric only
+                logger.warning("closing quote of %s for match %s failed: %s", key, match.match_id, exc)
+                closing = None
             closing_odds = closing.odds if closing is not None else None
             clv = (
                 float(quote.odds / closing_odds) - 1.0
@@ -404,7 +446,16 @@ def run_backtest(
             if clv is not None:
                 clv_flat.append(clv)
             state = bank.state(t)
-            stake = quantize_money(staker(decision, state)) if decision.accepted else _ZERO
+            staking_failed = False
+            try:
+                raw_stake = D(staker(decision, state))
+                stake = quantize_money(raw_stake) if raw_stake.is_finite() else _ZERO
+                stake = min(stake, max(bank.cash, _ZERO))  # never more than the free balance
+            except Exception as exc:
+                report.n_step_errors += 1
+                staking_failed = True
+                stake = _ZERO
+                logger.warning("staking %s of match %s failed: %s", key, match.match_id, exc)
             bet = BetRecord(
                 match_id=match.match_id,
                 decided_at=t,
@@ -432,7 +483,7 @@ def run_backtest(
                 if pred_rec is not None:
                     pred_rec.bet = True
             else:
-                rejections["staking"] += 1
+                rejections["staking_error" if staking_failed else "staking"] += 1
             accepted.append(bet)
     if progress is not None:
         progress(len(todo), len(todo))
@@ -509,3 +560,13 @@ def _fill_report(
         )
     if report.n_prediction_errors:
         report.warnings.append(f"{report.n_prediction_errors} matches could not be predicted (see the log)")
+    if report.n_training_errors:
+        report.warnings.append(
+            f"{report.n_training_errors} trainings / online updates failed; the previous model was kept "
+            "(see the log)"
+        )
+    if report.n_step_errors:
+        report.warnings.append(
+            f"{report.n_step_errors} pricing / settlement / decision / staking steps failed and were "
+            "skipped (see the log)"
+        )

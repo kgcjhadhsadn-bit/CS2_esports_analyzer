@@ -534,7 +534,27 @@ class MapWinEnsemble:
 
         ``rating_provider`` must answer for past timestamps (``WalkForwardRatings`` or a
         ``MapRatingModel`` fitted with ``record_history=True``), see :class:`RatingProvider`.
+
+        The fit is atomic: if building the feature rows raises (e.g. a rating provider refusing a
+        timestamp), the exception propagates and the ensemble keeps its previous state. A failure
+        inside the model training itself (LightGBM, the stacker, the calibrator) does not raise: the
+        ensemble falls back to the rating provider and the report names the reason.
         """
+        previous = (self._core, self._calibrator, self.report, self.model_version, self.data_end)
+        try:
+            return self._fit(map_results, store=store, rating_provider=rating_provider, as_of=as_of)
+        except BaseException:
+            self._core, self._calibrator, self.report, self.model_version, self.data_end = previous
+            raise
+
+    def _fit(
+        self,
+        map_results: Iterable[MapResultRecord],
+        *,
+        store: FeatureStore,
+        rating_provider: RatingProvider,
+        as_of: datetime | None,
+    ) -> FitReport:
         cfg = self.config
         records = list(map_results)
         if as_of is not None:
@@ -552,7 +572,16 @@ class MapWinEnsemble:
             reason = "the feature rows carry no rating features"
         if reason is not None:
             return self._finish_fallback(reason, n_rows, meta_all)
+        try:
+            return self._fit_models(x_all, y_all, meta_all, n_rows)
+        except Exception as exc:  # degrade to the rating provider rather than leave no model at all
+            logger.warning("MapWinEnsemble training failed, falling back to the ratings: %s", exc)
+            return self._finish_fallback(f"training failed ({type(exc).__name__}: {exc})", n_rows, meta_all)
 
+    def _fit_models(
+        self, x_all: pd.DataFrame, y_all: np.ndarray, meta_all: pd.DataFrame, n_rows: int
+    ) -> FitReport:
+        cfg = self.config
         # time-ordered holdout
         starts = meta_all.drop_duplicates("match_id").sort_values(["as_of", "match_id"], kind="mergesort")
         last = ensure_utc(starts["as_of"].iloc[-1].to_pydatetime())
@@ -584,8 +613,8 @@ class MapWinEnsemble:
         self._calibrator = self._fit_calibrator(out["stacked"], y_ho, n_hold_maps)
         holdout = self._holdout_metrics(out, y_ho, m_ho)
         if cfg.refit_on_all:
-            core = self._fit_core(x_all, y_all, meta_all)
-            warnings.extend(core.warnings)
+            warnings.extend(f"pre-holdout model: {w}" for w in core.warnings)
+            core = self._fit_core(x_all, y_all, meta_all)  # its own warnings are added by _finish
         self._core = core
         return self._finish(core, n_rows, meta_all, is_hold=is_hold, holdout=holdout, warnings=warnings)
 

@@ -79,6 +79,10 @@ class PipelineConfig(BaseModel):
     model_version_prefix: str = "bt"
 
 
+def _chronological(rec: MapResultRecord) -> tuple[datetime, int, int]:
+    return ensure_utc(rec.played_at), rec.match_id, rec.map_number
+
+
 def _played_sequences(
     seqs: Sequence[MapSequenceProbability], fmt: MatchFormat
 ) -> list[tuple[tuple[str, ...], float]]:
@@ -234,6 +238,9 @@ class PipelinePredictor:
         self._map_results = list(map_results)
         self.trained_through = trained_through
         self.model_version = model_version
+        # rating state at the retrain: out-of-order results are replayed from here, not from scratch
+        self._base_model = ratings.model.copy()
+        self._base_keys = {(r.match_id, r.map_number) for r in self._map_results}
 
     # ------------------------------------------------------------------ online updates
     def observe(self, training: TrainingSet) -> None:
@@ -246,16 +253,36 @@ class PipelinePredictor:
             return
         model: MapRatingModel = self.ratings.model
         last = model.last_processed
-        ordered = sorted(new, key=lambda r: (ensure_utc(r.played_at), r.match_id, r.map_number))
+        ordered = sorted(new, key=_chronological)
         if last is None or ensure_utc(ordered[0].played_at) > last:
             for rec in ordered:
                 model.update(rec)
-        else:  # out of order (overlapping matches): refit from scratch
-            self.ratings = WalkForwardRatings.fit(training.map_results, self.config.rating_config)
+        else:
+            self.ratings = self._replay(training)
         self._map_results = list(training.map_results)
         latest = training.latest_time
         if latest is not None and (self.trained_through is None or latest > self.trained_through):
             self.trained_through = latest
+
+    def _replay(self, training: TrainingSet) -> WalkForwardRatings:
+        """Ratings after results arrived out of order (overlapping matches), exactly as a refit.
+
+        The rating model must process games chronologically. Every result that became visible
+        since the retrain is replayed, in ``played_at`` order, on a copy of the state at the retrain;
+        only when one of them was played at or before the latest game of the retrain is the model
+        refitted from scratch.
+        """
+        since = sorted(
+            (r for r in training.map_results if (r.match_id, r.map_number) not in self._base_keys),
+            key=_chronological,
+        )
+        base_last = self._base_model.last_processed
+        if since and (base_last is None or ensure_utc(since[0].played_at) > base_last):
+            model = self._base_model.copy()
+            for rec in since:
+                model.update(rec)
+            return WalkForwardRatings(model)
+        return WalkForwardRatings.fit(training.map_results, self.config.rating_config)
 
     # ------------------------------------------------------------------ prediction
     def _map_pool(self, ctx: MatchContext, as_of: datetime) -> list[str]:

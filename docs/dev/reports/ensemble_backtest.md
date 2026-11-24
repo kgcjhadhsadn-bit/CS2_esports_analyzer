@@ -1,6 +1,6 @@
 # ensemble_backtest: implementation report
 
-Tests: `.venv/bin/python -m pytest tests/learning -q -n 2` - 132 passed, 2 skipped (PostgreSQL tests of the predecessor, need `CS2BOT_TEST_DATABASE_URL`), 0 failed, about 60 s; this package's 61 tests (`test_ensemble_calibration.py`, `test_ensemble_model.py`, `test_backtest_engine.py`, `test_backtest_synthetic.py`, `test_backtest_db.py`) take about 40 s with `-n 2`. `tests/foundation`: 37 passed. `ruff check`, `ruff format --check` and `mypy` are clean on `src/cs2bot/models/ensemble.py`, `src/cs2bot/models/calibration.py`, `src/cs2bot/backtest/` and `tests/learning`.
+Tests: `.venv/bin/python -m pytest tests/learning -q -n 2` - 144 passed, 2 skipped (PostgreSQL tests of the predecessor, need `CS2BOT_TEST_DATABASE_URL`), 0 failed, about 50 s; this package's 73 tests (`test_ensemble_calibration.py`, `test_ensemble_model.py`, `test_backtest_engine.py`, `test_backtest_synthetic.py`, `test_backtest_db.py`, `test_backtest_review_round1.py`) take about 40 s with `-n 2`. `tests/foundation`: 37 passed. `ruff check`, `ruff format --check` and `mypy` are clean on `src/cs2bot/models/ensemble.py`, `src/cs2bot/models/calibration.py`, `src/cs2bot/backtest/` and `tests/learning`.
 
 ## Summary
 
@@ -79,7 +79,7 @@ class FitReport(BaseModel): model_version, fitted_at, fallback, fallback_reason,
 class MapWinEnsemble:
     def __init__(self, config: EnsembleConfig | None = None, *, settings: Settings | ModelSettings | None = None)
     def fit(self, map_results: Iterable[MapResultRecord], *, store: FeatureStore, rating_provider: RatingProvider,
-            as_of: datetime | None = None) -> FitReport
+            as_of: datetime | None = None) -> FitReport      # atomic; a training failure -> fallback (see below)
     def predict(self, features_or_ctx: Mapping[str, float] | MatchContext, map_name: str, *, as_of: datetime,
                 store: FeatureStore | None = None, rating_provider: RatingProvider | None = None,
                 picked_by: TeamSlot | Literal["auto"] | None = "auto") -> MapWinEstimate
@@ -94,6 +94,7 @@ class MapWinEnsemble:
     #                          holdout_days, sigma_floor, config
 ```
 - `fit` builds the rows with `features.build_training_rows`. `rating_provider` must answer for past dates: `WalkForwardRatings`, or `MapRatingModel` fitted with `record_history=True`.
+- `fit` is atomic: when building the rows raises (e.g. a provider refusing a timestamp), the exception propagates and the ensemble keeps its previous model, report, version and `data_end`. When the training itself fails (LightGBM, stacker, calibrator), `fit` does not raise: the ensemble falls back to the rating provider (`report.fallback`, `fallback_reason = "training failed (...)"`, logged as a warning).
 - `predict`:
   - Raises `LookAheadError` when `as_of <= data_end` (the latest map trained on).
   - With a `MatchContext` it builds the row through `features_for_match_map`. Give an upcoming match an id the store does not hold: for a stored match every feature is cut at its start.
@@ -190,7 +191,8 @@ def run_backtest(data: HistoricalData, *, trainer: Trainer, odds: OddsHistory, c
 class SimulatedBankroll(initial: Decimal, tax: engine.ev.TaxModel, timezone="Europe/Warsaw")   # .state(now) -> BankrollState
 class BacktestReport(BaseModel):
     created_at, start, end, model_versions, settings_summary,
-    n_matches, n_matches_predicted, n_matches_skipped, n_retrains, n_prediction_errors, n_quotes, n_priced, n_unpriceable,
+    n_matches, n_matches_predicted, n_matches_skipped, n_retrains, n_prediction_errors, n_training_errors, n_step_errors,
+    n_quotes, n_priced, n_unpriceable,
     n_accepted, n_bets, n_won, n_lost, n_void, n_push, n_unknown, hit_rate,
     initial_bankroll, final_bankroll, total_staked, total_returned, profit, roi, bankroll_growth, max_drawdown, max_drawdown_pct,
     flat_n, flat_profit, flat_roi, n_clv, avg_clv, positive_clv_share, avg_clv_flat,
@@ -209,7 +211,16 @@ Definitions:
 - Flat metrics bet 1 unit on every decision the decider accepted, before staking caps.
 - CLV = bet odds / closing odds - 1.
 - Brier and log-loss use `p(win | settled)` against won or lost, over all priced outcomes (`*_all`) or over the bets placed (`*_bets`).
-- `rejection_reasons` counts the engine reason codes (`low_ev`, `low_probability`, `waiting_for_veto`, ...) plus `staking` (accepted, but the staker gave 0).
+- `rejection_reasons` counts the engine reason codes (`low_ev`, `low_probability`, `waiting_for_veto`, ...) plus `staking` (accepted, but the staker gave 0), `staking_error` (the staker raised) and `decision_error` (the decider raised).
+
+Failure handling of `run_backtest` (one broken record or step never aborts the run; look-ahead always does):
+- `LeakageError` / `LookAheadError` raised anywhere (trainer, `observe`, `predict`, pricer, decider) propagate.
+- Trainer raises: the previous predictor is kept until the next retrain point (`n_training_errors`); with no predictor yet the match is skipped (`n_matches_skipped`). `observe` raises: the model is kept as it was (`n_training_errors`).
+- `predict` raises: the match is skipped (`n_prediction_errors`).
+- Pricer or `engine.ev.price` raises: `UnpriceableMarket` / `ValueError` / `KeyError` count as `n_unpriceable`; any other exception also counts as `n_step_errors`.
+- Resolver raises: the outcome settles `UNKNOWN` (full refund) and `n_step_errors` is incremented.
+- Decider or staker raises: the outcome is not bet (`decision_error` / `staking_error`, `n_step_errors`).
+- The stake is capped at the free simulated balance, whatever the staker returns.
 
 ### `cs2bot.backtest` - full pipeline (`pipeline.py`)
 
@@ -229,6 +240,7 @@ def series_match_prediction(*, match_id, fmt, team1_id, team2_id, veto_distribut
 ```
 - **Trainer:** fits `WalkForwardRatings`, the `VetoModel` (with the ratings' map advantage), the `RoundModel` when simulating, the `PlayerKillModel` with `player_props`, and the ensemble on a `FeatureStore` built from the training set with `use_ensemble`. Context flags and LLM shifts are not part of the backtest.
 - **Predictor:**
+  - `observe` keeps the ratings current between retrains: results that arrive in order are applied incrementally; results that arrive out of order (overlapping matches) are replayed in `played_at` order on a copy of the rating state at the retrain, which gives exactly the ratings of a refit. Only a result played at or before the retrain's latest game forces a refit from scratch.
   - The published veto steps in the query's context condition the veto distribution.
   - The map pool comes from the context, else from `features.meta.detect_active_map_pool`, else from settings.
   - The predictor calls `build_match_prediction(seed=stable_seed(config.seed, match_id), created_at=as_of, as_of=as_of)`.
@@ -248,13 +260,14 @@ synthetic_odds_history(universe, truth, *, markets=..., margin=0.06, opening_noi
                        opening_lead=24h, closing_lead=10min, seed=0) -> InMemoryOddsHistory
 class OracleTrainer(truth, formats, *, markets=..., sigma=0.0) ; class RandomTrainer(truth, formats, *, markets=..., seed=0)
 
-def load_backtest_matches(session, *, settings, since=None, until=None, in_scope_only=True, with_context=True) -> list[BacktestMatch]
+def load_backtest_matches(session, *, settings, since=None, until=None, in_scope_only=True, with_context=True,
+                          context_since=None) -> list[BacktestMatch]    # contexts only for kick-offs >= context_since
 def load_historical_data(session, *, matches, since=None, until=None, in_scope_only=True, with_rounds=True,
                          with_player_maps=False, result_delay=timedelta(hours=1)) -> HistoricalData
 def run_db_backtest(session, *, settings, since, until, history_since=None, config=None, pipeline_config=None, trainer=None,
                     odds=None, in_scope_only=True, progress=None) -> BacktestReport
 ```
-`load_backtest_matches` keeps FINISHED matches whose `load_match_actuals(...).complete` is true. Their context comes from `load_match_context(now=kick-off, include_context_flags=False)`. `run_db_backtest` trains from `history_since`, default `settings.scope.backfill_start`.
+`load_backtest_matches` keeps FINISHED matches whose `load_match_actuals(...).complete` is true. Their context comes from `load_match_context(now=kick-off, include_context_flags=False)`. `run_db_backtest` trains from `history_since`, default `settings.scope.backfill_start`, and loads contexts only for the matches it predicts (`context_since=since`); history-only matches carry none.
 
 Wiring for the CLI (`cs2bot backtest --from --to`, P12) and the owner's sanity check:
 
@@ -294,3 +307,36 @@ report = run_synthetic_backtest(generate_universe(n_teams=12, n_matches=400, see
 ## New dependency requests
 
 None. LightGBM, scikit-learn, SciPy and pandas were already dependencies.
+
+## Review round 1
+
+Reviewer: independent review of the whole package against the brief (Addendum included), the engine / sim / ratings / datasets reports and their source. All checks re-run after the fixes (numbers in the first line of this report): `tests/learning` 144 passed / 2 skipped, `tests/foundation` 37 passed, `ruff check`, `ruff format --check` and `mypy` clean on the package paths.
+
+### What was verified
+
+- **Requirements coverage**, point by point: calibrators and every metric of item 1; the ensemble of item 2 (monotone LightGBM, chronological early stopping, expanding-window OOF stacking with non-negative weights, holdout calibration on `calibration_holdout_days`, sigma = sqrt(rating part^2 + bootstrap part^2) floored, FitReport against the ratings alone, feature importance, JSON save / load with version, features and training window, fallback); the walk-forward engine of item 3 (OddsHistory protocol, retraining on data strictly before t, injectable pricer / decider / staker / resolver with the real engine as defaults, settlement incl. push / void, bankroll, every metric, per-market and per-month breakdowns, `to_markdown`, `run_synthetic_backtest`); every test of item 4; the Addendum (engine settlement and `load_match_actuals`, the engine defaults, the full pipeline with `build_match_prediction`). Nothing was missing or stubbed.
+- **Maths re-derived:** bin assignment and ECE / MCE, Wilson interval, the Murphy decomposition, Platt targets and the ridge towards the identity, isotonic interpolation; the stacker logit, the delta-method sigma and the law-of-total-variance mixture in `predict_for_sequences`; flat P&L `(1 - 0.12) * odds - 1` and refunds through `engine.ev`; CLV, ROI, hit rate, drawdown; the exact series maths of `series_match_prediction` (slot win probabilities conditional on being played, BO2 draws).
+- **Leakage:** `TrainingSet` / `HistoricalData.until` (results visible only after the last map plus `result_delay`), `trained_through` and prediction-stamp checks, the ensemble's `LookAheadError`, the pipeline's feature store built from the training set only, the history-aware rating provider for the ensemble rows, quotes strictly before t and the closing line used for the report only.
+- **Orientation:** `DbOddsHistory` reads `selection_key`, which the odds mapper already converts to our team1 / team2 (`teams_swapped` is applied at mapping time; a changed orientation resets the mappings), so no second swap is needed.
+- **Interfaces:** every call into `engine.pricing`, `engine.ev`, `engine.decision`, `engine.bankroll`, `engine.settlement`, `features`, `models.ratings`, `models.veto`, `models.match_engine`, `datasets` matches the current signatures.
+
+### Issues found
+
+| # | Severity | Issue | Fixed |
+|---|---|---|---|
+| 1 | major | `run_backtest` aborted the whole run when an injected step raised anything but `UnpriceableMarket` / `ValueError` / `KeyError`: a resolver error (malformed actuals), a pricer `TypeError`, a decider or staker bug, a failing retrain (e.g. LightGBM on odd data) or a failing `observe` all crashed the backtest, against "one malformed record must never abort a batch". Every step is now contained (see "Failure handling" above, new counters `n_training_errors`, `n_step_errors`, reasons `decision_error` / `staking_error`, warnings in the report); look-ahead errors still always propagate. | yes |
+| 2 | minor | A custom staker could stake more than the simulated balance (negative cash). The stake is now capped at the free balance; non-finite stakes become 0. | yes |
+| 3 | minor | `MapWinEnsemble.fit` was not atomic: a provider error while building rows left a new `data_end` (and possibly a new calibrator) next to the previous core, a silently inconsistent model. The previous state is now restored before the exception propagates. A failure inside the training itself now degrades to the rating-provider fallback (the brief's "degrade gracefully") instead of leaving the nightly training without any model. | yes |
+| 4 | minor | With `refit_on_all` the final model's warnings were listed twice in `FitReport.warnings` and the pre-holdout model's warnings were lost. Now each appears once (the pre-holdout ones prefixed `pre-holdout model:`). | yes |
+| 5 | minor (performance) | `PipelinePredictor.observe` refitted the rating model from scratch whenever results arrived out of `played_at` order, which with overlapping tournament matches is most of the time: O(history) per match, about 0.2-0.5 s per match on real-sized data. It now replays only the results since the retrain on a copy of the retrain state (exactly equal to a refit, tested), refitting only when a late result predates the retrain's latest game. | yes |
+| 6 | minor (performance) | `run_db_backtest` loaded the pre-match context (several queries each) for every history match back to the CS2 release, although only the predicted matches use one. New `load_backtest_matches(context_since=...)`; `run_db_backtest` passes `since`. | yes |
+
+New tests: `tests/learning/test_backtest_review_round1.py` (12 tests: every contained failure, leakage still propagating from a trainer and from `observe`, the stake cap, the training-failure fallback, fit atomicity, de-duplicated warnings, `context_since`, exact replay of out-of-order results with and without a full refit).
+
+### Remaining concerns (not changed)
+
+- **Veto timing is optimistic by default.** `veto_known_at_decision=True` prices with the final veto at `kick-off - decision_lead` against the prices on offer at that time. In reality the veto is usually published shortly before the start, and the price after the veto already reflects it, so map-specific edges are overstated. The DB stores no veto publication time, so the backtest cannot know when it became public. Compare runs with `veto_known_at_decision=False` before trusting map-level results.
+- **Stable prices older than `max_quote_age` (48 h) are dropped** for `DbOddsHistory`: snapshots are written only on change, so a price unchanged for two days counts as not on offer. Raise `max_quote_age` for markets that rarely move.
+- **`EnginePricer` on a bare `MapWinEstimate`** reads it as a BO1 match winner and as map 1, without knowing the format or whether map 1 is that map. It is only safe for BO1 experiments; series-level backtests should use `PipelineTrainer` (a `MatchPrediction`).
+- **`HistoricalData.until`** re-validates every visible record on each call (the leakage guard): about 10 ms per match with 70 000 round records. Acceptable for thousands of matches, but it grows with the history.
+- **Calibration after `refit_on_all`** and the delta-method sigma remain as described in "Known limitations".

@@ -44,12 +44,16 @@ def load_backtest_matches(
     until: datetime | None = None,
     in_scope_only: bool = True,
     with_context: bool = True,
+    context_since: datetime | None = None,
 ) -> list[BacktestMatch]:
     """Finished matches kicking off in ``[since, until)`` whose result is complete.
 
     Matches without both teams, without a format or start time, or whose actuals are incomplete
     (settlement would answer UNKNOWN) are skipped. A failing context load only drops the context.
+    ``context_since`` limits the (slow) context loading to matches kicking off at or after it -
+    earlier matches only serve as training history and never need one.
     """
+    context_from = ensure_utc(context_since) if context_since is not None else None
     stmt = select(Match).where(
         Match.status == MatchStatus.FINISHED,
         Match.team1_id.is_not(None),
@@ -76,7 +80,7 @@ def load_backtest_matches(
             continue
         start = ensure_utc(match.scheduled_at)
         context = None
-        if with_context:
+        if with_context and (context_from is None or start >= context_from):
             try:
                 context = datasets.load_match_context(
                     session, match.id, settings=settings, now=start, include_context_flags=False
@@ -156,7 +160,12 @@ def run_db_backtest(
     cfg = (config or BacktestConfig()).model_copy(update={"start": start, "end": end})
     pc = pipeline_config or PipelineConfig()
     matches = load_backtest_matches(
-        session, settings=settings, since=hist_start, until=end, in_scope_only=in_scope_only
+        session,
+        settings=settings,
+        since=hist_start,
+        until=end,
+        in_scope_only=in_scope_only,
+        context_since=start,
     )
     data = load_historical_data(
         session,

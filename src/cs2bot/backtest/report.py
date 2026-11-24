@@ -184,6 +184,8 @@ class BacktestReport(BaseModel):
     n_matches_skipped: int = 0
     n_retrains: int = 0
     n_prediction_errors: int = 0
+    n_training_errors: int = 0  # failed retrains / online updates (the previous model was kept)
+    n_step_errors: int = 0  # failed pricer / resolver / decider / staker calls (skipped, see the log)
     n_quotes: int = 0
     n_priced: int = 0
     n_unpriceable: int = 0
