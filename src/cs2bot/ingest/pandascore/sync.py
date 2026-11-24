@@ -689,6 +689,10 @@ def _replace_teams(
     match.team1_score = match.team2_score = match.winner_team_id = None
     tracker.touch("Match.teams")
     session.flush()
+    # stored context flags describe the old pairing in the old orientation (final review)
+    from cs2bot.llm.store import deactivate_flags_after_team_change
+
+    deactivate_flags_after_team_change(session, match.id)
     session.expire(match, ["maps", "lineups"])
 
 

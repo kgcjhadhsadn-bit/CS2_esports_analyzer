@@ -22,3 +22,4 @@ Test counts are the package's own suite as reported in `docs/dev/reports/<packag
 | ops (Windows install, CI, docs) | done | 37 | round 1 | PowerShell scripts never run on Windows |
 | integration (services, jobs, `cs2bot up`, CLI, end-to-end test) | done | 58 | round 1 | whole suite 2973 passed |
 | final cross-cutting review (Lens A: money / safety path) | done | 15 | - | 6 bugs fixed (1 critical: confirmed link + Betclic team-order flip); migration 0002; see reports/final_review.md |
+| final cross-cutting review (Lens B: data / model correctness, docs) | done | 12 | - | 6 issues fixed (high: ensemble predictions depended on which team is team1; stale context flags after a participant change; backtest != live economy / model config / post-match start sides; doctor shows uncalibrated bundles); docs aligned; see reports/final_review.md |

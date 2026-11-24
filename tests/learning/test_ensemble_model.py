@@ -16,7 +16,7 @@ from cs2bot.domain.predictions import MapSequenceProbability
 from cs2bot.features import FeatureStore, build_training_rows, features_for_match_map
 from cs2bot.features.rows import match_map_features
 from cs2bot.models.calibration import log_loss
-from cs2bot.models.ensemble import EnsembleConfig, LookAheadError, MapWinEnsemble
+from cs2bot.models.ensemble import EnsembleConfig, LookAheadError, MapWinEnsemble, mirror_context
 from cs2bot.models.ratings import WalkForwardRatings
 from tests.learning.ensemble_helpers import FAST_ENSEMBLE, RARE_TEAM, ensemble_universe, fitted_ensemble
 
@@ -103,6 +103,10 @@ def test_sigma_is_larger_for_a_team_with_little_data() -> None:
     assert np.mean(rare) > 1.5 * np.mean(common)
 
 
+def logit_scalar(p: float) -> float:
+    return math.log(p / (1.0 - p))
+
+
 def test_feature_row_and_context_paths_agree() -> None:
     fx = fitted_ensemble()
     as_of = fx.report.data_end + timedelta(hours=3)
@@ -110,8 +114,17 @@ def test_feature_row_and_context_paths_agree() -> None:
     row = features_for_match_map(ctx, "nuke", store=fx.store, as_of=as_of, rating_provider=fx.ratings)
     a = fx.ensemble.predict(row, "nuke", as_of=as_of)
     b = fx.ensemble.predict(ctx, "nuke", as_of=as_of, store=fx.store, rating_provider=fx.ratings)
-    assert a.p_team1_win == pytest.approx(b.p_team1_win)
-    assert a.sigma == pytest.approx(b.sigma)
+    # final review: a context prediction is averaged with the team-swapped one (orientation-free); its
+    # forward half is exactly the raw-row prediction
+    assert a.p_team1_win == pytest.approx(b.components["p_forward"])
+    mirrored = features_for_match_map(
+        mirror_context(ctx), "nuke", store=fx.store, as_of=as_of, rating_provider=fx.ratings
+    )
+    m = fx.ensemble.predict(mirrored, "nuke", as_of=as_of)
+    assert 1.0 - m.p_team1_win == pytest.approx(b.components["p_mirrored"])
+    z = (logit_scalar(a.p_team1_win) + logit_scalar(1.0 - m.p_team1_win)) / 2.0
+    assert b.p_team1_win == pytest.approx(1.0 / (1.0 + math.exp(-z)))
+    assert b.sigma >= min(a.sigma, m.sigma) - 1e-12
     with pytest.raises(ValueError, match="rating"):
         fx.ensemble.predict({k: v for k, v in row.items() if not k.startswith("rating")}, "nuke", as_of=as_of)
     with pytest.raises(ValueError, match="store"):

@@ -2,7 +2,8 @@
 
 * :func:`load_backtest_matches` - finished, complete matches with their actual result
   (:func:`cs2bot.datasets.load_match_actuals`) and pre-match context
-  (:func:`cs2bot.datasets.load_match_context` as of kick-off, without LLM flags);
+  (:func:`cs2bot.datasets.load_match_context` as of kick-off, without LLM flags and without the
+  starting sides, which only exist for maps that were played);
 * :func:`load_historical_data` - every training record (map results, vetoes, rounds, player stat
   lines) the walk-forward engine slices by time;
 * :func:`run_db_backtest` - both, plus the stored Betclic price history (:class:`DbOddsHistory`)
@@ -85,6 +86,10 @@ def load_backtest_matches(
                 context = datasets.load_match_context(
                     session, match.id, settings=settings, now=start, include_context_flags=False
                 )
+                # Starting sides are stored from the played maps only (map rows exist once a map is
+                # played), so before a match the live bot never knows them - and here they would tell
+                # which maps were actually played (e.g. a decider). Final review: drop them.
+                context = context.model_copy(update={"start_sides": {}})
             except Exception as exc:
                 logger.warning("match %s: no pre-match context (%s)", match.id, exc)
         out.append(

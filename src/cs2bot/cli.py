@@ -666,16 +666,24 @@ def backtest(
     date_from: str = typer.Option(..., "--from", help="First kick-off day, YYYY-MM-DD"),
     date_to: str = typer.Option(..., "--to", help="Last kick-off day (exclusive), YYYY-MM-DD"),
     sims: int = typer.Option(2000, help="Map simulations per prediction"),
-    ensemble: bool = typer.Option(False, "--ensemble/--no-ensemble", help="Use the LightGBM ensemble"),
+    ensemble: bool = typer.Option(
+        True,
+        "--ensemble/--no-ensemble",
+        help="Use the LightGBM ensemble like the live bot does (it falls back to the ratings on little data)",
+    ),
     output: Path | None = typer.Option(None, help="Also write the Markdown report to this file"),
 ) -> None:
     """Walk-forward backtest over stored history and Betclic odds; stored in model_runs (kind backtest)."""
     from cs2bot.backtest import BacktestConfig, PipelineConfig, run_db_backtest
     from cs2bot.db.models import ModelRun
     from cs2bot.domain.enums import JobStatus
+    from cs2bot.services.registry import load_rating_config
     from cs2bot.utils.time import utcnow
 
     s = _settings()
+    # the live model uses the `models tune` result: so does the backtest (it was tuned on a holdout that
+    # may overlap the backtest window - a mild optimism, stated in the report notes)
+    rating_config = load_rating_config(s)
     since, until = _parse_day(date_from, "--from"), _parse_day(date_to, "--to")
     if until <= since:
         raise CLIError("--to must be after --from")
@@ -687,8 +695,15 @@ def backtest(
             since=since,
             until=until,
             config=BacktestConfig(retrain_every=timedelta(days=7)),
-            pipeline_config=PipelineConfig(simulate=True, n_sims=sims, use_ensemble=ensemble),
+            pipeline_config=PipelineConfig(
+                simulate=True, n_sims=sims, use_ensemble=ensemble, rating_config=rating_config
+            ),
         )
+        if rating_config is not None:
+            report.warnings.append(
+                "rating model: the tuned configuration of `cs2bot models tune` (tuned on a holdout that may "
+                "overlap this window)"
+            )
         session.add(
             ModelRun(
                 kind="backtest",
@@ -696,7 +711,13 @@ def backtest(
                 status=JobStatus.SUCCESS,
                 started_at=started,
                 finished_at=utcnow(),
-                params={"from": date_from, "to": date_to, "sims": sims, "ensemble": ensemble},
+                params={
+                    "from": date_from,
+                    "to": date_to,
+                    "sims": sims,
+                    "ensemble": ensemble,
+                    "rating_config": "tuned" if rating_config is not None else "default",
+                },
                 metrics=json.loads(report.model_dump_json()),
             )
         )

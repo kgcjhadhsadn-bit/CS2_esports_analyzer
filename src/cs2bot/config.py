@@ -158,6 +158,8 @@ class ModelSettings(BaseModel):
     artifacts_dir: Path = Path("data/models")
     n_map_simulations: int = 20_000
     random_seed: int | None = 20231
+    # Not read by any model (final review): the rating model's time decay and priors live in
+    # ``cs2bot.models.ratings.RatingConfig`` (defaults, or the result of ``cs2bot models tune``).
     rating_half_life_days: float = 180.0
     min_maps_for_rating: int = 8
     calibration_holdout_days: int = 90

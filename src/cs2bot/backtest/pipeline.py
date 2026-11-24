@@ -45,7 +45,12 @@ from cs2bot.domain.predictions import (
 )
 from cs2bot.domain.records import MapResultRecord
 from cs2bot.models.ensemble import EnsembleConfig, MapWinEnsemble
-from cs2bot.models.match_engine import build_match_prediction, players_from_context, scenario_probabilities
+from cs2bot.models.match_engine import (
+    build_match_prediction,
+    economy_from_settings,
+    players_from_context,
+    scenario_probabilities,
+)
 from cs2bot.models.player_props import PlayerKillModel
 from cs2bot.models.ratings import MapRatingModel, RatingConfig, WalkForwardRatings
 from cs2bot.models.round_model import RoundModel
@@ -376,6 +381,9 @@ class PipelinePredictor:
             n_sims=self.config.n_sims,
             scenario_n_sims=self.config.scenario_n_sims,
             seed=stable_seed(self.config.seed, query.match_id),
+            # final review: the live rules of the game (``engine_options``: overtime start money) - the
+            # backtest used the built-in default even when the owner configured another value
+            economy=economy_from_settings(self.settings.models),
             model_version=self.model_version,
             data_completeness=1.0,
             veto_known=veto_known,

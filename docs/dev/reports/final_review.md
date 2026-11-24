@@ -1,6 +1,6 @@
 # final_review: implementation report
 
-**Tests:** `.venv/bin/python -m pytest tests -n 2` - 2988 passed, 20 skipped (browser / PostgreSQL), 0 failed; new regression tests: `tests/odds/test_odds_final_review.py` (4), `tests/services/test_services_final_review.py` (8), `tests/services/test_services_final_review_db.py` (3) - 15 passed, 0 failed; `ruff check src tests`, `ruff format --check src tests` and `mypy` clean; `tests/foundation` 37 passed; dashboard (unchanged) `npm run lint` clean, `npm test` 79 passed, `npm run build` OK.
+**Tests:** `.venv/bin/python -m pytest tests -q -n 2` - 3000 passed, 20 skipped (browser / PostgreSQL), 0 failed (after Lens B; Lens A: 2988 passed); Lens A regression tests: `tests/odds/test_odds_final_review.py` (4), `tests/services/test_services_final_review.py` (8), `tests/services/test_services_final_review_db.py` (3); Lens B regression tests: `tests/learning/test_learning_final_review.py` (5), `tests/services/test_services_final_review_lens_b.py` (7) - 12 passed, 0 failed; `ruff check src tests`, `ruff format --check src tests` and `mypy` clean; `tests/foundation` 37 passed; dashboard (unchanged) `npm run lint` clean, `npm test` 79 passed, `npm run build` OK.
 
 ## Summary
 
@@ -91,6 +91,109 @@ everywhere; proxy credentials split out; the DB URL is never printed); Windows: 
 `O_CREAT|O_EXCL`, PID check via `OpenProcess`, SIGBREAK handled, the scripts set the working directory
 (so `.env` and relative data paths resolve to the repo).
 
+### Lens B (data and model correctness, documentation)
+
+I followed the data from the sources to the decision - PandaScore / HLTV / demos -> `datasets` ->
+`features` -> ratings / veto / round model / kill model / ensemble + calibration -> `match_engine` ->
+`engine.pricing` -> `engine.decision`, plus the Claude layer and the backtest - looking for look-ahead
+leakage, team1/team2 orientation slips, time-zone errors, CS2 rule errors, calibration and sigma that
+do not reach the decision, and differences between the backtest and the live path. Two experiments
+drove most findings: predicting the same match with the teams listed both ways through the live
+service, and predicting one match through `services.prediction` and `backtest.PipelinePredictor` with
+the same models. Every fix has a regression test that fails without it (checked by reverting each
+fix); new tests: `tests/learning/test_learning_final_review.py` (5) and
+`tests/services/test_services_final_review_lens_b.py` (7).
+
+**High - fixed**
+
+1. **Ensemble probabilities depended on which team is "team1".** Mirrored training rows do not make
+   LightGBM antisymmetric (trees split on `t1_x` and `t2_x` separately). Through the live service, an
+   even synthetic match got P(team A wins) = 0.454 when listed "A vs B" and 0.393 when listed "B vs A"
+   (map level 0.44 vs 0.39; the two answers summed to 1.076). Which team is team1 is an accident of the
+   source (PandaScore's opponent order), so this was a random +-3 point error on near-even matches -
+   the size of the EV threshold - and it created spurious edges in both directions. The rating-only
+   path and the simulator are exactly symmetric (checked).
+   *Fix* (`models/ensemble.py`): `MapWinEnsemble.predict` from a `MatchContext` also predicts
+   `mirror_context(ctx)` (teams, lineups, veto slots, start sides, flags swapped) and averages the two
+   calibrated answers in logit space; half the gap between them is added to `sigma_model` (it is model
+   uncertainty). `EnsembleConfig.symmetric` (default on; old bundles load with it on). Now
+   p(A,B) + p(B,A) = 1 to 1e-12 for every map, picker and sequence mixture. Tests: 4 in
+   `test_learning_final_review.py`; `test_ensemble_model.py::test_feature_row_and_context_paths_agree`
+   adapted (the raw-row path is the forward half).
+
+**Medium - fixed**
+
+2. **Stored Claude flags kept pushing a pairing they were not written for.** `context_flags.logit_shift`
+   is stored from the perspective of the team that was team1 when the flag was written. When a source
+   replaced a participant (PandaScore `_replace_teams`, HLTV re-pointing a match only it knows), (a) a
+   flag about the removed team still shifted the new pairing (with `team=None`), and (b) a team that
+   stayed but moved to the other slot (PandaScore lists the new pairing in its own order) got its shift
+   with the wrong sign. Bounded by `max_total_logit_shift` (0.35 logit, about +-8 points at p = 0.5),
+   but silent, and it persists while the analyzer is off or failing. *Fix*: `llm.load_active_flags`
+   ignores the shift of a flag about a team no longer in the match (its veto still blocks);
+   `llm.deactivate_flags_after_team_change` (called by both syncs on a participant change) switches
+   plain flags off and keeps vetoes with shift 0; manual flags are untouched. The LLM fingerprint
+   includes the team ids, so the next analysis writes flags for the new pairing. Tests: 3.
+3. **The backtest did not measure the model that bets.** (a) `PipelinePredictor` simulated with the
+   built-in overtime money, not `settings.models.ot_start_money` (round markets priced differently from
+   live as soon as the owner configures 12 500); (b) `cs2bot backtest` ran without the ensemble and with
+   the default rating configuration, while the live bot trains the ensemble and uses the `models tune`
+   result; (c) DB backtest contexts carried the starting sides of the played maps - the live bot never
+   knows them before a match (map rows exist only once a map is played) and they reveal which maps were
+   played (a decider). *Fixes*: economy from settings in `backtest/pipeline.py`; CLI default
+   `--ensemble` + tuned rating configuration (with a report warning that the tuning holdout may overlap
+   the window); `backtest.db.load_backtest_matches` drops `start_sides`. A parity test now checks that
+   `PipelinePredictor` and `services.prediction` give identical match, map, round-score and overtime
+   probabilities and sigma (1e-12) for the same models. Tests: 3.
+4. **Uncalibrated probabilities were invisible.** PLAN.md 5.8 / 6 bets on a *calibrated* p, but with
+   fewer than `EnsembleConfig.min_rows` labelled maps, a failed LightGBM fit (silent fallback) or a tiny
+   holdout (identity calibrator), the bot bets on the rating model's own probabilities and nothing told
+   the owner. *Fix*: `cs2bot doctor` ("models") warns with the reason, read from the newest bundle's
+   manifest. The decision rule itself is unchanged (owner's call; see limitations). Test: 1.
+
+**Low - fixed**
+
+5. `MapWinEnsemble.predict_for_sequences` skipped maps when a sequence's `pickers` list was shorter than
+   its maps (`zip(strict=False)`), so the match engine failed with "no map estimate"; it now pads with
+   unknown pickers like the rating model. Test: 1.
+6. **Docs out of step with the code:** OPERATIONS listed a non-existent "slow" lane (real lanes: fast /
+   sync / hltv / train), omitted the rankings (12 h) and executor-health (15 min) jobs, described the
+   betting job's trigger and the model-artefact retention (the newest 5 are kept automatically)
+   inaccurately, and did not mention the demo job's aggregate / role rebuild or the backtest's defaults
+   and caveats; ARCHITECTURE updated for the changes above; `config.py` notes that
+   `models.rating_half_life_days` / `min_maps_for_rating` are not read by any model.
+
+**Verified, no change needed**
+
+* *Leakage:* training is cut at `as_of` (`since <= t < until` on the map time); the rating model's
+  historical views use games strictly before `as_of`; training rows are computed as of the match start
+  with the match excluded (map 2 never sees map 1); the feature store cuts every query; the ensemble
+  refuses `as_of <= data_end`; the backtest asserts every training set and the predictor's
+  `trained_through`; scope uses the rank history for old matches; the live rating refresh applies only
+  maps played before `now`.
+* *Orientation:* PandaScore (`is_swapped`, scores / sides / round history swapped), HLTV (`_Orientation`
+  incl. side splits and halves), demos (roster decided by players, clan names, start side or score -
+  raises rather than guesses), datasets (team1 = `matches.team1_id`), veto (`first_veto=None` = 50/50),
+  rating model + simulator + series maths (p(A,B) + p(B,A) = 1 exactly), market mapping (Lens A).
+* *Time zones:* HLTV `data-unix` milliseconds -> UTC, PandaScore ISO "Z", Betclic naive times = Warsaw,
+  date-only values = UTC midnight, the DB rejects naive datetimes, Warsaw only for display and limits.
+* *CS2 rules:* MR12 (13 wins), MR3 overtime (first to 4, sides kept into overtime), $800 / $16 000,
+  loss bonus 1400 + 500 x streak up to 3400 with a one-step reduction after a win, round rewards
+  3250 / 3500, overtime money $10 000 by default (the `mp_overtime_startmoney` default; configurable);
+  a finished map needs a winner with >= 13 rounds; pricing and settlement share
+  `betclic.totals_include_overtime`.
+* *Calibration and uncertainty reach the decision:* isotonic / Platt on a time-ordered holdout, sigma
+  from the rating deviation and the bootstrap models (plus the new orientation gap), match-level sigma
+  from the +-1 sigma scenarios, the decision uses p(win | settled) and the settled-scale sigma, data
+  completeness from the prediction, context vetoes from the flags.
+* *Claude layer:* news is HTML-escaped inside `<news_item>` tags declared untrusted, evidence must cite
+  supplied items, each flag is clipped to 0.20 and the total to 0.35 logit (confidence-weighted),
+  adverse flags cannot help the affected team, a veto needs confidence >= 0.6, the model never outputs
+  a probability.
+* *Docs (script-checked):* every `CS2BOT_*` variable in the docs and `.env.example` is a real setting;
+  every `cs2bot ...` command and option in the docs exists; every endpoint in API.md exists and every
+  `/api` endpoint is documented.
+
 ## Public API
 
 New or changed callables other packages / the owner use (everything else is unchanged):
@@ -135,6 +238,50 @@ with session_factory() as s:
 Owner-facing: `deploy\windows\restore-db.cmd` now ends with the kill switch ON
 (`uv run cs2bot control kill-switch off`, or the dashboard, after checking Betclic).
 
+### Lens B: new or changed callables
+
+```python
+# cs2bot.models.ensemble
+mirror_context(ctx: MatchContext) -> MatchContext      # team1 <-> team2 (lineups, veto slots, sides, flags)
+EnsembleConfig.symmetric: bool = True                   # saved with the bundle; old bundles load with True
+MapWinEnsemble.predict(ctx: MatchContext, map_name, *, as_of, store, rating_provider, picked_by="auto")
+    # unchanged signature; orientation-free when given a context; components gain
+    # "p_forward", "p_mirrored", "orientation_gap"; a raw feature row (Mapping) is predicted as given
+MapWinEnsemble.predict_for_sequences(...)               # unchanged; short pickers lists = unknown pickers
+
+# cs2bot.llm (cs2bot.llm.store)
+deactivate_flags_after_team_change(session: Session, match_id: int) -> int   # flushes; rows changed
+load_active_flags(session, match_id, *, now) -> list[ContextFlag]           # unchanged signature; a flag
+    # about a team no longer in the match keeps its veto but gets logit_shift = 0
+
+# cs2bot.services.doctor
+check_models(settings: Settings) -> Check   # "warn" + reason when the newest bundle is not calibrated
+
+# cs2bot.backtest
+load_backtest_matches(session, *, settings, ...)  # contexts without start_sides (unchanged signature)
+PipelinePredictor.predict(query)                  # economy = economy_from_settings(settings.models)
+```
+
+CLI: `cs2bot backtest --from --to [--sims N] [--ensemble/--no-ensemble]` - the default is now
+`--ensemble` and the tuned rating configuration (`data/models/rating_config.json`) is used when present
+(`model_runs.params["rating_config"]` records which).
+
+Wiring example (callers are unchanged; the syncs call the flag helper themselves):
+
+```python
+from cs2bot.llm import deactivate_flags_after_team_change
+from cs2bot.models.ensemble import mirror_context
+
+est_ab = bundle.ensemble.predict(ctx, "mirage", as_of=now, store=store, rating_provider=bundle.ratings)
+est_ba = bundle.ensemble.predict(mirror_context(ctx), "mirage", as_of=now, store=store,
+                                 rating_provider=bundle.ratings)
+assert abs(est_ab.p_team1_win + est_ba.p_team1_win - 1.0) < 1e-9
+
+with session_factory() as s:       # after replacing a participant of match 42 by hand
+    deactivate_flags_after_team_change(s, 42)
+    s.commit()
+```
+
 ## Known limitations
 
 Remaining risks found in this review but not changed (with why):
@@ -162,6 +309,28 @@ Remaining risks found in this review but not changed (with why):
 - The PostgreSQL paths (row locks, migration 0002 on PostgreSQL) were not exercised here (no
   `CS2BOT_TEST_DATABASE_URL`); the migration was run on SQLite. Nothing ran against live Betclic.
 
+Lens B (data and model correctness), remaining:
+
+- **The decision rule does not require calibration.** With the ensemble absent or fallen back the bot
+  bets on the rating model's probabilities; `cs2bot doctor` now warns, but a "calibrated" gate in the
+  decision rule (or stricter thresholds while uncalibrated) is an owner decision. Calibration is per
+  map; series, round and player-prop probabilities are derived from calibrated map probabilities, not
+  calibrated themselves.
+- **Backtest optimism that remains:** the final veto is treated as known at decision time by default
+  (no veto publication time is stored); no Claude flags and data completeness 1.0; the tuned rating
+  configuration may have been tuned on a holdout that overlaps the backtest window (the report says
+  so); `--from` / `--to` days are UTC.
+- **Player roles** (`players.primary_role`) are the latest inference from all demos, so the kill-model
+  training rows and backtests see today's roles for old matches (mild look-ahead; roles are stable).
+- **Ensemble holdout metrics** in `FitReport` are of the one-sided predictions (the calibrator was
+  fitted on both orientations); live predictions are the symmetric average, typically a little better.
+- **Stored analyses made before this update** keep their one-sided probabilities until re-simulated (at
+  most 6 h, or the next retrain); `uv run cs2bot predict upcoming --force` re-simulates at once.
+- HLTV gives all maps of a match the page's start time; maps of a series share one timestamp (ordered
+  by map number), which is what every consumer assumes.
+- No real HLTV / PandaScore / Betclic data was available: all findings come from code reading and
+  synthetic data; PostgreSQL paths were not exercised.
+
 ### What the owner must verify on the Windows PC before going live
 
 1. `deploy\windows\start.cmd` (or `uv run cs2bot db upgrade`) applies migration 0002; `uv run cs2bot doctor`
@@ -180,6 +349,19 @@ Remaining risks found in this review but not changed (with why):
 7. Never delete `data\browser\betclic` (placement journal + session) while bets are open; after a database
    restore keep the kill switch on until open bets were compared with "Moje zakłady".
 
+8. *(Lens B)* `uv run cs2bot doctor`: the "models" line must be **ok**. A warning "NOT calibrated"
+   means the bot would bet on uncalibrated rating-model probabilities: backfill more history and
+   retrain (`uv run cs2bot models train`), or raise `decision.min_probability` / `min_ev` meanwhile.
+9. *(Lens B)* After the backfill, run `uv run cs2bot backtest --from ... --to ...` (the live model) and
+   look at calibration (ECE, reliability) and CLV per market before trusting a market type; compare with
+   a run on prices before the veto was known if map-level markets look too good.
+10. *(Lens B)* Right after installing this update: `uv run cs2bot predict upcoming --force` (or restart
+    and wait for the next 6-hourly re-simulation), so no bet uses a one-sided ensemble prediction.
+11. *(Lens B)* Check the overtime money of the events you bet on (`CS2BOT_MODELS__OT_START_MONEY`,
+    default 10 000) and whether Betclic counts overtime in round totals / handicaps
+    (`CS2BOT_BETCLIC__TOTALS_INCLUDE_OVERTIME`); review the entries marked unverified in
+    `config\patches.yaml` (map-pool calendar).
+
 ## Foundation change requests
 
 None open. Applied in this review (I could edit any file): `src/cs2bot/db/models.py` (unique ledger
@@ -191,6 +373,17 @@ cycle instead of FAILED rows); `OddsQuote.market_page_name` / `market_group` + e
 tabs; an API action that clears `extra["unconfirmed_not_found"]` after a manual check;
 `BookmakerBetRecord.placed_at` resolution (integration request).
 
+Lens B: none open. Applied (I could edit any file): a comment in `src/cs2bot/config.py` (unused model
+settings; no behaviour change); code in `models/ensemble.py`, `llm/store.py` (+ export in
+`llm/__init__.py`), `ingest/pandascore/sync.py`, `ingest/hltv/sync/matches.py`, `backtest/pipeline.py`,
+`backtest/db.py`, `services/doctor.py`, `cli.py`; docs (`docs/OPERATIONS.md`, `docs/ARCHITECTURE.md`,
+`docs/dev/STATUS.md`). Suggested for later: store the team1 id (or an orientation-free sign) with each
+`context_flags` row (migration) so a stored shift can be re-oriented instead of dropped; a role history
+for players (time-aware roles); the veto publication time (to replay veto timing in the backtest); a
+`calibrated` marker on `MatchPrediction` so `engine.decision` can require calibration if the owner wants it.
+
 ## New dependency requests
 
 None.
+
+Lens B: none.

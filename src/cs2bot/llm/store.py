@@ -181,12 +181,47 @@ def persist_flags(
     return rows
 
 
+def deactivate_flags_after_team_change(session: Session, match_id: int) -> int:
+    """Neutralise the analysis flags of a match whose participants a source just replaced.
+
+    ``logit_shift`` is stored from the perspective of the team that was ``team1`` when the flag was
+    written. After a participant is replaced, a team that stays in the match can move to the other
+    slot (PandaScore lists the new pairing in its own order), so a stored shift would push the
+    probability the wrong way; the flags also describe a pairing that no longer exists. Plain flags
+    are switched off; veto flags stay active with ``logit_shift = 0`` (a no-bet veto is
+    orientation-free and blocking is always safe - the next analysis replaces it). Flags the owner set
+    by hand (``MANUAL_FLAG_MODEL``) are kept. Returns the number of rows changed; flushes, never
+    commits. Final review (Lens B).
+    """
+    rows = [
+        row
+        for row in session.scalars(
+            select(ContextFlagRow).where(ContextFlagRow.match_id == match_id, ContextFlagRow.active.is_(True))
+        )
+        if row.model != MANUAL_FLAG_MODEL
+    ]
+    changed = 0
+    for row in rows:
+        if row.veto:
+            if row.logit_shift != 0.0:
+                row.logit_shift = 0.0
+                changed += 1
+        else:
+            row.active = False
+            changed += 1
+    if changed:
+        session.flush()
+        log.info("match %s: %d context flags neutralised after a team change", match_id, changed)
+    return changed
+
+
 def load_active_flags(session: Session, match_id: int, *, now: datetime) -> list[ContextFlag]:
     """Active, unexpired flags of a match as domain objects (oldest first).
 
     A flag is expired when ``expires_at < now`` (same rule as ``combine_flags``). ``team_id`` is
     mapped back to a ``TeamSlot`` through the match row; a team id that is no longer one of the
-    match's two teams (the match was re-linked) yields ``team=None``.
+    match's two teams (the match was re-linked) yields ``team=None`` and ``logit_shift=0`` (its veto
+    bit is kept: blocking is always safe). See also :func:`deactivate_flags_after_team_change`.
     """
     current = ensure_utc(now)
     match = session.get(Match, match_id)
@@ -202,6 +237,7 @@ def load_active_flags(session: Session, match_id: int, *, now: datetime) -> list
         if row.expires_at is not None and row.expires_at < current:
             continue
         slot: TeamSlot | None = None
+        foreign_team = False
         if row.team_id is not None:
             if row.team_id == team1_id:
                 slot = TeamSlot.TEAM1
@@ -209,8 +245,12 @@ def load_active_flags(session: Session, match_id: int, *, now: datetime) -> list
                 slot = TeamSlot.TEAM2
             else:
                 log.warning(
-                    "context flag %s refers to team %s, not a team of match %s", row.id, row.team_id, match_id
+                    "context flag %s refers to team %s, not a team of match %s: its adjustment is ignored",
+                    row.id,
+                    row.team_id,
+                    match_id,
                 )
+                foreign_team = True
         try:
             flags.append(
                 ContextFlag(
@@ -218,7 +258,9 @@ def load_active_flags(session: Session, match_id: int, *, now: datetime) -> list
                     team=slot,
                     severity=min(1.0, max(0.0, row.severity)),
                     confidence=min(1.0, max(0.0, row.confidence)),
-                    logit_shift=row.logit_shift,
+                    # final review: a flag about a team that is no longer in the match (a source replaced
+                    # a participant) must not move the new pairing's probability; a veto still blocks
+                    logit_shift=0.0 if foreign_team else row.logit_shift,
                     veto=row.veto,
                     rationale=row.rationale,
                     evidence=[str(e) for e in (row.evidence or [])],

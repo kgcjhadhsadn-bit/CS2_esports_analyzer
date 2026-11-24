@@ -9,6 +9,7 @@ No check ever raises, and no secret value is printed (only whether it is set).
 
 from __future__ import annotations
 
+import json
 import os
 import shutil
 from collections.abc import Callable
@@ -176,7 +177,33 @@ def check_models(settings: Settings) -> Check:
             "models", "warn", "no trained bundle yet: `cs2bot models train` (cs2bot up trains on start)"
         )
     trained_at, path = bundles[0]
-    return Check("models", "ok", f"latest bundle {path.name} trained {trained_at:%Y-%m-%d %H:%M} UTC")
+    head = f"latest bundle {path.name} trained {trained_at:%Y-%m-%d %H:%M} UTC"
+    calibration = _calibration_status(path)
+    if calibration is not None:
+        # final review: the decision rule assumes calibrated probabilities (PLAN.md 5.8 / 6); without the
+        # ensemble the bot bets on the rating model's own, uncalibrated probabilities
+        return Check("models", "warn", f"{head}; {calibration}")
+    return Check("models", "ok", head)
+
+
+def _calibration_status(bundle_dir: Path) -> str | None:
+    """Why the bundle's probabilities are not calibrated (None = calibrated ensemble active)."""
+    try:
+        manifest = json.loads((bundle_dir / "manifest.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return "manifest unreadable: cannot tell whether the probabilities are calibrated"
+    ensemble = (manifest.get("metrics") or {}).get("ensemble")
+    if not isinstance(ensemble, dict):
+        return (
+            "no ensemble (fewer labelled maps than EnsembleConfig.min_rows?): probabilities come from the "
+            "rating model and are NOT calibrated - backfill more history or raise the decision thresholds"
+        )
+    if ensemble.get("fallback"):
+        reason = ensemble.get("fallback_reason") or "unknown reason"
+        return f"ensemble fell back to the rating model ({reason}): probabilities are NOT calibrated"
+    if ensemble.get("calibrator") == "identity":
+        return "the calibration holdout was too small (identity calibrator): probabilities are NOT calibrated"
+    return None
 
 
 def check_dashboard(settings: Settings) -> Check:

@@ -256,6 +256,10 @@ def _persist_match_page(
         if match.pandascore_id is None:
             match.team1_id, match.team2_id = team1.id, team2.id
             orient = _orientation(match, team1, team2)
+            # stored context flags describe the old pairing in the old orientation (final review)
+            from cs2bot.llm.store import deactivate_flags_after_team_change
+
+            deactivate_flags_after_team_change(session, match.id)
         if orient is None:
             report.failed += 1
             report.add_error(f"{what}: linked match {match.id} has different teams; not touching it")

@@ -35,6 +35,7 @@ from cs2bot.llm.schemas import (
 )
 from cs2bot.llm.store import (
     MANUAL_FLAG_MODEL,
+    deactivate_flags_after_team_change,
     load_active_flags,
     news_row_to_input,
     persist_flags,
@@ -69,6 +70,7 @@ __all__ = [
     "build_rationale_digest",
     "combine_flags",
     "context_fingerprint",
+    "deactivate_flags_after_team_change",
     "flag_contribution",
     "load_active_flags",
     "load_known_teams",

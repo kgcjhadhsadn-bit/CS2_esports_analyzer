@@ -47,6 +47,17 @@ method ``dp = p (1 - p) dz``):
 Teams with little data get a large Glicko deviation, hence a large ``sd_rating_logit``, and feature
 values the bootstrap models disagree on - both inflate sigma.
 
+Orientation (final review, Lens B): mirrored training rows do not make a LightGBM model antisymmetric -
+trees split on ``t1_x`` and ``t2_x`` separately, so ``f(A vs B)`` and ``1 - f(B vs A)`` can differ by
+several points for an even match (measured: 0.44 vs 0.39 on a synthetic 50/50 map), and which team is
+"team1" is an accident of the source (PandaScore's opponent order). With ``EnsembleConfig.symmetric``
+(default) :meth:`MapWinEnsemble.predict` therefore also predicts the same map from the mirrored
+:class:`~cs2bot.domain.match.MatchContext` (teams, lineups, veto slots and start sides swapped) and
+averages the two calibrated answers in logit space: ``z = (logit(p_ab) + logit(1 - p_ba)) / 2``. The
+result is exactly orientation-free; half the gap between the two answers is added (in quadrature) to
+``sigma_model``, since it is model uncertainty. Raw feature rows (a mapping instead of a context) are
+predicted as given.
+
 Graceful degradation: with fewer than ``min_rows`` labelled maps (or without rating features) the
 ensemble does not train LightGBM; :meth:`MapWinEnsemble.predict` then returns the rating provider's
 own estimate with ``components["fallback"] = 1.0``.
@@ -118,6 +129,7 @@ __all__ = [
     "HoldoutMetrics",
     "LookAheadError",
     "MapWinEnsemble",
+    "mirror_context",
 ]
 
 
@@ -167,6 +179,8 @@ class EnsembleConfig(BaseModel):
     n_bootstrap: int = Field(default=5, ge=0)
     sigma_floor: float | None = None  # None -> settings.models.sigma_floor
     calibration_eps: float = 1e-3
+    # average every context prediction with the team-swapped one (orientation-free p, see module docstring)
+    symmetric: bool = True
 
 
 class HoldoutMetrics(BaseModel):
@@ -808,6 +822,19 @@ class MapWinEnsemble:
             row = features_for_match_map(
                 ctx, name, store=store, as_of=t, rating_provider=rating_provider, picked_by=picked_by
             )
+            if self.config.symmetric:
+                mirrored_picker: TeamSlot | Literal["auto"] | None = (
+                    picked_by.other if isinstance(picked_by, TeamSlot) else picked_by
+                )
+                mirrored_row = features_for_match_map(
+                    mirror_context(ctx),
+                    name,
+                    store=store,
+                    as_of=t,
+                    rating_provider=rating_provider,
+                    picked_by=mirrored_picker,
+                )
+                return self._symmetric_estimate(name, row, mirrored_row, picker)
         else:
             row = dict(features_or_ctx)
         if "rating_p" not in row:
@@ -832,6 +859,48 @@ class MapWinEnsemble:
                 "fallback": 0.0,
             },
         )
+
+    def _symmetric_estimate(
+        self,
+        name: str,
+        row: Mapping[str, float],
+        mirrored_row: Mapping[str, float],
+        picker: TeamSlot | None,
+    ) -> MapWinEstimate:
+        """Average of the forward prediction and the mirrored one (seen from team1), in logit space."""
+        for r in (row, mirrored_row):
+            if "rating_p" not in r:
+                raise ValueError("the feature row has no rating features (rating_p); pass a rating provider")
+        out = self.predict_frame(pd.DataFrame([dict(row), dict(mirrored_row)], dtype=float))
+        fwd, mir = out.iloc[0], out.iloc[1]
+
+        def team1_view(col: str) -> tuple[float, float]:
+            return float(fwd[col]), 1.0 - float(mir[col])
+
+        p_fwd, p_mir = team1_view("p")
+        z = 0.5 * (
+            math.log(_clip(p_fwd) / (1.0 - _clip(p_fwd))) + math.log(_clip(p_mir) / (1.0 - _clip(p_mir)))
+        )
+        p = 1.0 / (1.0 + math.exp(-z))
+        gap = p_fwd - p_mir
+        s_rating = math.sqrt(0.5 * (float(fwd["sigma_rating"]) ** 2 + float(mir["sigma_rating"]) ** 2))
+        s_model = math.sqrt(
+            0.5 * (float(fwd["sigma_model"]) ** 2 + float(mir["sigma_model"]) ** 2) + (0.5 * gap) ** 2
+        )
+        sigma = max(math.sqrt(s_rating**2 + s_model**2), self.sigma_floor)
+        comps = {col: 0.5 * sum(team1_view(col)) for col in ("rating", "lgbm", "stacked")}
+        comps.update(
+            {
+                "calibrated": p,
+                "sigma_rating": s_rating,
+                "sigma_model": s_model,
+                "fallback": 0.0,
+                "p_forward": p_fwd,
+                "p_mirrored": p_mir,
+                "orientation_gap": gap,
+            }
+        )
+        return MapWinEstimate(map_name=name, p_team1_win=p, sigma=sigma, picked_by=picker, components=comps)
 
     def _fallback_estimate(
         self, name: str, p: float, sigma: float, picker: TeamSlot | None
@@ -864,7 +933,10 @@ class MapWinEnsemble:
         """
         weights: dict[str, dict[TeamSlot | None, float]] = {}
         for seq in sequences:
-            for m, picker in zip(seq.maps, seq.pickers, strict=False):
+            # a pickers list shorter than the maps means unknown pickers, never a dropped map (the same
+            # rule as MapRatingModel.predict_for_sequences)
+            pickers = list(seq.pickers[: len(seq.maps)]) + [None] * max(0, len(seq.maps) - len(seq.pickers))
+            for m, picker in zip(seq.maps, pickers, strict=True):
                 name = normalize_map_name(m)
                 slot = weights.setdefault(name, {})
                 slot[picker] = slot.get(picker, 0.0) + float(seq.probability)
@@ -976,6 +1048,46 @@ class MapWinEnsemble:
     @classmethod
     def load(cls, path: str | Path) -> MapWinEnsemble:
         return cls.from_dict(json.loads(Path(path).read_text(encoding="utf-8")))
+
+
+def _clip(p: float) -> float:
+    return min(max(p, _P_CLIP), 1.0 - _P_CLIP)
+
+
+def mirror_context(ctx: MatchContext) -> MatchContext:
+    """The same match seen with team1 and team2 swapped (teams, lineups, veto slots, start sides, flags).
+
+    Used for orientation-free predictions; ``match_id`` is kept (the feature store excludes the match
+    itself by id). Context flags are mirrored too (team slot swapped, shift negated) although the
+    feature rows do not read them.
+    """
+    return ctx.model_copy(
+        update={
+            "team1_id": ctx.team2_id,
+            "team2_id": ctx.team1_id,
+            "team1_name": ctx.team2_name,
+            "team2_name": ctx.team1_name,
+            "team1_lineup": list(ctx.team2_lineup),
+            "team2_lineup": list(ctx.team1_lineup),
+            "known_veto": [
+                step.model_copy(update={"team": step.team.other if step.team is not None else None})
+                for step in ctx.known_veto
+            ],
+            "first_veto_team": ctx.first_veto_team.other if ctx.first_veto_team is not None else None,
+            "start_sides": {
+                m: (side.other if side is not None else None) for m, side in ctx.start_sides.items()
+            },
+            "context_flags": [
+                flag.model_copy(
+                    update={
+                        "team": flag.team.other if flag.team is not None else None,
+                        "logit_shift": -flag.logit_shift,
+                    }
+                )
+                for flag in ctx.context_flags
+            ],
+        }
+    )
 
 
 def _picker_from_ctx(ctx: MatchContext, map_name: str) -> TeamSlot | None:

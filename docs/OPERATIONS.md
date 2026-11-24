@@ -28,7 +28,9 @@ a second bot; `update.ps1` and `restore-db.ps1` hold the same lock while they wo
 ## What runs when
 
 The built-in scheduler runs jobs in **lanes**: each lane is one thread running its jobs one at a
-time, so a slow data download never delays odds collection or betting. Intervals come from the
+time, so a slow data download never delays odds collection or betting. The lanes are `fast` (the
+money path), `sync` (PandaScore and other HTTP / database work), `hltv` (everything that uses the
+HLTV browser profile) and `train` (the nightly retrain). Intervals come from the
 `CS2BOT_SCHEDULER__*` settings (defaults below); every run is recorded in the `job_runs` table and
 shown on **Dashboard > Health** (the exact job names are listed there and at `GET /api/jobs`).
 
@@ -36,13 +38,15 @@ shown on **Dashboard > Health** (the exact job names are listed there and at `GE
 |---|---|---|---|---|
 | Betclic odds collection | every 3 min | `ODDS_POLL_S=180` | fast | Loads Betclic's CS2 pages, stores prices (only when they change), links events to matches, maps market names. |
 | Predictions | every 15 min | `PREDICT_MIN=15` | fast | For in-scope matches inside the betting window: veto distribution, per-map estimates, simulations, Claude context, priced outcomes. Re-predicts when the veto, line-up, news flags or model version changed. |
-| Betting | after predictions / odds | - | fast | Price -> EV after tax -> decision rules -> stake (1/4 Kelly + caps) -> place (or dry run). Checks the kill switch / pause before every placement and the loss limits every cycle. |
+| Betting | every 3 min, right after the odds pass | `ODDS_POLL_S=180` | fast | Price -> EV after tax -> decision rules -> stake (1/4 Kelly + caps) -> place (or dry run). Checks the kill switch / pause before every placement and the loss limits every cycle. |
 | Settlement | every 30 min | `SETTLE_MIN=30` | fast | Settles finished bets (Betclic's bet history is the source of truth for money), closing odds and CLV, ledger, balance reconciliation. |
-| Upcoming matches | every 30 min | `UPCOMING_SYNC_MIN=30` | slow | PandaScore + HLTV schedules, line-ups, vetoes once published. |
-| Results | every 60 min | `RESULTS_SYNC_MIN=60` | slow | Finished matches, map scores, player stats, demo links. |
-| News | every 30 min | `NEWS_POLL_MIN=30` | slow | HLTV news; Claude Haiku triages them, Claude Opus turns relevant ones into bounded context flags. |
-| Demo processing | every 60 min | `DEMO_PROCESS_MIN=60` | slow | Downloads + parses pending demos (rounds, kills, economy, positions), then deletes the raw files. |
-| Nightly retrain | daily 05:00 Warsaw | `RETRAIN_CRON="0 5 * * *"` | slow | Refits ratings, veto, round, kill and ensemble models on data up to that moment and swaps them in. |
+| Upcoming matches | every 30 min | `UPCOMING_SYNC_MIN=30` | sync (PandaScore, scope refresh), hltv (HLTV) | PandaScore + HLTV schedules, line-ups, vetoes once published. |
+| Results | every 60 min | `RESULTS_SYNC_MIN=60` | sync (PandaScore), hltv (HLTV) | Finished matches, map scores, player stats, demo links. |
+| News | every 30 min | `NEWS_POLL_MIN=30` | hltv (HLTV news), sync (Claude triage) | HLTV news; Claude Haiku triages them, Claude Opus turns relevant ones into bounded context flags. |
+| Demo processing | every 60 min | `DEMO_PROCESS_MIN=60` | hltv | Downloads + parses pending demos (rounds, kills, economy, positions), then deletes the raw files and rebuilds the position / duel aggregates and player roles when anything new was parsed. |
+| Nightly retrain | daily 05:00 Warsaw | `RETRAIN_CRON="0 5 * * *"` (only `M H * * *`) | train | Refits ratings, veto, round, kill and ensemble models on data up to that moment and swaps them in. |
+| HLTV rankings | every 12 h | - | hltv | Current HLTV ranking (the top-50 scope rule) and the rank history. |
+| Executor health | every 15 min | - | fast | Login state, balance and selector checks of the Betclic browser (shown on Health). |
 
 The betting window is `CS2BOT_DECISION__MIN_MINUTES_BEFORE_START` (10) to
 `CS2BOT_DECISION__MAX_HOURS_BEFORE_START` (48) before the scheduled start. Live (in-play) betting is
@@ -212,7 +216,7 @@ DevTools guide).
 | HLTV page cache (`data\cache\hltv`) | 6 h for live pages, 30 days for finished matches |
 | Raw Betclic payloads (`data\raw\betclic`) | for parser fitting; 14 days by default |
 | Screenshots (`data\screenshots`) | until deleted by hand; keep those of open or disputed bets |
-| Model artefacts (`data\models`) | one folder per retrain; old versions can be deleted |
+| Model artefacts (`data\models`) | one folder per retrain; the newest 5 are kept, older ones are deleted after each retrain |
 | Logs (`logs\`) | 30 days |
 | Backups (`backups\`) | 14 days, newest 3 always |
 
@@ -232,7 +236,7 @@ not shrink by itself after data is deleted.
 | Odds | `uv run cs2bot odds collect --once`, `uv run cs2bot odds unmapped` |
 | Models | `uv run cs2bot models train`, `models tune` |
 | Predict / bet / settle by hand | `uv run cs2bot predict upcoming`, `predict match <id>`, `bet run --dry-run`, `settle` |
-| Backtest | `uv run cs2bot backtest --from 2025-01-01 --to 2025-06-30` |
+| Backtest | `uv run cs2bot backtest --from 2025-01-01 --to 2025-06-30` (the live model: ensemble + tuned ratings; `--no-ensemble` for a quick ratings-only run). Days are UTC; the final veto is treated as known at decision time, which flatters map-level markets. |
 | Backup / restore / update | `backup-db.cmd`, `restore-db.cmd`, `update.cmd` |
 | Autostart / power | `register-autostart.cmd`, `unregister-autostart.cmd`, `power-settings.cmd` |
 
