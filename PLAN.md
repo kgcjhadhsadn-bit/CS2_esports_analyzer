@@ -18,12 +18,22 @@
 | Bet rule | **Confidence + edge filter**: high calibrated probability AND positive EV after tax |
 | Staking | **¼ Kelly + hard caps**, loss limits, kill switch |
 | Execution | **Fully automatic** bet placement on the **owner's own Betclic.pl account** |
-| Runtime | **Owner's PC in Poland, everything local**: no server, no VPS |
-| Interface | **Web dashboard** |
+| Runtime | **Cloud: a Polish VPS, fully autonomous, no human interaction** (decided 2026-11-24; replaces "owner's PC"). The Windows-PC install stays as an alternative |
+| Interface | **Telegram bot** (every bet, daily P&L, alerts, /status /pause /resume /stop) + **web dashboard** over HTTPS with a password |
+| Betclic login | **Saved password, auto-filled and submitted by the bot**. No SMS/2FA automation: if Betclic asks for a code the bot stays paused and alerts via Telegram |
+| Pauses | **Auto-resume everything** (loss limits lift at the next Warsaw day/week, UNCERTAIN bets after reconciliation, login after a successful auto-login, balance mismatches booked as an adjustment). The kill switch is the one exception: only the owner turns it off |
 | Budget | **High** (500+ PLN / month) |
 | Go-live gate | **None**: go live as soon as the system is built (backtest still runs, because calibration needs it) |
 
 ---
+
+## 0b. Cloud runtime (2026-11-24)
+
+- **Where:** one Linux VPS in Poland (e.g. OVH / a Polish provider, Warsaw). Docker Compose runs PostgreSQL, the bot (`cs2bot up`, built-in scheduler), Chromium on a virtual display (Xvfb) for Betclic and HLTV, and Caddy as an HTTPS reverse proxy for the dashboard. Everything restarts on failure and on reboot; nightly database backups.
+- **IP risk:** Betclic.pl only answers Polish IPs and may block datacenter IPs even in Poland. `CS2BOT_BETCLIC__PROXY_URL` routes Betclic traffic through a Polish residential proxy if that happens.
+- **No human in the loop:** the scheduler collects data, retrains, predicts, bets and settles on its own. Every automatic pause lifts itself once its cause is resolved, with a circuit breaker: if the same pause reason repeats too often in a short window the bot stays paused and alerts (protects against loops such as an endlessly failing login).
+- **What still needs a human, by design:** an SMS/2FA code if Betclic asks for one (the bot alerts and waits), and turning the kill switch off after the owner turned it on.
+- **Secrets** live only in the VPS `.env` (chmod 600); never in the repository or in logs.
 
 ## 1. Goal & honest constraints
 
@@ -198,7 +208,7 @@ At `p = 0.75` this needs odds of about **1.52** or higher, so expect **few bets*
 
 ---
 
-## 7. Betclic executor (owner's PC)
+## 7. Betclic executor (VPS; owner's PC as alternative)
 
 - **Playwright** with a **dedicated, persistent Chromium profile** on the owner's PC, separate from the owner's everyday browser.
 - **First login is done by the owner, by hand**, in that browser window (including SMS / 2FA). The session is then reused; when it expires, the bot pauses and the dashboard asks the owner to log in again.
