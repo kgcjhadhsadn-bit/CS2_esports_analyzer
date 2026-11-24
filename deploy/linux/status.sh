@@ -53,7 +53,10 @@ else
 fi
 echo "dashboard:     https://$(env_get CS2BOT_PUBLIC_HOST) (TLS: $(env_get CS2BOT_TLS_MODE))"
 proxy="$(env_get CS2BOT_BETCLIC__PROXY_URL)"
-echo "betclic proxy: $([[ -n "$proxy" ]] && echo configured || echo none)"
+echo "betclic proxy: $([[ -n "$proxy" ]] && echo configured || echo 'none (direct)')"
+hltv_proxy="$(env_get CS2BOT_HLTV__PROXY_URL)"
+hltv_mode="$(env_get CS2BOT_HLTV__PROXY_MODE)"
+echo "hltv proxy:    $([[ -n "$hltv_proxy" ]] && echo "configured (${hltv_mode:-after_block})" || echo 'none (direct)')"
 
 printf '\n%s== Disk ==%s\n' "$C_BOLD" "$C_RESET"
 df -h "$REPO_ROOT" | tail -n 1 | awk '{print "disk:          " $4 " free of " $2 " (" $5 " used)"}'

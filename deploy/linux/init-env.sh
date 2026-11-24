@@ -30,6 +30,23 @@ while (($#)); do
 done
 require_cmd openssl awk
 
+# The container user gets APP_UID / APP_GID. Run as root without --uid (by hand, not via provision.sh),
+# id -u would be 0: the image cannot create a second uid 0 and the bot must never run as root, so use
+# the owner of the checkout instead, or the image default 10001.
+if [[ ! "$NEW_UID" =~ ^[0-9]+$ || ! "$NEW_GID" =~ ^[0-9]+$ ]]; then
+    die "--uid / --gid must be numbers"
+fi
+if ((NEW_UID == 0)); then
+    NEW_UID="$(stat -c '%u' "$REPO_ROOT" 2>/dev/null || echo 0)"
+    NEW_GID="$(stat -c '%g' "$REPO_ROOT" 2>/dev/null || echo 0)"
+    if ((NEW_UID == 0)); then
+        NEW_UID=10001
+        NEW_GID=10001
+    fi
+    warn "running as root: APP_UID/APP_GID set to $NEW_UID:$NEW_GID (the bot never runs as root)"
+fi
+((NEW_GID != 0)) || NEW_GID="$NEW_UID"
+
 DOMAIN="${DOMAIN#https://}"
 DOMAIN="${DOMAIN#http://}"
 DOMAIN="${DOMAIN%%/*}"
@@ -79,6 +96,11 @@ set_if_empty() {
 set_default COMPOSE_FILE docker-compose.cloud.yml
 set_default APP_UID "$NEW_UID"
 set_default APP_GID "$NEW_GID"
+if [[ "$(env_get APP_UID)" == "0" || "$(env_get APP_GID)" == "0" ]]; then
+    warn "APP_UID/APP_GID 0 (root) in .env replaced by $NEW_UID:$NEW_GID"
+    env_set APP_UID "$NEW_UID"
+    env_set APP_GID "$NEW_GID"
+fi
 set_default CS2BOT_ENVIRONMENT prod
 set_default CS2BOT_LOG_JSON true
 set_default POSTGRES_USER cs2bot

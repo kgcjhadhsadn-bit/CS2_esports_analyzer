@@ -134,11 +134,32 @@ service_running() {
     [[ -n "$id" ]] && [[ "$(docker inspect -f '{{.State.Running}}' "$id" 2>/dev/null)" == "true" ]]
 }
 
+# How often Docker restarted SERVICE's current container (0 when unknown).
+service_restarts() {
+    local id count
+    id="$(service_container "$1")"
+    [[ -n "$id" ]] || {
+        printf '0'
+        return 0
+    }
+    count="$(docker inspect -f '{{.RestartCount}}' "$id" 2>/dev/null || true)"
+    [[ "$count" =~ ^[0-9]+$ ]] || count=0
+    printf '%s' "$count"
+}
+
 # Waits until SERVICE is healthy (or running, when it has no healthcheck); TIMEOUT in seconds.
+# A container that keeps crashing (restart policy) shows "starting" after every restart, so more than
+# one restart while waiting is reported as a failure instead of waiting for the whole TIMEOUT.
 wait_healthy() {
-    local service="$1" timeout="${2:-600}" waited=0 status
+    local service="$1" timeout="${2:-600}" waited=0 status restarts_before restarts
+    restarts_before="$(service_restarts "$service")"
     while ((waited < timeout)); do
         status="$(service_health "$service")"
+        restarts="$(service_restarts "$service")"
+        if ((restarts > restarts_before + 1)); then
+            err "$service keeps restarting ($((restarts - restarts_before)) restarts while waiting)"
+            return 1
+        fi
         case "$status" in
             healthy | running) return 0 ;;
             unhealthy)

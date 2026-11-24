@@ -2,13 +2,16 @@
 # Restore the cs2bot database from a backup made by backup.sh. REPLACES the current database.
 #
 #   deploy/linux/restore.sh --list                 show the available backups
-#   deploy/linux/restore.sh [FILE] [--yes] [--no-safety-backup]
+#   deploy/linux/restore.sh [FILE] [--yes] [--no-safety-backup] [--no-pause]
 #
 # Without FILE the newest backups/cs2bot-*.dump is used. Steps: confirmation (type RESTORE, or --yes),
 # a safety backup of the current database (label "before-restore"), stop the bot, drop + re-create the
-# database, pg_restore, start the bot again (its entrypoint applies newer migrations). The bot keeps
-# its Betclic session; check the dashboard's bankroll page afterwards - bets placed after the backup
-# are missing from the restored ledger until settlement / reconciliation finds them in Betclic's history.
+# database, pg_restore, migrate, PAUSE betting, start the bot again. The bot keeps its Betclic session.
+# Why the pause: bets placed after the backup are missing from the restored ledger (so the exposure,
+# the daily / weekly loss limits and the bets-per-day count would be computed too low) and the kill
+# switch / pause state is the one of the backup. Check the dashboard's bankroll and bets pages, then
+# resume (dashboard, Telegram /resume or `docker compose exec app cs2bot control resume`). The pause
+# is a manual one: it never lifts by itself. --no-pause skips it (only for a database without bets).
 set -euo pipefail
 # shellcheck source=deploy/linux/common.sh
 . "$(dirname "${BASH_SOURCE[0]}")/common.sh"
@@ -16,12 +19,14 @@ set -euo pipefail
 FILE=""
 LIST=0
 SAFETY=1
+PAUSE=1
 while (($#)); do
     case "$1" in
         --list) LIST=1; shift ;;
         -y | --yes) ASSUME_YES=1; shift ;;
         --no-safety-backup) SAFETY=0; shift ;;
-        -h | --help) sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        --no-pause) PAUSE=0; shift ;;
+        -h | --help) sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
         -*) die "unknown option: $1 (see --help)" ;;
         *) FILE="$1"; shift ;;
     esac
@@ -101,8 +106,15 @@ compose cp "$FILE" "postgres:$container_file" || {
 }
 
 info "re-creating database '$PG_DB'"
-compose exec -T postgres dropdb -U "$PG_USER" --maintenance-db=postgres --if-exists --force "$PG_DB"
-compose exec -T postgres createdb -U "$PG_USER" --maintenance-db=postgres -O "$PG_USER" "$PG_DB"
+if ! compose exec -T postgres dropdb -U "$PG_USER" --maintenance-db=postgres --if-exists --force "$PG_DB"; then
+    compose exec -T postgres rm -f "$container_file" || true
+    restart_app
+    die "could not drop the database '$PG_DB' (it is unchanged)"
+fi
+if ! compose exec -T postgres createdb -U "$PG_USER" --maintenance-db=postgres -O "$PG_USER" "$PG_DB"; then
+    compose exec -T postgres rm -f "$container_file" || true
+    die "could not create the database '$PG_DB': it is MISSING now and the bot stays stopped. Run this script again."
+fi
 
 info "restoring (this can take a while)"
 status=0
@@ -117,6 +129,21 @@ if ((status != 0)); then
     exit 1
 fi
 ok "database restored from $(basename "$FILE")"
+
+if ((PAUSE)); then
+    info "migrating the restored database and pausing betting (check the ledger, then resume)"
+    note="database restored from $(basename "$FILE") on $(date '+%Y-%m-%d %H:%M'): bets placed after that backup are missing from the ledger - check bankroll and bets, then resume"
+    # One-off container of the new image (no ports, no Xvfb): migrate first, the backup may be older.
+    # The reason travels as an environment variable, never through shell quoting.
+    if ! compose run --rm --no-deps -T -e "CS2BOT_RESTORE_NOTE=$note" app \
+        bash -c 'cs2bot db upgrade && cs2bot control pause --reason "$CS2BOT_RESTORE_NOTE"'; then
+        err "could not pause betting after the restore, so the bot stays STOPPED (it would bet with an"
+        err "incomplete ledger). Pause it by hand and start it:"
+        err "  docker compose run --rm --no-deps app cs2bot control pause && docker compose start app"
+        exit 1
+    fi
+    ok "betting is paused (manual pause: resume it from the dashboard, Telegram /resume or cs2bot control resume)"
+fi
 restart_app
 if ((app_was_running)); then
     if wait_healthy app 900; then

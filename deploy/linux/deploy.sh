@@ -65,6 +65,10 @@ app_uid="$(env_get APP_UID)"
 app_uid="${app_uid:-10001}"
 app_gid="$(env_get APP_GID)"
 app_gid="${app_gid:-10001}"
+[[ "$app_uid" =~ ^[0-9]+$ && "$app_gid" =~ ^[0-9]+$ ]] || die "APP_UID / APP_GID in .env must be numbers"
+if [[ "$app_uid" == "0" || "$app_gid" == "0" ]]; then
+    die "APP_UID/APP_GID is 0 (root) in .env: the bot must not run as root - run deploy/linux/init-env.sh as the cs2bot user, or set both to $(stat -c '%u' "$REPO_ROOT"):$(stat -c '%g' "$REPO_ROOT")"
+fi
 for dir in "$DATA_DIR" "$LOG_DIR"; do
     if [[ ! -d "$dir" ]]; then
         mkdir -p "$dir"

@@ -28,6 +28,7 @@ DB_UPGRADE_ATTEMPTS="${DB_UPGRADE_ATTEMPTS:-10}"
 XVFB_PID=""
 APP_PID=""
 TEE_PID=""
+STOP_REQUESTED=0
 
 log() { printf '%s entrypoint: %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$*" >&2; }
 
@@ -158,6 +159,7 @@ stop_tee() {
 # so the bot would never see it. `cs2bot up` shuts down cleanly on SIGTERM.
 forward_signal() {
     local sig="$1"
+    STOP_REQUESTED=1
     if [[ -n "$APP_PID" ]] && kill -0 "$APP_PID" 2>/dev/null; then
         log "SIG$sig received: stopping cs2bot (pid $APP_PID) with SIGTERM"
         kill -TERM "$APP_PID" 2>/dev/null || true
@@ -202,6 +204,11 @@ run_up() {
         log "starting cs2bot up"
         cs2bot up &
         APP_PID=$!
+    fi
+    # A signal that arrived after the traps were set but before APP_PID was known was not forwarded.
+    if ((STOP_REQUESTED)); then
+        log "stop requested during start-up: stopping cs2bot (pid $APP_PID) with SIGTERM"
+        kill -TERM "$APP_PID" 2>/dev/null || true
     fi
 
     local status="" done_pid

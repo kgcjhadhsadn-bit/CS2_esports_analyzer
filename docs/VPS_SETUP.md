@@ -182,7 +182,8 @@ nano /opt/cs2bot/.env
 | `CS2BOT_PANDASCORE__API_TOKEN` | empty, or a PandaScore token | optional; HLTV is the main source |
 | `CS2BOT_BETCLIC__CREDENTIALS_SOURCE` | `env` (already set) | the bot logs in by itself with the next two lines |
 | `CS2BOT_BETCLIC__USERNAME` / `CS2BOT_BETCLIC__PASSWORD` | your Betclic.pl login | see "quotes" below |
-| `CS2BOT_BETCLIC__PROXY_URL` | empty, or `http://user:pass@host:port` | only if Betclic blocks the server's IP ([section 11](#11-betclic-and-the-servers-ip-address)) |
+| `CS2BOT_BETCLIC__PROXY_URL` | **empty** (normal), or `http://user:pass@host:port` | optional: only if Betclic blocks the server's IP ([section 11](#11-betclic-and-the-servers-ip-address)) |
+| `CS2BOT_HLTV__PROXY_URL` | empty, or `http://user:pass@host:port` | optional fallback for HLTV: with the default `CS2BOT_HLTV__PROXY_MODE=after_block` HLTV is read directly and only goes through the proxy while the server's own IP is blocked by Cloudflare (`always` = every HLTV page through the proxy) |
 | `CS2BOT_TELEGRAM__BOT_TOKEN` | token from **@BotFather** | in Telegram: open @BotFather, send `/newbot`, choose a name; it answers with the token |
 | `CS2BOT_TELEGRAM__CHAT_ID` | your chat id from **@userinfobot** | open @userinfobot, send any message, copy the number after "Id". Then open **your new bot** and press **Start** (a bot cannot write to you before that) |
 | `CS2BOT_BANKROLL__STARTING_BANKROLL` | the money on the Betclic account reserved for the bot, e.g. `1000.00` | |
@@ -267,8 +268,10 @@ docker logs -f cs2bot-backfill        # progress (Ctrl+C stops following)
   **nightly retrain** (05:00) trains on the new data; to train right away:
   `docker compose exec app cs2bot models train` and then `docker compose restart app`.
 - HLTV may block a server that reads too much (Cloudflare). The bot then waits and retries by
-  itself. A Polish residential proxy for HLTV (`CS2BOT_HLTV__PROXY_URL` in `.env`) helps with the
-  backfill; see OPERATIONS.md for slowing down.
+  itself. A residential proxy for HLTV (`CS2BOT_HLTV__PROXY_URL` in `.env`, then `deploy.sh`) is used
+  as a fallback while the server's own IP is blocked (`CS2BOT_HLTV__PROXY_MODE=after_block`, the
+  default; `always` sends every HLTV page through it). The backfill container reads the same `.env`.
+  See OPERATIONS.md for slowing down.
 
 ## 10. Dry-run smoke test, then going live
 
@@ -299,12 +302,13 @@ wins most of the time; you chose this knowingly.
 
 ## 11. Betclic and the server's IP address
 
-Betclic.pl only works from Polish IP addresses, and it **may block data-centre addresses even in
-Poland** (a VPS address is a data-centre address). Signs: the executor check on the Health page fails
+Betclic.pl only works from Polish IP addresses. A Polish VPS address normally works - Betclic works
+for the owner through a Polish VPN, which is a data-centre address too - so **start without a proxy**
+(`CS2BOT_BETCLIC__PROXY_URL` empty). Betclic *may* still block some data-centre addresses. Signs: the executor check on the Health page fails
 with an access / error page, the odds collector finds no events, Telegram reports login problems
 although the password is right, or screenshots show a block page.
 
-The fix is a **Polish residential proxy** (an address of a normal Polish home connection, rented
+Only if that happens, the fix is a **Polish residential proxy** (an address of a normal Polish home connection, rented
 from a proxy provider; prefer a "static" / "ISP" residential address so Betclic always sees the same
 IP). Put it into `.env`:
 
@@ -354,7 +358,11 @@ only on the server's own 127.0.0.1. The SSH tunnel is the only way in.
   profiles, i.e. your Betclic session - keep such files private).
 - **Restore:** `deploy/linux/restore.sh --list`, then `deploy/linux/restore.sh backups/<file>.dump`.
   It asks you to type `RESTORE`, saves the current database first (`...-before-restore.dump`), stops
-  the bot, restores and starts it again.
+  the bot, restores, **pauses betting** and starts the bot again. The pause is deliberate: bets placed
+  after that backup are missing from the restored ledger, so the loss limits and the exposure would be
+  computed too low. Check the dashboard's **Bankroll** and **Bets** pages (settlement and the balance
+  reconciliation find the missing bets in Betclic's history), then resume (dashboard, Telegram
+  `/resume`). This pause never lifts by itself.
 - **Off-site copy (recommended):** a backup on the same server does not survive the loss of the
   server. Set up any rclone storage (Backblaze B2, an S3 bucket, Google Drive, another server via
   SFTP) as the `cs2bot` user with `rclone config`, then put its name into `.env`, e.g.

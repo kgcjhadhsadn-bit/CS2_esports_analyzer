@@ -1,12 +1,14 @@
 # deep_data: implementation report
 
+Review round 1 (see the last section): `tests/learning tests/models tests/ingest tests/odds tests/foundation` - 1584 passed, 18 skipped; whole suite (`tests -n 2`) - 3171 passed, 21 skipped, 0 failed; ruff, ruff format, mypy clean on every owned path. New review tests: `tests/learning/test_deep_review.py` (16).
+
 Tests: `.venv/bin/python -m pytest tests/learning tests/models tests/ingest tests/odds -q -n 2` - 1531 passed, 18 skipped (PostgreSQL / browser), 0 failed (2.5 min) (deep_data's own new modules: `test_deep_*`, 58 tests in 7 files: `tests/learning/test_deep_{features,confidence,ensemble}.py`, `tests/odds/test_deep_odds_movement.py`, `tests/ingest/hltv/test_deep_hltv_proxy.py`, `tests/ingest/pandascore/test_deep_pandascore_optional.py`). Whole suite (`tests -n 2`): 3132 passed, 14 skipped, 0 failed (6 min). `tests/foundation`: passed. `ruff check`, `ruff format --check` and `mypy` are clean on every owned path.
 
 ## Summary
 
 Requirement by requirement:
 
-1. **New leakage-safe features** - `cs2bot.features.deep.DeepFeatureIndex`, built by `FeatureStore.build(..., deep=DeepData)` / `FeatureStore.from_session(..., with_deep=True)` and added to every row by `match_map_features` (the single code path of `build_training_rows` and `features_for_match_map`, so training and live rows cannot drift apart). 48 team factors (as `diff_dp_*`; `t1_`/`t2_` too with `DeepConfig(team_columns="all")`) and 22 match factors plus 11 market columns:
+1. **New leakage-safe features** - `cs2bot.features.deep.DeepFeatureIndex`, built by `FeatureStore.build(..., deep=DeepData)` / `FeatureStore.from_session(..., with_deep=True)` and added to every row by `match_map_features` (the single code path of `build_training_rows` and `features_for_match_map`, so training and live rows cannot drift apart). 48 team factors (as `diff_dp_*`; `t1_`/`t2_` too with `DeepConfig(team_columns="all")`) and 22 match factors plus 11 market columns (12 since review round 1: `mkt_lead_hours`):
    * schedule / fatigue (maps and series in 3 / 7 days, rest days, consecutive play days, second series the same day, maps today);
    * travel and time zones (venue country/region/UTC offset vs the team's home from `teams.country`, the HLTV extra or the players' countries; curated table in `features/geo.py` with ~100 countries and ~100 event cities; online events = no travel), first match after travel, days at the event;
    * stakes (`features/stakes.py`: grand final / final / semi / quarter / playoff / lower / upper bracket / elimination / decider / qualification / Swiss / group / opening / low-stakes from the stage text, an ordinal `stakes_level`, the team's record in the event before the match, Swiss elimination / qualification match from that record);
@@ -215,7 +217,9 @@ store = FeatureStore.build(map_results, player_maps=player_maps, rounds=rounds, 
 # 2. confidence guard: after a backtest (cs2bot backtest / nightly), persist the guard
 guard = ConfidenceGuard.from_predictions(report.predictions); guard.save(settings.models.confidence_guard_file)
 
-# 3. decision (engine.decision.evaluate), before the min_probability check
+# 3. decision (engine.decision.evaluate), before the min_probability check. Status after review round 1:
+#    services.betting.trusted_markets / cli backtest already read / write the guard's trusted flags
+#    (cloud_autonomy); guard.adjust is NOT wired yet.
 p_adj = guard.adjust(spec.market_type.value, outcome.p_win)          # use p_adj for the probability and EV checks
 if require_trusted and not guard.is_trusted(spec.market_type.value): reject("market_not_trusted", guard.reasons(...))
 #    suggested settings: DecisionSettings.use_confidence_guard: bool = True, require_trusted_market: bool = False
