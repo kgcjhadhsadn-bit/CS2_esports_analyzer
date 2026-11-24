@@ -213,6 +213,7 @@ def run_up(
         executor=executor,
         analyzer=analyzer,
         health_cache=health,
+        stop_event=stop,  # a betting cycle running at Ctrl+C places nothing more
         **(runtime_overrides or {}),
     )
     scheduler: Scheduler | None = None

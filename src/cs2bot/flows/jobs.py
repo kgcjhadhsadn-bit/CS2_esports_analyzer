@@ -64,8 +64,9 @@ class Runtime:
 
     ``executor`` is a :class:`~cs2bot.executor.BetExecutor` (``None``: decisions only). ``analyzer`` is a
     :class:`~cs2bot.llm.ContextAnalyzer` or None. The factories create sources lazily inside the job's
-    own lane thread (``odds_source_factory`` once, reused; the HLTV / PandaScore ones per job when
-    given, else the ingestion service opens and closes its own).
+    own lane thread (``odds_source_factory`` once, reused; the HLTV / PandaScore / demo ones per job
+    when given, closed again after the job, else the ingestion service opens and closes its own).
+    ``stop_event`` is set by ``run_up`` at shutdown; the betting cycle checks it before every placement.
     """
 
     settings: Settings
@@ -81,6 +82,8 @@ class Runtime:
     mapper: Any | None = None
     hltv_enabled: bool = True
     demo_limit: int = 5
+    #: Set when ``cs2bot up`` shuts down: a running betting cycle places nothing more.
+    stop_event: threading.Event = field(default_factory=threading.Event)
     _odds_source: Any = field(default=None, repr=False)
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
 
@@ -122,6 +125,29 @@ def _maybe(factory: Callable[[], Any] | None) -> Any | None:
     return factory() if factory is not None else None
 
 
+def _close_quietly(obj: Any) -> None:
+    if obj is not None and hasattr(obj, "close"):
+        try:
+            obj.close()
+        except Exception:
+            log.warning("could not close %s", type(obj).__name__, exc_info=True)
+
+
+def _with_source(
+    factory: Callable[[], Any] | None, run: Callable[[Any | None], ingestion.ReportLike]
+) -> ingestion.ReportLike:
+    """Create a source from ``factory`` in the calling (lane) thread, run, and close it again.
+
+    An injected source is not closed by the ingestion services (they only close what they open), so
+    a source made here per job would otherwise leak a browser / HTTP client on every run.
+    """
+    source = _maybe(factory)
+    try:
+        return run(source)
+    finally:
+        _close_quietly(source)
+
+
 # ------------------------------------------------------------------------------------------ job bodies
 
 
@@ -158,7 +184,14 @@ def _bet(rt: Runtime, tracker: JobTracker) -> None:
         tracker.details = {"skipped": "no trained model yet"}
         return
     analyzer = rt.analyzer if rt.llm_ready else None
-    report = run_betting_cycle(rt.session_factory, rt.settings, rt.executor, bundle, analyzer=analyzer)
+    report = run_betting_cycle(
+        rt.session_factory,
+        rt.settings,
+        rt.executor,
+        bundle,
+        analyzer=analyzer,
+        should_stop=rt.stop_event.is_set,
+    )
     tracker.add(report.items)
     tracker.details = report.as_dict()
     if report.errors:
@@ -226,14 +259,12 @@ def _retrain(rt: Runtime, tracker: JobTracker) -> None:
 
 
 def _demos(rt: Runtime, tracker: JobTracker) -> None:
-    downloader = _maybe(rt.demo_downloader_factory)
-    try:
-        report = ingestion.process_demos(
+    report = _with_source(
+        rt.demo_downloader_factory,
+        lambda downloader: ingestion.process_demos(
             rt.session_factory, rt.settings, limit=rt.demo_limit, downloader=downloader
-        )
-    finally:
-        if downloader is not None and hasattr(downloader, "close"):
-            downloader.close()
+        ),
+    )
     ingestion.report_to_tracker(tracker, report, fail_when_empty=False)
 
 
@@ -256,10 +287,14 @@ def build_jobs(rt: Runtime) -> list[Job]:
     hltv_fetcher = rt.hltv_fetcher_factory
 
     def ps(fn: Callable[..., ingestion.ReportLike]) -> Callable[[JobTracker], None]:
-        return _sync_job(lambda: fn(rt.session_factory, s, client=_maybe(ps_client)))
+        return _sync_job(
+            lambda: _with_source(ps_client, lambda client: fn(rt.session_factory, s, client=client))
+        )
 
     def hl(fn: Callable[..., ingestion.ReportLike]) -> Callable[[JobTracker], None]:
-        return _sync_job(lambda: fn(rt.session_factory, s, fetcher=_maybe(hltv_fetcher)))
+        return _sync_job(
+            lambda: _with_source(hltv_fetcher, lambda fetcher: fn(rt.session_factory, s, fetcher=fetcher))
+        )
 
     hltv_on = rt.hltv_enabled
     return [

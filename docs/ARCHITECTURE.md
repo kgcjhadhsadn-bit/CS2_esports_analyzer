@@ -118,11 +118,12 @@ a completed login; `cs2bot doctor` exits non-zero on problems; `cs2bot db upgrad
 Wires everything: sync → train → predict → price → decide → stake → execute → settle, plus CLI commands.
 * `services.registry`: `train_models(session, settings, *, as_of=None) -> TrainReport` (never sees data after `as_of`; artifacts in `settings.models.artifacts_dir/<version>/`, a `model_runs` row), `load_latest(settings) -> ModelBundle | None`, `ModelRegistry` (thread-safe swap after the nightly retrain).
 * `services.prediction`: `predict_match(session, match_id, bundle, settings, *, analyzer=None, now=None)`, `predict_upcoming(session_factory, settings, bundle, *, analyzer=None, now=None, force=False) -> PredictReport` (re-simulates only when veto, lineups, flags, completeness or model version changed).
-* `services.betting`: `run_betting_cycle(session_factory, settings, executor, bundle, *, now=None, dry_run=None) -> BettingReport` (bet row committed PENDING → halt re-read → PLACING committed → `executor.place`; crash-safe, idempotent).
-* `services.settlement`: `settle_bets(session_factory, settings, executor=None, *, now=None) -> SettlementReport` (bet history first, then results; closing odds/CLV; balance reconciliation).
+* `services.betting`: `run_betting_cycle(session_factory, settings, executor, bundle, *, now=None, dry_run=None, should_stop=None) -> BettingReport` (bet row committed PENDING → halt re-read → PENDING→PLACING compare-and-swap committed → `executor.place`; crash-safe, idempotent; UNCERTAIN / closed executor / shutdown stop the rest of the cycle).
+* `services.settlement`: `settle_bets(session_factory, settings, executor=None, *, now=None) -> SettlementReport` (bet history first, then results; the bookmaker's outcome and plausible payout are the truth for money; closing odds/CLV; balance reconciliation, skipped while the history is unavailable).
 * `services.ingestion` (job functions per source), `services.health` (executor health cache + `system_state`), `services.dbops` (Alembic in code), `services.doctor`.
 * `flows.scheduler`: built-in job scheduler (interval + daily jobs, catch-up of runs missed while the PC was off,
-  based on `job_runs`). `flows.jobs.build_jobs(Runtime) -> list[Job]` (lanes `fast`, `sync`, `hltv`, `train`).
+  based on `job_runs`). `flows.jobs.build_jobs(Runtime) -> list[Job]` (lanes `fast`, `sync`, `hltv`, `train`;
+  `Runtime.stop_event` is set at shutdown so a running betting cycle places nothing more).
   `flows.supervisor.run_up(settings) -> int` = `cs2bot up`: starts the API/dashboard on `127.0.0.1`, the executor
   and the scheduler in one command.
 

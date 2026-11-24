@@ -20,5 +20,5 @@ Test counts are the package's own suite as reported in `docs/dev/reports/<packag
 | llm (Claude context layer) | done | 233 | round 1 | |
 | dashboard (React) | done | 79 (vitest) | round 1 | |
 | ops (Windows install, CI, docs) | done | 37 | round 1 | PowerShell scripts never run on Windows |
-| integration (services, jobs, `cs2bot up`, CLI, end-to-end test) | done | 40 | - | whole suite 2955 passed |
+| integration (services, jobs, `cs2bot up`, CLI, end-to-end test) | done | 58 | round 1 | whole suite 2973 passed |
 | final cross-cutting review | - | | - | |

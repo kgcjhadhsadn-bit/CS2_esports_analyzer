@@ -6,7 +6,9 @@ One cycle (:func:`run_betting_cycle`):
    executor (a bet is moved to ``PLACING`` - committed - *before* ``executor.place`` is called), so
    they are cancelled; the outcome may be decided again. ``PLACING`` bets may exist at the bookmaker:
    they stay open, count as exposure and block their outcome until settlement reconciles them with
-   the bet history. They are never sent again.
+   the bet history. They are never sent again. A ``PLACING`` bet settlement could not find in the
+   history (marked FAILED with ``extra["unconfirmed_not_found"]``) keeps blocking its market: it may
+   exist after all, so it is never bet again automatically.
 2. **Bankroll.** The ledger is opened from the bookmaker balance when it is empty (falls back to
    ``bankroll.starting_bankroll``); ``engine.bankroll.compute_state`` + ``check_loss_limits`` (a loss
    limit pauses the bot).
@@ -17,20 +19,30 @@ One cycle (:func:`run_betting_cycle`):
    ``bankroll.size_decision`` against the state that already contains the previous bets, so the
    per-bet, per-match exposure, daily and bets-per-day caps hold. Every decision is written to
    ``bet_decisions`` (rejections with their reasons; unchanged rejections are not repeated within an
-   hour).
+   hour). The cycle clock advances with real time, so a match decided late in a long cycle is
+   checked against the time it is really decided (odds freshness, minutes before kick-off).
 4. **Placement** of each accepted stake: ``bets`` row (``PENDING``, deterministic idempotency key from
    match + market + selection + mode + attempt) committed; ``db.state.is_trading_halted`` read fresh;
-   ``PLACING`` committed; ``executor.place``; ``engine.ledger.apply_placement`` maps the result
-   (``domain.betting.bet_status_after_placement``) and writes the ledger. ``LOGIN_REQUIRED`` /
-   ``SELECTOR_ERROR`` pause trading with a clear reason (dashboard alert); ``UNCERTAIN`` keeps the bet
-   ``PLACING`` and raises an audit alert; it is never retried.
+   ``PENDING -> PLACING`` committed as a compare-and-swap (a row another process changed meanwhile is
+   never sent); ``executor.place``; ``engine.ledger.apply_placement`` maps the result
+   (``domain.betting.bet_status_after_placement``) and writes the ledger.
+
+   * ``LOGIN_REQUIRED`` / ``SELECTOR_ERROR`` pause trading with a clear reason (dashboard alert).
+   * ``UNCERTAIN`` keeps the bet ``PLACING`` (exposure, audit alert, never retried) and stops placing
+     for the rest of the cycle, like ``KILL_SWITCH`` / ``INSUFFICIENT_BALANCE`` (no pause: the next
+     cycle tries again).
+   * An executor that is closed (shutdown) answers before sending anything: FAILED, cycle stopped.
+   * A result that cannot be recorded leaves the bet ``PLACING`` for settlement; the cycle stops.
+   * ``should_stop`` (the shutdown event of ``cs2bot up``) is checked before every placement.
 
 Dry-run bets (``settings.executor.dry_run`` or ``dry_run=True``) are recorded with status ``DRY_RUN``
-and never touch the ledger or the loss limits (``compute_state`` ignores them); within a cycle their
-stakes are still reserved so the per-match cap applies to paper bets too.
+and never touch the ledger or the loss limits (``compute_state`` ignores them); their stakes are
+still reserved (within the cycle and across cycles, :func:`with_open_paper_bets`) so the per-match cap
+applies to paper bets too.
 
 Cycles in one process are serialised by a lock (``compute_state`` takes no DB locks); do not run
-``cs2bot bet run`` while ``cs2bot up`` is betting.
+``cs2bot bet run`` while ``cs2bot up`` is betting (the Betclic profile lock refuses the second browser,
+and the status compare-and-swap keeps the two from acting on one row).
 """
 
 from __future__ import annotations
@@ -38,14 +50,15 @@ from __future__ import annotations
 import hashlib
 import logging
 import threading
+import time
 from collections import defaultdict
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from decimal import Decimal
 from typing import Any
 
-from sqlalchemy import func, or_, select
+from sqlalchemy import func, or_, select, update
 from sqlalchemy.orm import Session, sessionmaker
 
 from cs2bot import datasets
@@ -69,6 +82,7 @@ from cs2bot.engine.pricing import price_quotes
 from cs2bot.odds import latest_quotes
 from cs2bot.services.prediction import write_outcome_predictions, write_rationale
 from cs2bot.services.registry import ModelBundle
+from cs2bot.services.settlement import UNCONFIRMED_NOT_FOUND_KEY
 from cs2bot.utils.time import ensure_utc, utcnow
 
 log = logging.getLogger(__name__)
@@ -189,12 +203,18 @@ def idempotency_key(
     return f"{prefix}{count + 1}"
 
 
+def is_unconfirmed_failure(bet: Bet) -> bool:
+    """A FAILED bet whose placement was never confirmed either way (it may exist at the bookmaker)."""
+    return bet.status is BetStatus.FAILED and bool((bet.extra or {}).get(UNCONFIRMED_NOT_FOUND_KEY))
+
+
 def _blocking_bets(session: Session, match_id: int, *, include_dry_run: bool) -> list[Bet]:
+    """Bets on the match that put (or may have put) money at risk, plus unconfirmed failures."""
     rows = session.scalars(select(Bet).where(Bet.match_id == match_id))
     return [
         b
         for b in rows
-        if b.status not in NON_BLOCKING_BET_STATUSES
+        if (b.status not in NON_BLOCKING_BET_STATUSES or is_unconfirmed_failure(b))
         and (include_dry_run or not (b.dry_run or b.status is BetStatus.DRY_RUN))
     ]
 
@@ -206,20 +226,35 @@ def _reject(dec: BetDecision, reason: str) -> BetDecision:
 
 
 def enforce_one_selection_per_market(
-    decisions: Sequence[BetDecision], *, bet_specs: dict[str, set[str]]
+    decisions: Sequence[BetDecision],
+    *,
+    bet_specs: dict[str, set[str]],
+    blocked_outcomes: set[tuple[str, str]] | None = None,
 ) -> list[BetDecision]:
     """Never back two selections of the same market (same ``spec_key``).
 
     ``bet_specs`` maps spec key -> selections that already have a blocking bet on this match. An accepted
     decision on a market with a bet on *another* selection is rejected; among accepted decisions of one
-    market only the highest EV stays accepted.
+    market only the highest EV stays accepted. ``blocked_outcomes`` holds ``(spec_key, selection_key)``
+    pairs that must not be backed again although the engine's duplicate check lets them through (an
+    unconfirmed placement that settlement could not find: it may exist at the bookmaker).
     """
+    blocked = blocked_outcomes or set()
     out: list[BetDecision] = []
     for dec in decisions:
         spec_key = dec.priced.quote.spec.key()
         sel = dec.priced.quote.selection_key
         others = bet_specs.get(spec_key, set()) - {sel}
-        if dec.accepted and others:
+        if dec.accepted and (spec_key, sel) in blocked:
+            dec = _reject(
+                dec,
+                make_reason(
+                    ReasonCode.DUPLICATE,
+                    "an earlier placement of this outcome could not be confirmed in the bet history "
+                    "(it may exist at Betclic) - it is not bet again automatically",
+                ),
+            )
+        elif dec.accepted and others:
             dec = _reject(
                 dec,
                 make_reason(
@@ -374,22 +409,57 @@ def _fresh_halt(session_factory: sessionmaker[Session]) -> tuple[bool, str | Non
         return True, f"could not read the trading state: {type(exc).__name__}: {exc}"
 
 
+def transition_status(
+    session: Session, bet: Bet, *, expected: BetStatus, new: BetStatus, **values: Any
+) -> bool:
+    """Compare-and-swap of ``bets.status``: ``expected`` -> ``new`` (plus ``values``) in ONE UPDATE.
+
+    The UPDATE only matches while the row still has ``expected`` in the database, so two processes
+    (``cs2bot up`` and a CLI ``bet run``) can never both act on one row: e.g. a cycle that is about to
+    hand a PENDING bet to the executor and another process cancelling it as stale. Whoever commits
+    first wins; the loser sees ``False`` and must not act. The in-session ``bet`` is updated too.
+    Flushes pending changes first; does not commit.
+    """
+    session.flush()
+    result = session.execute(
+        update(Bet)
+        .where(Bet.id == bet.id, Bet.status == expected)
+        .values(status=new, **values)
+        .execution_options(synchronize_session=False)
+    )
+    if getattr(result, "rowcount", 0) != 1:
+        session.refresh(bet)
+        return False
+    session.refresh(bet)
+    return True
+
+
 def cancel_stale_pending(
     session: Session, *, now: datetime, older_than: timedelta = STALE_PENDING_AFTER
 ) -> int:
-    """Cancel PENDING bets an interrupted cycle left behind (they never reached the executor)."""
+    """Cancel PENDING bets an interrupted cycle left behind (they never reached the executor).
+
+    A bet is handed to the executor only after its PENDING -> PLACING transition was committed, so a
+    PENDING row was never sent. The cancellation is a compare-and-swap (:func:`transition_status`): a
+    row another process moves to PLACING at the same moment is left alone.
+    """
     n = 0
-    for bet in session.scalars(select(Bet).where(Bet.status == BetStatus.PENDING)):
+    for bet in list(session.scalars(select(Bet).where(Bet.status == BetStatus.PENDING))):
         created = (bet.extra or {}).get("cycle_at")
         try:
-            created_at = ensure_utc(datetime.fromisoformat(created)) if created else None
+            created_at = ensure_utc(datetime.fromisoformat(created)) if isinstance(created, str) else None
         except ValueError:
             created_at = None
         if created_at is not None and now - created_at < older_than:
             continue
-        bet.status = BetStatus.CANCELLED
-        bet.error = "not sent to the bookmaker: the bot stopped before placement (stale PENDING row)"
-        n += 1
+        if transition_status(
+            session,
+            bet,
+            expected=BetStatus.PENDING,
+            new=BetStatus.CANCELLED,
+            error="not sent to the bookmaker: the bot stopped before placement (stale PENDING row)",
+        ):
+            n += 1
     if n:
         db_state.audit(session, actor=ACTOR, action="stale_pending_cancelled", details={"count": n})
         session.flush()
@@ -458,6 +528,40 @@ def _event_info(session: Session, event_id: int, match: Match | None) -> tuple[d
 # ------------------------------------------------------------------------------------- the cycle
 
 
+@dataclass
+class _Cycle:
+    """Per-cycle state shared by the matches of one cycle.
+
+    ``now()`` is the cycle clock: the start time given to :func:`run_betting_cycle` plus the time that
+    has really elapsed since, so the odds freshness and kick-off checks of a match decided 20 minutes
+    into a long cycle (every placement takes a while with the executor's human-like pauses) use the
+    time it is actually decided, not the cycle's start. ``stop_reason`` survives an exception in one
+    match, so a stop (pause, UNCERTAIN, shutdown) always holds for the rest of the cycle.
+    """
+
+    start: datetime
+    should_stop: Callable[[], bool] | None = None
+    stop_reason: str | None = None
+    _t0: float = field(default_factory=time.monotonic)
+
+    def now(self) -> datetime:
+        return self.start + timedelta(seconds=max(0.0, time.monotonic() - self._t0))
+
+    def stop(self, reason: str) -> None:
+        if self.stop_reason is None:
+            self.stop_reason = reason
+
+    def stopped(self) -> str | None:
+        """Why placing must stop for the rest of the cycle (None = go on)."""
+        if self.stop_reason is None and self.should_stop is not None:
+            try:
+                if self.should_stop():
+                    self.stop("the bot is shutting down")
+            except Exception as exc:  # cannot tell -> do not place
+                self.stop(f"stop check failed: {type(exc).__name__}")
+        return self.stop_reason
+
+
 def run_betting_cycle(
     session_factory: sessionmaker[Session],
     settings: Settings,
@@ -469,13 +573,15 @@ def run_betting_cycle(
     analyzer: Any | None = None,
     max_prediction_age: timedelta = DEFAULT_MAX_PREDICTION_AGE,
     match_ids: Sequence[int] | None = None,
+    should_stop: Callable[[], bool] | None = None,
 ) -> BettingReport:
     """Run one betting cycle (see the module docstring) and return what happened.
 
     ``executor`` is a :class:`~cs2bot.executor.BetExecutor`; with ``None`` (or the executor disabled in
     the settings) decisions are recorded but no bet is created. Real money moves only when neither
     ``dry_run`` nor ``settings.executor.dry_run`` is set. ``bundle`` (optional) requires predictions of
-    the active model version.
+    the active model version. ``should_stop`` (e.g. the shutdown event of ``cs2bot up``) is checked
+    before every placement: once it returns True nothing more is sent in this cycle.
     """
     now = ensure_utc(now or utcnow())
     dry = bool(settings.executor.dry_run or dry_run)
@@ -491,7 +597,7 @@ def run_betting_cycle(
             executor if settings.executor.enabled else None,
             bundle,
             report,
-            now=now,
+            cycle=_Cycle(start=now, should_stop=should_stop),
             dry=dry,
             analyzer=analyzer,
             max_prediction_age=max_prediction_age,
@@ -509,12 +615,13 @@ def _run_cycle(
     bundle: ModelBundle | None,
     report: BettingReport,
     *,
-    now: datetime,
+    cycle: _Cycle,
     dry: bool,
     analyzer: Any | None,
     max_prediction_age: timedelta,
     match_ids: Sequence[int] | None,
 ) -> None:
+    now = cycle.start
     if executor is None:
         report.notes.append("no executor: decisions are recorded, no bets are created")
     with session_factory() as session:
@@ -537,29 +644,40 @@ def _run_cycle(
             wanted = set(match_ids)
             analyses = [a for a in analyses if a.match_id in wanted]
         targets = [(a.id, a.match_id) for a in analyses]
-    stop_placing = False
     for analysis_id, match_id in targets:
         report.matches_considered += 1
+        created_before = report.bets_created
         try:
-            stop_placing = _bet_match(
+            _bet_match(
                 session_factory,
                 settings,
                 executor,
                 report,
                 analysis_id=analysis_id,
                 match_id=match_id,
-                now=now,
+                cycle=cycle,
                 dry=dry,
                 analyzer=analyzer,
-                stop_placing=stop_placing,
             )
         except Exception as exc:
             log.exception("betting failed for match %s", match_id)
             report.errors.append(f"match {match_id}: {type(exc).__name__}: {exc}")
+            if report.bets_created > created_before:
+                # the error came after a bet row was created: its state may be unclear, place no more
+                cycle.stop(f"unexpected error while placing on match {match_id}: {type(exc).__name__}")
+    if cycle.stop_reason is not None:
+        report.notes.append(f"placing stopped: {cycle.stop_reason}"[:500])
     with session_factory() as session:
         paused, pause_reason = db_state.get_pause(session)
         if paused:
             report.paused_reason = pause_reason
+
+
+def _sizing_state(session: Session, settings: Settings, *, now: datetime, dry: bool) -> BankrollState:
+    """The bankroll state bets are sized against (paper bets reserved in dry-run mode)."""
+    session.expire_all()
+    state = bankroll.compute_state(session, settings, now=now)
+    return with_open_paper_bets(session, state) if dry else state
 
 
 def _bet_match(
@@ -570,21 +688,21 @@ def _bet_match(
     *,
     analysis_id: int,
     match_id: int,
-    now: datetime,
+    cycle: _Cycle,
     dry: bool,
     analyzer: Any | None,
-    stop_placing: bool,
-) -> bool:
-    """Decide, size and place the outcomes of one match. Returns True when placing must stop."""
+) -> None:
+    """Decide, size and place the outcomes of one match (a stop is recorded on ``cycle``)."""
+    now = cycle.now()
     with session_factory() as session:
         analysis = session.get(MatchAnalysis, analysis_id)
         match = session.get(Match, match_id)
         if analysis is None or match is None:
-            return stop_placing
+            return
         prediction = MatchPrediction.model_validate(analysis.payload)
         quotes = latest_quotes(session, match_id, max_age_s=settings.betclic.odds_max_age_s, now=now)
         if not quotes:
-            return stop_placing
+            return
         report.matches_with_quotes += 1
         # make sure every quoted outcome has a predictions row (decisions link to it)
         write_outcome_predictions(
@@ -621,9 +739,12 @@ def _bet_match(
                 )
             )
         bet_specs: dict[str, set[str]] = defaultdict(set)
+        blocked: set[tuple[str, str]] = set()
         for b in _blocking_bets(session, match_id, include_dry_run=dry):
             bet_specs[b.spec_key].add(b.selection_key)
-        decisions = enforce_one_selection_per_market(decisions, bet_specs=bet_specs)
+            if is_unconfirmed_failure(b):
+                blocked.add((b.spec_key, b.selection_key))
+        decisions = enforce_one_selection_per_market(decisions, bet_specs=bet_specs, blocked_outcomes=blocked)
         report.decisions += len(decisions)
 
         rejected = [d for d in decisions if not d.accepted]
@@ -634,17 +755,15 @@ def _bet_match(
         session.commit()
 
         placed_decisions: list[BetDecision] = []
-        session.expire_all()
-        state = bankroll.compute_state(session, settings, now=now)
-        if dry:
-            state = with_open_paper_bets(session, state)
+        state = _sizing_state(session, settings, now=now, dry=dry)
         for dec in accepted:
             sized = bankroll.size_decision(dec, state, bank_settings, settings.betclic)
-            if not sized.accepted or sized.stake <= 0 or executor is None or stop_placing:
+            stop = cycle.stopped()
+            if not sized.accepted or sized.stake <= 0 or executor is None or stop is not None:
                 if sized.accepted and executor is None:
                     sized = _reject(sized, "no_executor: no bet executor is configured")
-                elif sized.accepted and stop_placing:
-                    sized = _reject(sized, "halted: placing stopped earlier in this cycle")
+                elif sized.accepted and stop is not None:
+                    sized = _reject(sized, f"halted: placing stopped earlier in this cycle ({stop})"[:500])
                 if write_decision(session, sized, now=now, extra={"dry_run": dry}) is not None:
                     report.decisions_written += 1
                 session.commit()
@@ -677,18 +796,39 @@ def _bet_match(
                     min_odds=min_odds,
                     match=match,
                     state=state,
-                    now=now,
+                    now=cycle.now(),
                     dry=dry,
                 )
-            except _StopPlacing as stop:
-                report.notes.append(str(stop))
-                stop_placing = True
+            except _StopPlacing as stop_exc:
+                report.notes.append(str(stop_exc)[:500])
+                cycle.stop(str(stop_exc))
         if placed_decisions:
             _update_rationale(
                 session, analysis, prediction, placed_decisions, settings, analyzer=analyzer, now=now
             )
             session.commit()
-    return stop_placing
+
+
+def _raised_before_sending(exc: BaseException) -> bool:
+    """True for the executor errors raised at the start of ``place`` (closed / wrong thread).
+
+    ``BetclicExecutor.place`` and ``ThreadBoundExecutor`` raise only these two, and only before
+    anything is sent (see the executor report): nothing was clicked, so the bet is FAILED, not
+    UNCERTAIN. Any other exception may come from anywhere in the flow and stays UNCERTAIN.
+    """
+    try:
+        from cs2bot.executor.base import ExecutorClosedError, ExecutorThreadError
+    except Exception:  # pragma: no cover - the executor package is part of the install
+        return False
+    return isinstance(exc, (ExecutorClosedError, ExecutorThreadError))
+
+
+#: Results after which the rest of the cycle places nothing (no pause: the next cycle tries again):
+#: an unconfirmed click (UNCERTAIN: do not fire more clicks at a page that misbehaves), the
+#: executor's own halt check, and an account without money.
+STOP_CYCLE_STATUSES = frozenset(
+    {PlacementStatus.UNCERTAIN, PlacementStatus.KILL_SWITCH, PlacementStatus.INSUFFICIENT_BALANCE}
+)
 
 
 def _place_one(
@@ -706,7 +846,10 @@ def _place_one(
     now: datetime,
     dry: bool,
 ) -> BankrollState:
-    """Create the bet row, place it and apply the result; returns the bankroll state to size the next bet."""
+    """Create the bet row, place it and apply the result; returns the bankroll state to size the next bet.
+
+    Raises :class:`_StopPlacing` when nothing more may be placed in this cycle.
+    """
     quote = dec.priced.quote
     spec_key = quote.spec.key()
     starts_at, event_name = _event_info(session, quote.bookmaker_event_id, match)
@@ -748,17 +891,32 @@ def _place_one(
 
     halted, reason = _fresh_halt(session_factory)
     if halted:
-        bet.status = BetStatus.CANCELLED
-        bet.error = f"not placed: {reason}"
+        transition_status(
+            session, bet, expected=BetStatus.PENDING, new=BetStatus.CANCELLED, error=f"not placed: {reason}"
+        )
         session.commit()
         report.cancelled += 1
         report.halted_reason = reason
         report.bets.append(_summary(bet, "cancelled", reason or ""))
         raise _StopPlacing(f"trading halted before placement: {reason}")
 
-    bet.status = BetStatus.PLACING
-    bet.extra = {**dict(bet.extra or {}), ledger.PLACEMENT_ATTEMPTED_AT_KEY: utcnow().isoformat()}
-    session.commit()  # from here on the bet may exist at the bookmaker: never re-sent
+    # PENDING -> PLACING as a compare-and-swap, committed BEFORE the executor is called: from here on
+    # the bet may exist at the bookmaker and is never sent again. If another process cancelled the
+    # row in the meantime (stale-PENDING clean-up), nothing is sent.
+    moved = transition_status(
+        session,
+        bet,
+        expected=BetStatus.PENDING,
+        new=BetStatus.PLACING,
+        extra={**dict(bet.extra or {}), ledger.PLACEMENT_ATTEMPTED_AT_KEY: utcnow().isoformat()},
+    )
+    session.commit()
+    if not moved:
+        report.cancelled += 1
+        report.bets.append(_summary(bet, "cancelled", "the row was changed by another process"))
+        raise _StopPlacing(
+            f"bet {bet.id} was changed by another process before placement ({bet.status.value})"
+        )
 
     order = BetOrder(
         bet_id=bet.id,
@@ -776,25 +934,50 @@ def _place_one(
         event_starts_at=starts_at,
         event_name=event_name,
     )
+    executor_unavailable = False
     try:
         result = executor.place(order)
-    except Exception as exc:  # unknown whether anything was clicked: treat as unconfirmed
-        log.exception("executor.place raised for bet %s", bet.id)
-        result = PlacementResult(
-            status=PlacementStatus.UNCERTAIN,
-            message=f"executor raised {type(exc).__name__}: {exc}",
-            at=utcnow(),
-        )
+    except Exception as exc:
+        executor_unavailable = _raised_before_sending(exc)
+        if executor_unavailable:  # closed (shutdown) or wrong thread: nothing was sent
+            log.warning("executor.place refused bet %s before sending it: %s", bet.id, exc)
+            result = PlacementResult(
+                status=PlacementStatus.FAILED,
+                message=f"not sent: executor {type(exc).__name__}: {exc}",
+                at=utcnow(),
+            )
+        else:  # unknown whether anything was clicked: treat as unconfirmed
+            log.exception("executor.place raised for bet %s", bet.id)
+            result = PlacementResult(
+                status=PlacementStatus.UNCERTAIN,
+                message=f"executor raised {type(exc).__name__}: {exc}",
+                at=utcnow(),
+            )
     try:
         status = ledger.apply_placement(session, bet, result, settings)
-    except ledger.LedgerConflictError as exc:
-        log.error("placement result for bet %s conflicts with the ledger: %s", bet.id, exc)
-        db_state.audit(
-            session, actor=ACTOR, action="placement_conflict", details={"bet_id": bet.id, "error": str(exc)}
-        )
-        session.commit()
-        report.errors.append(f"bet {bet.id}: {exc}")
-        return state
+    except Exception as exc:
+        # The row stays PLACING (committed above): it counts as exposure and settlement reconciles it
+        # with the bet history. Stop placing - something is inconsistent.
+        bet_id = bet.id
+        log.error("could not record the placement result of bet %s: %s", bet_id, exc)
+        report.errors.append(f"bet {bet_id}: {type(exc).__name__}: {exc}")
+        try:
+            session.rollback()
+            db_state.audit(
+                session,
+                actor=ACTOR,
+                action="placement_conflict",
+                details={
+                    "bet_id": bet_id,
+                    "result": result.status.value,
+                    "external_bet_id": result.external_bet_id,
+                    "error": str(exc)[:500],
+                },
+            )
+            session.commit()
+        except Exception:  # the database itself may be the problem: stopping matters more
+            log.exception("could not audit the unrecorded placement of bet %s", bet_id)
+        raise _StopPlacing(f"the placement result of bet {bet_id} could not be recorded") from exc
     if result.screenshot_path:
         bet.screenshot_path = result.screenshot_path
     bet.extra = {**dict(bet.extra or {}), "placement_message": result.message[:1000]}
@@ -825,23 +1008,28 @@ def _place_one(
                 details={"bet_id": bet.id, "message": result.message[:500]},
             )
     report.bets.append(_summary(bet, result.status.value, result.message))
-    stop_reason: str | None = None
+    pause_reason: str | None = None
     if result.status in PAUSING_STATUSES:
         what = (
             "Betclic login required"
             if result.status is PlacementStatus.LOGIN_REQUIRED
             else "Betclic page layout changed (selector error)"
         )
-        stop_reason = f"{what}: {result.message}"[:500]
-        ledger.pause_trading(session, stop_reason, actor=ACTOR)
+        pause_reason = f"{what}: {result.message}"[:500]
+        ledger.pause_trading(session, pause_reason, actor=ACTOR)
     session.commit()
-    if stop_reason is not None:
-        raise _StopPlacing(f"trading paused: {stop_reason}")
-    if bet.dry_run or status is BetStatus.DRY_RUN:
+    if pause_reason is not None:
+        raise _StopPlacing(f"trading paused: {pause_reason}")
+    if executor_unavailable:
+        raise _StopPlacing(f"the executor is not available: {result.message}"[:500])
+    if result.status in STOP_CYCLE_STATUSES:
+        raise _StopPlacing(
+            f"placing stopped for this cycle after {result.status.value}: {result.message}"[:500]
+        )
+    if bet.dry_run and status is BetStatus.DRY_RUN:
         # paper bets are invisible to compute_state; reserve them locally so caps hold in this cycle
         return bankroll.reserve_stake(state, match.id, dec.stake)
-    session.expire_all()
-    return bankroll.compute_state(session, settings, now=now)
+    return _sizing_state(session, settings, now=now, dry=dry)
 
 
 def _summary(bet: Bet, placement: str, message: str) -> BetSummary:

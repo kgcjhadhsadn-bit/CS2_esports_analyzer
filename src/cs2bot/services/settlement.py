@@ -5,21 +5,28 @@
 1. **Executor health** -> ``system_state["executor_health"]`` (+ the in-memory cache for the API).
 2. **Bet history** from the bookmaker (``executor.fetch_bet_history``) when there are open real bets.
 3. **PLACING bets** (``UNCERTAIN`` placements, or a crash around the click) are looked up in the
-   history: by bet id, else by stake + selection (+ market) name among rows placed after the attempt.
-   Found -> ``PLACED`` with the bookmaker's id and odds (``ledger.apply_placement``). Still absent
-   after ``grace`` -> ``FAILED`` (exposure released) and an audit alert asks the owner to verify on
-   Betclic. Ambiguous matches and an unavailable history leave the bet open.
+   history: by bet id, else by stake + selection (+ market) name among rows that may have been placed
+   at or after the attempt (the history shows minutes or only the day). Found -> ``PLACED`` with the
+   bookmaker's id and odds (``ledger.apply_placement``). Still absent after ``grace`` -> ``FAILED``
+   (exposure released), flagged ``extra["unconfirmed_not_found"]`` (the betting cycle never bets that
+   outcome again) and an audit alert asks the owner to verify on Betclic. Ambiguous matches and an
+   unavailable history leave the bet open.
 4. **PLACED bets**: the bookmaker's own history is the source of truth for money when it shows the
-   bet settled (WON / LOST / VOID). Otherwise, once the match is finished or cancelled, the local
+   bet settled (WON / LOST / VOID): its outcome is used and, when the row shows a plausible payout
+   that differs from the local tax rules, an ADJUSTMENT entry makes the ledger and the bet's
+   ``payout`` / ``pnl`` follow it. Otherwise, once the match is finished or cancelled, the local
    resolver decides (``engine.settlement.resolve_bet`` on ``datasets.load_match_actuals``); UNKNOWN
-   stays open and is flagged. When both exist and disagree, an alert is recorded and the bookmaker
-   wins. A bet the history still shows open is never settled locally (its payout is not credited yet).
+   stays open and is flagged (once per bet, not on every pass). When both exist and disagree, an
+   alert is recorded and the bookmaker wins. A bet the history still shows open is never settled
+   locally (its payout is not credited yet).
 5. **Paper bets** (dry run) of finished matches are settled "on paper" by the local resolver
    (``ledger.settle_bet`` stores payout / pnl on the row, no ledger entry).
 6. **Closing odds and CLV** for placed and paper bets once the event has started
    (``odds.closing_odds``; CLV = our odds / closing odds - 1).
 7. **Balance reconciliation** (live mode only): ``executor.get_balance`` + ``ledger.reconcile`` (a large
-   mismatch pauses the bot).
+   mismatch pauses the bot). Skipped while the bet history could not be read and real bets are open:
+   a payout Betclic already credited would otherwise be booked as a reconciliation now and again by
+   the local settlement later.
 """
 
 from __future__ import annotations
@@ -27,7 +34,7 @@ from __future__ import annotations
 import logging
 from collections.abc import Sequence
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from typing import Any
 
@@ -52,7 +59,8 @@ from cs2bot.domain.results import MatchActuals, SettlementOutcome
 from cs2bot.engine import ledger, settlement
 from cs2bot.odds import closing_odds
 from cs2bot.services.health import HealthCache, refresh_executor_health
-from cs2bot.utils.time import ensure_utc, utcnow
+from cs2bot.utils.money import CENT, quantize_money
+from cs2bot.utils.time import WARSAW, ensure_utc, utcnow
 
 log = logging.getLogger(__name__)
 
@@ -62,6 +70,10 @@ DEFAULT_GRACE = timedelta(minutes=30)
 OPEN_AT_BOOKMAKER_FLAG_AFTER = timedelta(hours=12)
 #: History rows show minutes; a row may carry a time up to this much before the attempt.
 HISTORY_TIME_SLACK = timedelta(minutes=2)
+#: ``bets.extra`` flag set on a PLACING bet marked FAILED because the bookmaker's bet history did not
+#: show it after the grace period: the bet may still exist (the executor skips unreadable history
+#: rows), so ``services.betting`` never decides this outcome again automatically.
+UNCONFIRMED_NOT_FOUND_KEY = "unconfirmed_not_found"
 
 _BOOKMAKER_OUTCOME = {
     BookmakerBetStatus.WON: SettlementOutcome.WON,
@@ -75,6 +87,8 @@ FINISHED_STATUSES = (MatchStatus.FINISHED, MatchStatus.CANCELED)
 class SettlementReport:
     started_at: datetime
     history_rows: int | None = None
+    #: True when the bet history was needed (open real bets) but could not be read.
+    history_failed: bool = False
     placing_confirmed: int = 0
     placing_failed: int = 0
     placing_open: int = 0
@@ -100,6 +114,7 @@ class SettlementReport:
         return {
             "started_at": self.started_at.isoformat(),
             "history_rows": self.history_rows,
+            "history_failed": self.history_failed,
             "placing_confirmed": self.placing_confirmed,
             "placing_failed": self.placing_failed,
             "placing_open": self.placing_open,
@@ -152,13 +167,32 @@ def _attempt_time(bet: Bet) -> datetime | None:
     return None
 
 
+def history_row_latest_time(placed_at: datetime) -> datetime:
+    """The latest instant a history row shown with ``placed_at`` may really have been placed.
+
+    Betclic's history shows minutes or only the day; the executor parses the START of that minute /
+    day (``cs2bot.executor.betclic``): local (Warsaw) midnight stands for the whole day, zero seconds
+    for the whole minute. Without this a bet shown with its date only would never match the
+    unconfirmed placement it belongs to, be marked FAILED after the grace period, and its exposure
+    released although the money is at risk.
+    """
+    local = ensure_utc(placed_at).astimezone(WARSAW)
+    if (local.hour, local.minute, local.second) == (0, 0, 0):
+        return (local + timedelta(days=1)).astimezone(UTC)  # wall-clock day (DST days have 23 / 25 h)
+    if local.second == 0:
+        return ensure_utc(placed_at) + timedelta(minutes=1)
+    return ensure_utc(placed_at)
+
+
 def match_history_record(
     bet: Bet, records: Sequence[BookmakerBetRecord], *, claimed: set[str]
 ) -> tuple[BookmakerBetRecord | None, int]:
     """(record, number of candidates) for a bet: by bet id, else stake + selection (+ market) + time.
 
     ``claimed`` holds bookmaker bet ids that already belong to other bets. Returns ``(None, n)`` when
-    nothing or more than one row fits (``n`` = number of fitting rows).
+    nothing or more than one row fits (``n`` = number of fitting rows). A row fits in time when it may
+    have been placed at or after the attempt (minute / day resolution of the history, see
+    :func:`history_row_latest_time`, plus ``HISTORY_TIME_SLACK`` for clock differences).
     """
     if bet.external_bet_id:
         hits = [r for r in records if r.external_bet_id == bet.external_bet_id]
@@ -174,7 +208,11 @@ def match_history_record(
             continue
         if r.market_name and not _names_fit(r.market_name, bet.market_raw):
             continue
-        if attempt is not None and r.placed_at is not None and r.placed_at + HISTORY_TIME_SLACK < attempt:
+        if (
+            attempt is not None
+            and r.placed_at is not None
+            and history_row_latest_time(r.placed_at) + HISTORY_TIME_SLACK < attempt
+        ):
             continue
         fits.append(r)
     if len(fits) == 1:
@@ -218,6 +256,29 @@ def _alert(
     report.alerts.append(message)
     log.warning("settlement alert: %s", message)
     db_state.audit(session, actor=ACTOR, action=action, details={"message": message, **details})
+
+
+#: ``bets.extra`` key listing the alert actions already raised for a bet (see :func:`_alert_once`).
+ALERTS_KEY = "settlement_alerts"
+
+
+def _alert_once(
+    session: Session,
+    report: SettlementReport,
+    bet: Bet,
+    action: str,
+    message: str,
+    details: dict[str, Any],
+) -> None:
+    """Like :func:`_alert`, but once per bet and action: a bet that stays UNKNOWN (or ambiguous, or
+    cashed out) would otherwise write the same audit row on every settlement pass, i.e. every few
+    minutes for as long as it stays open."""
+    sent = list((bet.extra or {}).get(ALERTS_KEY) or [])
+    if action in sent:
+        report.notes.append(message)
+        return
+    _alert(session, report, action, message, details)
+    bet.extra = {**dict(bet.extra or {}), ALERTS_KEY: [*sent, action]}
 
 
 class _Actuals:
@@ -282,7 +343,18 @@ def settle_bets(
             session.scalars(select(Bet.id).where(Bet.status == BetStatus.PLACING).order_by(Bet.id))
         )
     for bet_id in placing_ids:
-        _guarded(session_factory, report, bet_id, _reconcile_placing, records, claimed, now, grace, settings)
+        _guarded(
+            session_factory,
+            report,
+            bet_id,
+            {BetStatus.PLACING},
+            _reconcile_placing,
+            records,
+            claimed,
+            now,
+            grace,
+            settings,
+        )
 
     with session_factory() as session:
         open_ids = list(
@@ -296,11 +368,37 @@ def settle_bets(
             )
         )
     for bet_id in open_ids:
-        _guarded(session_factory, report, bet_id, _settle_placed, records, claimed, now, grace, settings)
+        _guarded(
+            session_factory,
+            report,
+            bet_id,
+            {BetStatus.PLACED},
+            _settle_placed,
+            records,
+            claimed,
+            now,
+            grace,
+            settings,
+        )
     for bet_id in paper_ids:
-        _guarded(session_factory, report, bet_id, _settle_paper, records, claimed, now, grace, settings)
+        _guarded(
+            session_factory,
+            report,
+            bet_id,
+            {BetStatus.DRY_RUN},
+            _settle_paper,
+            records,
+            claimed,
+            now,
+            grace,
+            settings,
+        )
 
-    _update_clv(session_factory, report, now=now)
+    try:
+        _update_clv(session_factory, report, now=now)
+    except Exception as exc:  # closing odds are analytics: never let them block the reconciliation
+        log.exception("closing odds / CLV update failed")
+        report.errors.append(f"clv: {type(exc).__name__}: {exc}")
     _reconcile_balance(session_factory, settings, executor, report, now=now)
     return report
 
@@ -309,13 +407,21 @@ def _guarded(
     session_factory: sessionmaker[Session],
     report: SettlementReport,
     bet_id: int,
+    expected: set[BetStatus],
     fn: Any,
     *args: Any,
 ) -> None:
+    """Run one step for one bet in its own transaction; an error is recorded, never raised.
+
+    The row is read ``FOR UPDATE`` (PostgreSQL; ignored by SQLite) and skipped when its status is no
+    longer ``expected``: a second settlement running at the same time (``cs2bot settle`` next to
+    ``cs2bot up``) waits for the first and then sees the bet already settled, so a payout can never
+    be booked twice (the ledger's one-entry-per-bet rule is enforced in code, not by the database).
+    """
     try:
         with session_factory() as session:
-            bet = session.get(Bet, bet_id)
-            if bet is None:
+            bet = session.get(Bet, bet_id, with_for_update=True)
+            if bet is None or bet.status not in expected:
                 return
             fn(session, bet, report, *args)
             session.commit()
@@ -346,6 +452,7 @@ def _fetch_history(
     try:
         records = list(executor.fetch_bet_history(since))
     except Exception as exc:
+        report.history_failed = True
         report.notes.append(f"bet history unavailable: {type(exc).__name__}: {exc}")
         log.warning("bet history unavailable: %s", exc)
         return None
@@ -388,9 +495,10 @@ def _reconcile_placing(
         return
     if n > 1:
         report.placing_open += 1
-        _alert(
+        _alert_once(
             session,
             report,
+            bet,
             "placing_ambiguous",
             f"bet {bet.id}: {n} bet-history rows fit this unconfirmed placement - check Betclic by hand",
             {"bet_id": bet.id},
@@ -406,13 +514,18 @@ def _reconcile_placing(
         at=now,
     )
     ledger.apply_placement(session, bet, result, settings)
+    # The bet may still exist (an unreadable history row is skipped by the executor): never decide
+    # this outcome again automatically (services.betting blocks it). A real bet that does exist
+    # shows up as a balance shortfall in the reconciliation of this same pass (which pauses).
+    bet.extra = {**dict(bet.extra or {}), UNCONFIRMED_NOT_FOUND_KEY: True}
     report.placing_failed += 1
     _alert(
         session,
         report,
         "placing_not_found",
         f"bet {bet.id} ({bet.selection_raw}, {bet.stake} PLN) was not found in the Betclic history and is "
-        "marked FAILED - please verify on Betclic that no such bet exists",
+        "marked FAILED - please verify on Betclic that no such bet exists (the bot will not bet this "
+        "outcome again)",
         {"bet_id": bet.id, "idempotency_key": bet.idempotency_key},
     )
 
@@ -460,22 +573,16 @@ def _settle_placed(
             )
         payout, _ = ledger.settle_bet(session, bet, outcome, settings, at=now)
         bet.extra = {**dict(bet.extra or {}), "settled_by": "bookmaker"}
-        if record.payout is not None and abs(record.payout - payout) > settings.executor.reconcile_tolerance:
-            _alert(
-                session,
-                report,
-                "payout_mismatch",
-                f"bet {bet.id}: Betclic paid {record.payout}, the ledger expected {payout}; the next "
-                "balance reconciliation books the difference",
-                {"bet_id": bet.id, "bookmaker_payout": str(record.payout), "ledger_payout": str(payout)},
-            )
+        if record.payout is not None:
+            _follow_bookmaker_payout(session, report, bet, outcome, record.payout, payout, settings, now=now)
         _count(report, outcome, paper=False)
         return
     if record is not None and record.status is BookmakerBetStatus.CASHOUT:
         report.unknown += 1
-        _alert(
+        _alert_once(
             session,
             report,
+            bet,
             "cashout_seen",
             f"bet {bet.id} shows a cash-out at Betclic (the bot never cashes out) - settle it by hand",
             {"bet_id": bet.id},
@@ -494,9 +601,10 @@ def _settle_placed(
         return
     if local.outcome is SettlementOutcome.UNKNOWN:
         report.unknown += 1
-        _alert(
+        _alert_once(
             session,
             report,
+            bet,
             "settlement_unknown",
             f"bet {bet.id} cannot be settled from the match data ({local.reason or 'unknown'}); "
             "it stays open",
@@ -506,6 +614,78 @@ def _settle_placed(
     ledger.settle_bet(session, bet, local.outcome, settings, at=now)
     bet.extra = {**dict(bet.extra or {}), "settled_by": "local", "settle_reason": local.reason}
     _count(report, local.outcome, paper=False)
+
+
+def plausible_bookmaker_payout(bet: Bet, outcome: SettlementOutcome, amount: Decimal) -> bool:
+    """Whether a payout read off the bet history can be true for this bet and outcome.
+
+    A bookmaker never returns more than ``stake x odds`` on a win (that is before any tax), more than
+    the stake on a void, or anything on a loss. A number outside that range is a misread row.
+    """
+    if not amount.is_finite() or amount < 0:
+        return False
+    stake = Decimal(bet.stake)
+    if outcome is SettlementOutcome.LOST:
+        return amount == 0
+    if outcome.is_refund:
+        return amount <= stake
+    odds = Decimal(bet.placed_odds if bet.placed_odds is not None else bet.requested_odds)
+    return Decimal(0) < amount <= quantize_money(stake * odds) + CENT
+
+
+def _follow_bookmaker_payout(
+    session: Session,
+    report: SettlementReport,
+    bet: Bet,
+    outcome: SettlementOutcome,
+    bookmaker_payout: Decimal,
+    ledger_payout: Decimal,
+    settings: Settings,
+    *,
+    now: datetime,
+) -> None:
+    """The bookmaker's payout is the truth for money: book the difference to the local amount.
+
+    ``ledger.settle_bet`` books the locally computed payout (tax rules from the settings). When the
+    history shows another plausible amount (e.g. Betclic keeps the stake tax on a void, or rounds the
+    winnings tax differently) an ADJUSTMENT entry brings the ledger to what was really credited and
+    the bet's ``payout`` / ``pnl`` follow, so P&L and loss limits use real money and the balance
+    reconciliation does not pause the bot for it. An implausible amount (a misread row) is not used;
+    the alert asks the owner to check, and the reconciliation compares with the real balance anyway.
+    """
+    paid = quantize_money(Decimal(bookmaker_payout))
+    diff = paid - quantize_money(ledger_payout)
+    if diff == 0:
+        return
+    details = {"bet_id": bet.id, "bookmaker_payout": str(paid), "ledger_payout": str(ledger_payout)}
+    if not plausible_bookmaker_payout(bet, outcome, paid):
+        _alert(
+            session,
+            report,
+            "payout_mismatch",
+            f"bet {bet.id}: the Betclic history shows an implausible payout {paid} for a {outcome.value} "
+            f"bet (expected {ledger_payout}); the ledger keeps its own amount - please check",
+            details,
+        )
+        return
+    ledger.record_adjustment(
+        session,
+        diff,
+        f"bet {bet.id}: Betclic paid {paid}, settlement computed {ledger_payout}",
+        at=now,
+    )
+    bet.payout = paid
+    bet.pnl = paid - quantize_money(Decimal(bet.stake))
+    bet.extra = {**dict(bet.extra or {}), "local_payout": str(ledger_payout)}
+    if abs(diff) > settings.executor.reconcile_tolerance:
+        _alert(
+            session,
+            report,
+            "payout_mismatch",
+            f"bet {bet.id}: Betclic paid {paid}, the local tax rules gave {ledger_payout}; the ledger "
+            "follows Betclic (check the tax settings if this repeats)",
+            details,
+        )
 
 
 def _settle_paper(
@@ -575,6 +755,18 @@ def _update_clv(session_factory: sessionmaker[Session], report: SettlementReport
         session.commit()
 
 
+def _open_real_bets(session: Session) -> bool:
+    """Whether real bets are still open (placed or unconfirmed) after this pass."""
+    return (
+        session.scalar(
+            select(Bet.id)
+            .where(Bet.status.in_([BetStatus.PLACED, BetStatus.PLACING]), Bet.dry_run.is_(False))
+            .limit(1)
+        )
+        is not None
+    )
+
+
 def _reconcile_balance(
     session_factory: sessionmaker[Session],
     settings: Settings,
@@ -599,6 +791,11 @@ def _reconcile_balance(
         return
     try:
         with session_factory() as session:
+            if report.history_failed and _open_real_bets(session):
+                # Betclic may already have credited bets the history would have settled; booking that
+                # as a reconciliation now and the local settlement later would count it twice.
+                report.notes.append("balance reconciliation skipped: the bet history was unavailable")
+                return
             if session.scalar(select(BankrollLedger.id).limit(1)) is None:
                 ledger.ensure_initialized(session, settings, at=now, opening_balance=balance)
             result = ledger.reconcile(

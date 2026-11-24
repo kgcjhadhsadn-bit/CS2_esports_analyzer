@@ -329,6 +329,8 @@ def test_crash_after_handing_the_order_to_the_executor_never_double_bets(world: 
     rows = bets(world)
     assert len(rows) == 1 and rows[0].status is BetStatus.PLACING
     crashed = rows[0]
+    # the attempt time was committed with the PLACING status, before the executor was called
+    assert crashed.extra.get(ledger.PLACEMENT_ATTEMPTED_AT_KEY)
 
     # restart: the PLACING bet blocks its outcome; other outcomes may be bet, the crashed one never again
     rep = run_betting_cycle(
