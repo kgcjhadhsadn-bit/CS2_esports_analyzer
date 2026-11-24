@@ -1,0 +1,2 @@
+# Line endings: these scripts run on Linux (bash, systemd, Caddy) and inside the container.
+* text eol=lf

@@ -311,84 +311,13 @@ install -d -m 700 -o "$APP_USER" -g "$APP_GID" "$TARGET_DIR/backups"
 # ---------------------------------------------------------------------------------------- 7. .env
 log "7/8 Configuration file .env"
 ENV_PATH="$TARGET_DIR/.env"
+init_args=(--uid "$APP_UID" --gid "$APP_GID")
+if [[ -n "$DOMAIN" ]]; then
+    init_args+=(--domain "$DOMAIN")
+fi
+as_app bash "$TARGET_DIR/deploy/linux/init-env.sh" "${init_args[@]}"
 # shellcheck source=deploy/linux/common.sh
 . "$TARGET_DIR/deploy/linux/common.sh"
-
-gen_hex() { openssl rand -hex "$1"; }
-# Letters and digits only: no character that needs quoting in .env, a URL or a shell.
-gen_password() { openssl rand -base64 48 | tr -dc 'A-Za-z0-9' | head -c "$1"; }
-
-public_host="$DOMAIN"
-if [[ -z "$public_host" ]]; then
-    public_host="$(ip -4 route get 1.1.1.1 2>/dev/null | awk '{for (i = 1; i < NF; i++) if ($i == "src") print $(i + 1)}' | head -n 1)"
-fi
-is_ip() { [[ "$1" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ || "$1" == *:*:* ]]; }
-if [[ -z "$DOMAIN" && "$public_host" =~ ^(10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[01])\.) ]]; then
-    warn "this VPS's own address $public_host is private (NAT): put the public IP or a domain into CS2BOT_PUBLIC_HOST in .env"
-fi
-
-fresh=0
-if [[ ! -f "$ENV_PATH" ]]; then
-    [[ -f "$TARGET_DIR/.env.example" ]] || die "$TARGET_DIR/.env.example is missing"
-    install -m 600 -o "$APP_USER" -g "$APP_GID" "$TARGET_DIR/.env.example" "$ENV_PATH"
-    printf '\n# --- VPS settings (deploy/linux/provision.sh, docs/VPS_SETUP.md) --------------------\n' >>"$ENV_PATH"
-    fresh=1
-fi
-chown "$APP_USER:$APP_GID" "$ENV_PATH"
-chmod 600 "$ENV_PATH"
-
-# set_default KEY VALUE: on a fresh .env always; on an existing one only when KEY is missing/empty.
-set_default() {
-    local key="$1" value="$2"
-    if ((fresh)) || [[ -z "$(env_get "$key" "$ENV_PATH")" ]]; then
-        env_set "$key" "$value" "$ENV_PATH"
-    fi
-}
-
-set_default COMPOSE_FILE docker-compose.cloud.yml
-set_default APP_UID "$APP_UID"
-set_default APP_GID "$APP_GID"
-set_default CS2BOT_ENVIRONMENT prod
-set_default CS2BOT_LOG_JSON true
-set_default POSTGRES_USER cs2bot
-set_default POSTGRES_DB cs2bot
-[[ -n "$(env_get POSTGRES_PASSWORD "$ENV_PATH")" ]] || env_set POSTGRES_PASSWORD "$(gen_hex 24)" "$ENV_PATH"
-pg_user="$(env_get POSTGRES_USER "$ENV_PATH")"
-pg_db="$(env_get POSTGRES_DB "$ENV_PATH")"
-pg_password="$(env_get POSTGRES_PASSWORD "$ENV_PATH")"
-# Informational on the VPS: docker-compose.cloud.yml builds the app's URL from POSTGRES_* itself.
-env_set CS2BOT_DATABASE__URL "postgresql+psycopg://${pg_user:-cs2bot}:${pg_password}@postgres:5432/${pg_db:-cs2bot}" "$ENV_PATH"
-# The API listens on the container network (Caddy in front): password + session secret required.
-set_default CS2BOT_API__HOST 0.0.0.0
-[[ -n "$(env_get CS2BOT_API__PASSWORD "$ENV_PATH")" ]] || env_set CS2BOT_API__PASSWORD "$(gen_password 24)" "$ENV_PATH"
-[[ -n "$(env_get CS2BOT_API__SESSION_SECRET "$ENV_PATH")" ]] || env_set CS2BOT_API__SESSION_SECRET "$(gen_hex 32)" "$ENV_PATH"
-if [[ -n "$DOMAIN" ]]; then
-    env_set CS2BOT_PUBLIC_HOST "$DOMAIN" "$ENV_PATH"
-    env_set CS2BOT_TLS_MODE auto "$ENV_PATH"
-elif [[ -n "$public_host" ]]; then
-    if [[ -z "$(env_get CS2BOT_PUBLIC_HOST "$ENV_PATH")" ]]; then
-        env_set CS2BOT_PUBLIC_HOST "$public_host" "$ENV_PATH"
-        if is_ip "$public_host"; then
-            env_set CS2BOT_TLS_MODE internal "$ENV_PATH"
-        else
-            env_set CS2BOT_TLS_MODE auto "$ENV_PATH"
-        fi
-    fi
-fi
-# Unattended operation (PLAN.md 0b); real money only after the dry-run smoke test (VPS_SETUP.md).
-set_default CS2BOT_EXECUTOR__DRY_RUN true
-set_default CS2BOT_EXECUTOR__HEADLESS false
-set_default CS2BOT_AUTONOMY__ENABLED true
-set_default CS2BOT_AUTONOMY__AUTO_LOGIN true
-set_default CS2BOT_BETCLIC__CREDENTIALS_SOURCE env
-set_default CS2BOT_TELEGRAM__ENABLED true
-chown "$APP_USER:$APP_GID" "$ENV_PATH"
-chmod 600 "$ENV_PATH"
-if ((fresh)); then
-    log ".env created with generated secrets (chmod 600). Fill in the remaining values (see below)."
-else
-    log ".env existed: kept your values, added only what was missing"
-fi
 
 # -------------------------------------------------------------------------- 8. timers, logrotate
 log "8/8 systemd timers (backup, Docker clean-up) and logrotate"
@@ -413,7 +342,7 @@ Next steps (docs/VPS_SETUP.md explains each one):
        CS2BOT_TELEGRAM__BOT_TOKEN / CS2BOT_TELEGRAM__CHAT_ID, bankroll and limits.
        Keep CS2BOT_EXECUTOR__DRY_RUN=true until the smoke test passed.
   2. Start it:              sudo -u $APP_USER $TARGET_DIR/deploy/linux/deploy.sh
-  3. Dashboard:             https://$(env_get CS2BOT_PUBLIC_HOST "$ENV_PATH")   user: $(env_get CS2BOT_API__USERNAME "$ENV_PATH" || true)
+  3. Dashboard:             https://$(env_get CS2BOT_PUBLIC_HOST "$ENV_PATH")   user: $(env_get CS2BOT_API__USERNAME "$ENV_PATH")
                             password: sudo grep CS2BOT_API__PASSWORD $ENV_PATH
 
 Deploy key of the $APP_USER user (only needed for 'git pull' of a private repository):
