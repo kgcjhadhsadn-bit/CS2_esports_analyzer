@@ -585,6 +585,40 @@ def test_apply_placement_real_placement_of_a_dry_run_row_is_booked_as_real(
     assert "REAL placement" in caplog.text
 
 
+def test_apply_placement_uncertain_dry_run_counts_as_a_real_open_bet(
+    session: Session, settings: Settings, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Review round 2: the executor answers UNCERTAIN in dry-run mode when a click may have placed
+    a bet (quick-bet mode). A row left as a dry run was invisible to the exposure, the guards, the
+    duplicate check for real betting and the reconcile deferral."""
+    from cs2bot.engine import bankroll, decision
+
+    ledger.ensure_initialized(session, settings, at=T0)
+    add_match(session, match_id=8)
+    bet = add_bet(session, stake="20", status=BetStatus.PENDING, match_id=8, dry_run=True, created_at=T0)
+    with caplog.at_level("ERROR"):
+        status = ledger.apply_placement(session, bet, placement(PlacementStatus.UNCERTAIN), settings)
+    assert status is BetStatus.PLACING and bet.dry_run is False and not ledger.is_dry_run(bet)
+    assert "REAL placement" in caplog.text
+    state_now = bankroll.compute_state(session, settings, now=T0 + timedelta(minutes=10))
+    assert state_now.exposure_by_match == {8: Decimal("20.00")} and state_now.reserved_stakes == Decimal(
+        "20.00"
+    )
+    assert decision.bet_key(8, bet.spec_key, bet.selection_key) in decision.load_already_bet_keys(
+        session, 8, include_dry_run=False
+    )
+    # the bookmaker took the money: the shortfall is explained by the unconfirmed bet, not flagged
+    check = ledger.reconcile(
+        session, Decimal("980.00"), tolerance=Decimal("0.05"), at=T0 + timedelta(hours=1)
+    )
+    assert check.deferred and not check.flagged and not check.paused
+    # reconciliation shows it never existed: the reservation is released
+    ledger.apply_placement(session, bet, placement(PlacementStatus.FAILED), settings)
+    assert bankroll.compute_state(session, settings, now=T0 + timedelta(hours=2)).reserved_stakes == Decimal(
+        "0"
+    )
+
+
 def test_apply_placement_refuses_impossible_transitions(session: Session, settings: Settings) -> None:
     ledger.ensure_initialized(session, settings)
     placed = add_bet(session, stake="10", status=BetStatus.PLACED)
@@ -642,12 +676,28 @@ def test_reconcile_mismatch_pauses_trading_until_the_owner_confirms(
     assert quiet.flagged and not quiet.paused and state.is_trading_halted(session) == (False, None)
 
 
-def test_reconcile_does_not_overwrite_another_pause_reason(session: Session, settings: Settings) -> None:
+def test_reconcile_adds_the_mismatch_to_another_pause_reason(session: Session, settings: Settings) -> None:
+    """Review round 2: the mismatch used to be dropped when the bot was already paused (e.g. by the
+    daily loss limit); the owner, resuming for that reason, never saw it in the dashboard."""
     ledger.ensure_initialized(session, settings)
     state.set_paused(session, True, actor="system", reason="daily loss limit reached")
-    result = ledger.reconcile(session, Decimal("900.00"), tolerance=Decimal("0.05"))
-    assert result.flagged and not result.paused
-    assert state.get_pause(session) == (True, "daily loss limit reached")
+    result = ledger.reconcile(session, Decimal("900.00"), tolerance=Decimal("0.05"), at=T0)
+    assert result.flagged and not result.paused  # it did not pause a running bot
+    paused, reason = state.get_pause(session)
+    assert paused and reason is not None
+    assert reason.startswith("daily loss limit reached; balance mismatch") and "-100.00" in reason
+    # the same reason is never appended twice
+    assert ledger.pause_trading(session, "daily loss limit reached") is False
+    assert state.get_pause(session)[1] == reason
+
+
+def test_pause_trading_keeps_every_reason_within_a_bounded_length(session: Session) -> None:
+    assert ledger.pause_trading(session, "first problem") is True
+    for i in range(200):
+        assert ledger.pause_trading(session, f"problem {i} " + "x" * 40) is False
+    paused, reason = state.get_pause(session)
+    assert paused and reason is not None and len(reason) <= ledger.MAX_PAUSE_REASON_CHARS
+    assert reason.startswith("first problem") and reason.endswith("problem 199 " + "x" * 40)
 
 
 def test_reconcile_defers_while_an_unconfirmed_placement_can_explain_the_shortfall(

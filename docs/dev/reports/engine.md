@@ -2,7 +2,7 @@
 
 > Written by the engineer who implemented the package. Reviewers update it when the public API changes.
 
-**Tests:** `.venv/bin/python -m pytest tests/engine -q` - 552 passed, 0 failed, about 35 s single-process (lint/type clean: True)
+**Tests:** `.venv/bin/python -m pytest tests/engine -q` - 567 passed, 0 failed, about 60 s single-process, 35 s with `-n 2` (lint/type clean: True)
 
 ## Summary
 
@@ -62,6 +62,7 @@ All functions only `session.flush()`; they never commit (the caller owns the tra
 - `price_quotes(prediction: MatchPrediction, quotes: Iterable[OddsQuote], *, sigma_floor: float, include_overtime_in_totals=None, h2h_tie=None, betclic=None) -> list[tuple[OutcomeProbability, OddsQuote]]`: skips unpriceable quotes and logs the reason at INFO. One broken quote never aborts the batch.
 - `price_quotes_report(...same args...) -> PricingReport`: also returns the skipped quotes with reasons (for the dashboard).
 - `fallback_sigma(p_win: float, prediction: MatchPrediction) -> float`
+- Correct-score selections (`CORRECT_MAP_SCORE`, `MAP_CORRECT_SCORE`) must be a possible final score of the format / a possible final CS2 map score, even when a malformed pmf carries a key for them (settlement leaves such a bet UNKNOWN) **(review round 2)**.
 - Shared with settlement: `compare_to_line(value: float, line: float) -> int` (+1 / 0 / −1), `rounds_value(team1_rounds: int, team2_rounds: int, *, include_overtime: bool, team: str | None = None) -> int`, `is_final_round_score(team1_rounds: int, team2_rounds: int) -> bool`, `final_map_scores(fmt: MatchFormat) -> set[tuple[int, int]]`.
 - Constants: `REGULATION_ROUNDS = 24`, `ROUNDS_TO_WIN_REGULATION = 13`, `FIRST_OVERTIME_WIN = 16`, `PMF_TOLERANCE = 0.02` (pmfs further than this from summing to 1 are unpriceable; others are renormalised).
 
@@ -151,7 +152,7 @@ All functions only `session.flush()`; they never commit (the caller owns the tra
 - `total_open_stakes(state: BankrollState) -> Decimal`: every stake at risk, whenever it was placed.
 - `check_loss_limits(session: Session, state: BankrollState, settings: Settings | BankrollSettings, *, actor: str = "system", now: datetime | None = None) -> bool`
   - True while the daily or weekly realized-loss limit is reached.
-  - Calls `db.state.set_paused(True, reason=…)` once per period; it never resumes.
+  - Pauses through `ledger.pause_trading(...)` once per period; it never resumes. An existing pause keeps its reason and gets the limit appended **(review round 2)**.
 - `loss_limit_status(state: BankrollState, settings: BankrollSettings) -> LossLimitStatus`. Fields: daily_limit, weekly_limit (rounded DOWN to the grosz), realized_loss_today, realized_loss_week, daily_allowance, weekly_allowance, daily_hit, weekly_hit, open_stakes.
 - Constants: `OPEN_STATUSES`, `SETTLED_STATUSES`, `COUNTED_STATUSES`, `LOSS_LIMIT_STATE_KEY = "loss_limit_pauses"`.
 
@@ -171,13 +172,13 @@ All functions only `session.flush()`; they never commit (the caller owns the tra
   - Applies the executor's answer using `cs2bot.domain.betting.bet_status_after_placement`.
   - PLACED: sets placed_odds (reported odds, else requested), placed_at (`result.at`, or the attempt time for a bet confirmed later), external_bet_id, tax, potential_payout and `extra["stake_tax_rate"]`, then debits the stake. A row created as a dry run that was really placed becomes a real bet (logged as an error).
   - DRY_RUN: marks the row `dry_run`; the ledger is not touched.
-  - PLACING (UNCERTAIN): nothing is debited; the stake stays reserved and counts as exposure. The attempt time is kept in `extra["placement_attempted_at"]`. Call again with a PLACED or FAILED result once the bet history has been checked.
+  - PLACING (UNCERTAIN): nothing is debited; the stake stays reserved and counts as exposure. The attempt time is kept in `extra["placement_attempted_at"]`. Call again with a PLACED or FAILED result once the bet history has been checked. A dry-run row becomes a real one here (logged as an error): the executor answers UNCERTAIN in dry-run mode only when money may have moved (quick-bet click), and dry-run rows count for no exposure, guard, duplicate check or reconcile deferral **(review round 2)**.
   - FAILED (everything else): no money at risk; a stake that was already debited is refunded.
   - Only PENDING / PLACING bets take a result. Replaying the same result is a no-op; any other transition raises LedgerConflictError.
 - `@dataclass(frozen=True) class ReconcileResult(observed_balance: Decimal, ledger_balance: Decimal, difference: Decimal, tolerance: Decimal, flagged: bool, entry_id: int | None, at: datetime, deferred: bool = False, paused: bool = False)`
 - `reconcile(session: Session, observed_balance: Decimal, *, tolerance: Decimal, actor: str = "system", at: datetime | None = None, pause_on_flag: bool = True) -> ReconcileResult`
   - Writes a RECONCILIATION entry for any non-zero difference.
-  - Flags when |difference| > tolerance: audit log, warning, and (**review round 1**) a trading pause with the numbers in the reason unless `pause_on_flag=False`. An existing pause is left untouched.
+  - Flags when |difference| > tolerance: audit log, warning, and (**review round 1**) a trading pause with the numbers in the reason unless `pause_on_flag=False`. An existing pause stays and gets the mismatch appended to its reason (**review round 2**; it used to be dropped, so resuming after a loss-limit pause hid the mismatch). `paused` is True only when this call paused a running bot.
   - Deferred (**review round 1**): a shortfall of at most the stakes of un-debited PENDING / PLACING bets (+ tolerance) is neither booked nor flagged; resolve those bets and reconcile again.
   - Stores the result in `system_state["last_reconciliation"]`. Raises ValueError for a non-finite balance.
 - `settle_amounts(bet: Bet, outcome: SettlementOutcome | Literal["won","lost","void","push"] | str, settings: TaxSource) -> tuple[Decimal, Decimal]`: returns (payout, pnl), consistent with ev.net_payout. Void and push refund the gross stake (or stake − tax when `void_refunds_stake_tax` is off). UNKNOWN raises ValueError.
@@ -185,10 +186,11 @@ All functions only `session.flush()`; they never commit (the caller owns the tra
   - Sets status, payout, pnl, settled_at, `extra["settled_outcome"]` and writes the ledger entries in one step.
   - Real bets must be PLACED. Dry-run bets keep status DRY_RUN and never touch the ledger (paper P&L is stored on the row).
   - Idempotent for the same outcome (void and push count as the same refund); a different outcome raises LedgerConflictError.
+- `pause_trading(session: Session, reason: str, *, actor: str = "system") -> bool` **(new in review round 2)**: pauses a running bot (returns True), or appends `reason` to the reason of an existing pause (returns False; a reason already present is not repeated; the text is capped at `MAX_PAUSE_REASON_CHARS = 2000`, keeping its start and the newest reason). Used by `reconcile` and `bankroll.check_loss_limits`, so safety controls never hide each other.
 - `bet_money_fields(stake: Decimal, odds: Decimal, settings: TaxSource) -> dict[str, object]`: returns `{"tax", "potential_payout", "extra": {"stake_tax_rate": "0.12"}}` for a new Bet row.
 - `bet_stake_tax(bet: Bet, settings: TaxSource) -> Decimal`: uses `extra["stake_tax_rate"]`, else a positive `bets.tax`, else settings.
 - `is_dry_run(bet: Bet) -> bool`
-- Constants: `STAKE_TAX_RATE_KEY`, `PLACEMENT_STATUS_KEY`, `PLACEMENT_ATTEMPTED_AT_KEY`, `SETTLED_OUTCOME_KEY`.
+- Constants: `STAKE_TAX_RATE_KEY`, `PLACEMENT_STATUS_KEY`, `PLACEMENT_ATTEMPTED_AT_KEY`, `SETTLED_OUTCOME_KEY`, `MAX_PAUSE_REASON_CHARS`.
 
 ## cs2bot.engine.settlement
 - `resolve_outcome(spec: MarketSpec, selection: str, actuals: MatchActuals, *, include_overtime_in_totals: bool | None = None, h2h_tie: str | None = None, betclic: BetclicSettings | None = None, player_teams: Mapping[int, TeamSlot] | None = None) -> SettlementOutcome`
@@ -205,7 +207,7 @@ All functions only `session.flush()`; they never commit (the caller owns the tra
 ## Bet lifecycle for the integration layer
 1. **Go-live:** `ledger.ensure_initialized(session, settings, opening_balance=executor.get_balance())` so the ledger starts from the real account.
 2. **Decide and size:** `bankroll.size_decisions(...)` for a batch, or recompute `compute_state` after each bet row. Use `load_already_bet_keys(include_dry_run=False)` when betting for real.
-3. **Create the row:** status PENDING, `min_acceptable_odds = decision.min_acceptable_odds(...)`, `**ledger.bet_money_fields(...)`. Commit before calling the executor.
+3. **Create the row:** status PENDING, `dry_run=` the executor's real dry-run state (**set it explicitly**: the column defaults to True, and a dry-run row is invisible to compute_state, so a real PENDING bet created with the default would not count as exposure until the executor answers), `min_acceptable_odds = decision.min_acceptable_odds(...)`, `**ledger.bet_money_fields(...)`. Commit before calling the executor.
 4. **Place:** check `db.state.is_trading_halted`, call the executor, then `ledger.apply_placement(session, bet, result, settings)`.
 5. **Unconfirmed placements:** look the bet up in the bookmaker's history and call `apply_placement` again with PLACED or FAILED. Never retry them.
 6. **Settle:** `settlement.resolve_bet(bet, actuals)`; WON / LOST / VOID / PUSH go to `ledger.settle_bet`. UNKNOWN stays open and is settled from the bookmaker's history.
@@ -235,6 +237,7 @@ All functions only `session.flush()`; they never commit (the caller owns the tra
 ## Foundation change requests
 
 - db.models.BankrollLedger: add a partial unique index on `(bet_id, kind)` for rows with a bet id, so the one-entry-per-bet-and-kind rule holds even if two sessions write at once.
+- db.models.Bet.dry_run (review round 2): drop `default=True` so every insert has to state it. Dry-run rows are excluded from exposure, the loss guards and the reconcile deferral; a real PENDING row created with the default is invisible to `compute_state` until the executor answers (`apply_placement` then corrects it).
 - config.BankrollSettings.stake_step: change the default from 0.10 to 0.50 (or 1.00). 12% of the stake is then a whole number of grosze, so the stake tax and the payout have no rounding ambiguity against Betclic.
 - domain.results.MatchActuals: add `player_teams: dict[int, TeamSlot]` (filled by `datasets.load_match_actuals` from the lineups). Settlement already reads it when present, so team-restricted top-fragger markets settle locally without an extra argument.
 - models.match_engine (P6): publish `p_team1_race_to` and `p_neither_race_to` for overtime targets (N > 13) in `MapSlotPrediction`; the field exists and pricing uses it. Optionally publish conditional multi-map kill scopes such as `maps:1,2,3` for BO3.
@@ -279,3 +282,31 @@ The round started from an interrupted review: `settlement.py` and the settings a
 - The reconcile pause is new behaviour for the integration layer: the first reconciliation of an account whose balance differs from `starting_bankroll` pauses the bot unless the ledger is opened with `opening_balance`.
 - Head-to-head kill markets assume independent players (see Known limitations). By a rough estimate the bias is small for single maps and conservative for favourites over several maps; it has not been measured on real data.
 - `kelly_fraction_used` on a `BetDecision` is the fraction actually staked after caps, not the configured Kelly multiplier; the integration layer should store it under that meaning.
+
+## Review round 2
+
+Focus: the pricing <-> simulator contract end to end, settlement vs pricing for every market type, bankroll guards under adversarial sequences, rounding. Everything was re-read and run; round 1's work was not repeated.
+
+**Verified (no change needed):**
+- Settlement against the REAL map simulator, not a second hand-written one: `MapSimulator.simulate(..., record_rounds=True)` plays are rebuilt as finished maps (regulation rounds from the simulator's log, overtime order reconstructed to reproduce the simulator's own race records) and settled one by one. Pricing the slot the simulator published equals the settled frequencies to 1e-9 for every map-slot market type (map winner, round handicap, totals, team totals, odd/even, map correct score, overtime, pistols 1 / 13, halves 1 / 2 incl. draws, race to 1..16 incl. voids), with and without overtime in the totals, as simulated and after `reweighted` (the match engine's calibration). Two deliberate settlement mutations (half 2 including overtime, pistol round 13 read as round 1) make it fail.
+- Coherence of the real `build_match_prediction` output that pricing relies on, BO1 / BO2 / BO3 / BO5, central / low / high: `p_team1_win` and `p_draw` equal the sums of `map_score_pmf`; slot `p_played` equals P(series lasts >= k maps); sum over slots of p_played x p_team1_win equals E[maps won by team1]; slot `p_team1_win` / `p_overtime` equal their score pmfs (all to 1e-15). `player_kills_by_scope["map:k"]` is the slot's `players` dict.
+- Head-to-head kills, exactly: on populations where the two players' kill totals are exactly independent inside the scope (cross product of series x kill vectors), pricing equals settlement to 1e-9 for `map:k`, `maps:1,2`, `maps:1,2,3` and the BO2 match scope, handicaps -2.5 / -1 / 0 / +3, both tie rules. (Round 1 could only check this to +-0.07.)
+- Top fragger, exactly: with kills `50 r + i` no two players can tie in any scope; pricing equals settlement to 1e-9 for every scope, team-restricted tables included, and the selections sum to 1 - void.
+- Settlement fuzzed with 40,000 random malformed results (impossible scores, histories of the wrong length or order, negative kills, wrong map numbers, unfinished / forfeited / cancelled) and specs (NaN / inf lines, bad halves and rounds): never raises.
+- Bankroll guards under adversarial sequences (new test, 2 seeds in the suite and 60 more run once): batches sized from one snapshot with `size_decisions` (most decisions on one match), refunds that keep the stake tax, tax-free promo days, "wins" at odds 1.07 / 1.12 that lose money, settlements dated back to any moment after placement (also across local midnight onto a finished day), deposits mid-day, the autumn DST change. No stake above 2 % of the bankroll, no match above 4 %, every stake a multiple of the step and >= the Betclic minimum, the batch within the free balance and within the daily / weekly guard, the ledger equal to the test's own cash book, no reconcile flag, and the realized net loss of every local day (week) <= 5 % (10 %) of the day-start (week-start) bankroll the engine saw last in that period. The worst day reaches 4.999 %.
+- Derivation behind that invariant (with back-dating): a loss S back-dated into day D-1 lowers D's day-start bankroll by S and D's open stakes by S, so D's allowance changes by +0.95 S and the bound `loss_D <= 0.05 x day-start_D` still holds; open stakes carried into a day are <= 5 % of its day-start bankroll by the same argument.
+- Rounding: stakes are rounded down and never exceed a cap; limits are rounded down; `min_acceptable_odds` rounds up; the stake-tax rounding difference against a Betclic that does not round the tax is at most 0.004 x odds per bet (under the 0.05 reconcile tolerance below odds 12.5); the złoty rounding of the winnings tax and the threshold comparison (2,280.00 exempt, 2,280.01 taxed) re-checked.
+
+**Issues found and fixed:**
+1. *Major:* an UNCERTAIN placement result on a dry-run row (the executor returns UNCERTAIN in dry-run mode when a selection click may have placed a quick bet) left the row as a dry run in PLACING. Dry-run rows are excluded from exposure, the loss guards, the real-betting duplicate check and the reconcile deferral, so a bet that may exist at Betclic was invisible to every limit, and the shortfall it caused was flagged instead of deferred. `apply_placement` now turns the row into a real open bet (logged as an error) until reconciliation resolves it. Test added.
+2. *Major:* `reconcile` dropped a balance mismatch when the bot was already paused (e.g. by the daily loss limit): only the audit log recorded it, so the owner, resuming for the loss limit, never saw it - the misread-balance risk round 1 fixed came back through that path. Symmetrically, `check_loss_limits` overwrote the reason of an existing pause (e.g. a balance mismatch). New `ledger.pause_trading` appends to an existing pause reason (bounded length, no repeats); both use it. Tests added (the round-1 test asserting the old behaviour was rewritten).
+3. *Minor:* pricing priced a correct-score selection that is not a possible final score whenever a malformed pmf carried a key for it, while settlement leaves such a bet UNKNOWN forever. Pricing now refuses it like settlement. Test added.
+4. *Minor (tests):* the pricing <-> settlement consistency for head-to-head and top-fragger markets was only statistical / bounded, and settlement had never been checked against the real simulator's plays. Added `test_engine_sim_settlement.py`, `test_engine_settlement_props.py` and `test_engine_adversarial.py`.
+
+**Tests added:** test_engine_sim_settlement.py (3), test_engine_settlement_props.py (6), test_engine_adversarial.py (2), plus new cases in the ledger, bankroll and pricing modules. 567 tests in total (552 before this round).
+
+**Remaining concerns:**
+- A payout Betclic credits before our own settlement (our match data lags) is booked by `reconcile` as a flagged mismatch and pauses the bot; the later local settlement then credits it again (corrected, and flagged, by the next reconcile). The integration layer must settle open bets from the bookmaker's bet history (`executor` bet history: WON / LOST / VOID with the payout) before every reconciliation, not only from `settlement.resolve_bet`.
+- `MatchActuals.forfeited` voids every bet, also bets on maps that were completed before a forfeit; Betclic usually lets completed maps stand. The ledger follows Betclic through reconcile, but such a bet would be refunded locally and flagged. Settle partially played forfeits from the bookmaker's history.
+- The `match` scope of head-to-head kills in a BO3 / BO5 is priced with independent totals although both grow with the number of maps played (documented limitation; conservative for favourites).
+- The winnings-tax branch of `size_stake` may stake above the tax-free limit when that has a higher expected log-growth even if the EV after the 10 % tax falls below `min_ev`; it only matters for bankrolls above roughly 8,600 PLN.

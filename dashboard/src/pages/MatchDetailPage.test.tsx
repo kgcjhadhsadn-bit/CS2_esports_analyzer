@@ -1,8 +1,8 @@
-import { screen, within } from "@testing-library/react";
+import { screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { Route, Routes } from "react-router-dom";
 import { describe, expect, it } from "vitest";
-import { matchDetail, oddsHistory } from "../test/fixtures";
+import { configOut, matchDetail, oddsHistory } from "../test/fixtures";
 import { mockApi, renderWithProviders } from "../test/utils";
 import MatchDetailPage from "./MatchDetailPage";
 
@@ -38,6 +38,40 @@ describe("MatchDetailPage", () => {
     expect(screen.getByText("Player kill projections")).toBeInTheDocument();
     expect(screen.getByText(/Predicted map per slot/)).toBeInTheDocument();
     expect(screen.getAllByText("s1_awper").length).toBeGreaterThan(0);
+  });
+
+  it("expands a player's kill distribution with the keyboard", async () => {
+    const user = userEvent.setup();
+    renderPage();
+    await user.click(await screen.findByRole("tab", { name: "Model" }));
+    const row = (await screen.findAllByText("s1_awper")).map((el) => el.closest("tr")).find((tr) => tr !== null);
+    expect(row).toBeTruthy();
+    expect(row).toHaveAttribute("tabindex", "0");
+    expect(row).toHaveAttribute("aria-expanded", "false");
+    (row as HTMLElement).focus();
+    await user.keyboard("{Enter}");
+    expect(row).toHaveAttribute("aria-expanded", "true");
+    expect(screen.getByRole("img", { name: "kills distribution" })).toBeInTheDocument();
+  });
+
+  it("colours data completeness against the effective threshold", async () => {
+    mockApi({
+      "GET /api/matches/101": { ...matchDetail, match: { ...matchDetail.match, data_completeness: 0.92 } },
+      "GET /api/matches/101/odds-history": oddsHistory,
+      "GET /api/control/config": {
+        ...configOut,
+        effective: { ...configOut.effective, decision: { ...configOut.effective.decision, min_data_completeness: 0.9 } },
+      },
+    });
+    renderWithProviders(
+      <Routes>
+        <Route path="/matches/:id" element={<MatchDetailPage />} />
+      </Routes>,
+      { route: "/matches/101" },
+    );
+    const badge = await screen.findByTitle(/data completeness 92\.0%/);
+    await waitFor(() => expect(badge).toHaveClass("badge-pos"));
+    expect(badge.getAttribute("title")).toContain("≥ 90%");
   });
 
   it("renders the rationale safely and only links https evidence", async () => {

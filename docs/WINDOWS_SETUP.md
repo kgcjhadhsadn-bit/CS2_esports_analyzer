@@ -118,7 +118,7 @@ The installer opens `C:\cs2bot\.env` in Notepad (later: `notepad C:\cs2bot\.env`
 | Setting | What to put there |
 |---|---|
 | `CS2BOT_PANDASCORE__API_TOKEN` | Your PandaScore token. |
-| `ANTHROPIC_API_KEY` | Your Anthropic API key (`sk-ant-...`). |
+| `ANTHROPIC_API_KEY` | Your Anthropic API key (`sk-ant-...`). The `deploy\windows` scripts hand it to the bot. If you also run `uv run cs2bot ...` commands by hand and want Claude in those, write the key as `CS2BOT_LLM__API_KEY=sk-ant-...` instead (that name is read from `.env` in every case). |
 | `CS2BOT_BANKROLL__STARTING_BANKROLL` | The money (PLN) the bot may work with, e.g. `1000.00`. Should match what is on the Betclic account for the bot. |
 | `CS2BOT_BANKROLL__MAX_STAKE_FRACTION` | Largest single stake as a share of the bankroll (`0.02` = 2%). |
 | `CS2BOT_BANKROLL__MAX_MATCH_EXPOSURE_FRACTION` | Most money at risk on one match (`0.04` = 4%). |
@@ -403,10 +403,16 @@ market is worse than an unmapped one - when in doubt, leave it unmapped.
 Use the `.cmd` launchers (they allow the script for that one run), or run
 `powershell -ExecutionPolicy Bypass -File deploy\windows\<script>.ps1`.
 
-### "The bot is already running"
+### "The bot is already running" / "Another start.ps1 is already starting the bot"
 
 `start.cmd` found a running bot (maybe the autostart one, which has no window). The dashboard is at
 http://127.0.0.1:8000; stop it with `stop.cmd`.
+
+Only one start script runs at a time, so two bots can never run side by side. "Another start.ps1 is
+already starting the bot" means the autostart task is still waiting for Docker Desktop after
+sign-in (it waits up to 15 minutes), or an update / restore is running. Wait a few minutes and open
+the dashboard; if nothing comes up, look at the newest file in `logs\`, run `stop.cmd` and start
+again.
 
 ### The dashboard shows a notice instead of the web page
 

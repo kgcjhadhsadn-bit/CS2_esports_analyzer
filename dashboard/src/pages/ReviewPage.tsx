@@ -28,6 +28,20 @@ export function candidateAction(candidate: ReviewCandidate): ReviewActionIn {
     : { action: "relink", match_id: candidate.match.id, teams_swapped: candidate.teams_swapped };
 }
 
+export type ManualOrientation = "auto" | "same" | "swapped";
+
+const ORIENTATION_TEXT: Record<ManualOrientation, string> = {
+  auto: "team order detected from the names",
+  same: "Betclic lists our team1 first",
+  swapped: "Betclic lists our team2 first",
+};
+
+/** Body of a manual relink; "auto" leaves `teams_swapped` out so the API detects it. */
+export function manualRelinkBody(matchId: number, orientation: ManualOrientation): ReviewActionIn {
+  if (orientation === "auto") return { action: "relink", match_id: matchId };
+  return { action: "relink", match_id: matchId, teams_swapped: orientation === "swapped" };
+}
+
 function orientationText(item: ReviewItem, c: ReviewCandidate): string {
   const t1 = teamName(c.match.team1, "team1");
   const t2 = teamName(c.match.team2, "team2");
@@ -39,7 +53,9 @@ function orientationText(item: ReviewItem, c: ReviewCandidate): string {
 function ReviewCard({ item, onAction }: { item: ReviewItem; onAction: (a: PendingAction) => void }) {
   const ev = item.event;
   const [manualId, setManualId] = useState("");
-  const [manualSwapped, setManualSwapped] = useState(false);
+  // "auto" omits teams_swapped so the API detects the orientation from the team names; sending
+  // `false` by default would silently store "same order" for a match Betclic lists the other way.
+  const [manualOrientation, setManualOrientation] = useState<ManualOrientation>("auto");
   const manualMatchId = Number(manualId);
   const manualValid = Number.isInteger(manualMatchId) && manualMatchId > 0 && manualMatchId < 2 ** 31;
   return (
@@ -131,9 +147,9 @@ function ReviewCard({ item, onAction }: { item: ReviewItem; onAction: (a: Pendin
             if (!manualValid) return;
             onAction({
               eventId: ev.id,
-              body: { action: "relink", match_id: manualMatchId, teams_swapped: manualSwapped },
+              body: manualRelinkBody(manualMatchId, manualOrientation),
               title: "Relink to another match?",
-              description: `${ev.name} → match #${manualMatchId}${manualSwapped ? " (Betclic lists our team2 first)" : ""}.`,
+              description: `${ev.name} → match #${manualMatchId} (${ORIENTATION_TEXT[manualOrientation]}).`,
             });
           }}
         >
@@ -148,9 +164,15 @@ function ReviewCard({ item, onAction }: { item: ReviewItem; onAction: (a: Pendin
             value={manualId}
             onChange={(e) => setManualId(e.target.value)}
           />
-          <label className="row small">
-            <input type="checkbox" checked={manualSwapped} onChange={(e) => setManualSwapped(e.target.checked)} /> teams swapped
-          </label>
+          <select
+            aria-label="Team order"
+            value={manualOrientation}
+            onChange={(e) => setManualOrientation(e.target.value as ManualOrientation)}
+          >
+            <option value="auto">order: detect from names</option>
+            <option value="same">order: same as our match</option>
+            <option value="swapped">order: swapped</option>
+          </select>
           <button type="submit" className="btn btn-sm" disabled={!manualValid}>
             Relink
           </button>

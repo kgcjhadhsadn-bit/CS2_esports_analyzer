@@ -12,18 +12,24 @@ import type { TradingState } from "../api/types";
 import { formatDateTime } from "../lib/format";
 import { Badge, ConfirmDialog, ErrorState, Loading } from "./ui";
 
+/**
+ * The dialog's action is fixed when it opens (`target`): the state polls every 15 s, and a dialog
+ * that flipped from "Engage" to "Release" under the owner's cursor (because the engine or another
+ * tab changed the switch meanwhile) must never send the opposite of what was asked for.
+ */
 export function KillSwitch({ state }: { state: TradingState }) {
-  const [open, setOpen] = useState(false);
+  const [target, setTarget] = useState<boolean | null>(null);
   const mutation = useKillSwitch();
   const on = state.kill_switch.on;
-  const close = useCallback(() => setOpen(false), []);
+  const close = useCallback(() => setTarget(null), []);
+  const engage = target ?? !on;
   return (
     <div className="stack" style={{ gap: "0.5rem" }}>
       <button
         type="button"
         className={`btn kill-switch ${on ? "on" : "btn-danger"}`}
         aria-pressed={on}
-        onClick={() => setOpen(true)}
+        onClick={() => setTarget(!on)}
       >
         {on ? "Kill switch ON - release" : "Kill switch - stop all betting"}
       </button>
@@ -39,25 +45,27 @@ export function KillSwitch({ state }: { state: TradingState }) {
         )}
       </div>
       <ConfirmDialog
-        open={open}
-        title={on ? "Release the kill switch?" : "Engage the kill switch?"}
-        danger={!on}
+        open={target !== null}
+        title={engage ? "Engage the kill switch?" : "Release the kill switch?"}
+        danger={engage}
         busy={mutation.isPending}
-        confirmLabel={on ? "Release kill switch" : "Stop all betting"}
+        confirmLabel={engage ? "Stop all betting" : "Release kill switch"}
         reasonLabel="Reason (saved in the audit log)"
-        defaultReason={on ? "" : "manual stop from the dashboard"}
+        defaultReason={engage ? "manual stop from the dashboard" : ""}
         onCancel={close}
-        onConfirm={(reason) => mutation.mutate({ on: !on, reason }, { onSuccess: close })}
+        onConfirm={(reason) => mutation.mutate({ on: engage, reason }, { onSuccess: close })}
       >
-        {on ? (
-          <p>
-            Betting becomes possible again{state.paused.on ? " once the pause is also cleared" : ""}. Make sure the
-            reason for stopping is resolved.
-          </p>
-        ) : (
+        {engage ? (
           <p>
             No new bet will be placed until you release it. Bets already placed at Betclic stay open and are settled
             normally.
+            {on ? " (The kill switch is already on; this keeps it on.)" : ""}
+          </p>
+        ) : (
+          <p>
+            Betting becomes possible again{state.paused.on ? " once the pause is also cleared" : ""}. Make sure the
+            reason for stopping is resolved.
+            {!on ? " (The kill switch is already off.)" : ""}
           </p>
         )}
       </ConfirmDialog>

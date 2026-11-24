@@ -14,7 +14,7 @@ import type { AnalysisView, PlayerView } from "../../lib/analysis";
 import { formatDateTime, formatNumber, formatPct, formatSigned, humanize, teamName } from "../../lib/format";
 import { safeHref } from "../../lib/markdown";
 import { Histogram, useChartColors } from "../charts";
-import { Badge, Card, Empty, HBar, ProbBar, Segmented } from "../ui";
+import { Badge, Card, Empty, HBar, ProbBar, Segmented, toggleRowProps } from "../ui";
 
 function slotTeam(slot: TeamSlot | null | undefined, match: MatchSummary): string {
   if (slot === "team1") return teamName(match.team1, "team1");
@@ -308,7 +308,10 @@ export function PlayersCard({ view, match }: { view: AnalysisView; match: MatchS
                 const range = quantileRange(p);
                 return (
                   <Fragment key={`${p.playerId}-${p.nickname}`}>
-                    <tr className={`clickable ${isOpen ? "expanded" : ""}`} onClick={() => setExpanded(isOpen ? null : p.playerId)} aria-expanded={isOpen}>
+                    <tr
+                      className={`clickable ${isOpen ? "expanded" : ""}`}
+                      {...toggleRowProps(() => setExpanded(isOpen ? null : p.playerId), isOpen)}
+                    >
                       <td>
                         <strong>{p.nickname}</strong>
                       </td>

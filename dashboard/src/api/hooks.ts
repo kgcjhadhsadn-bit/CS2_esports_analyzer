@@ -39,6 +39,24 @@ export const useTradingState = () =>
 
 export const useConfig = () => useQuery({ queryKey: qk.config, queryFn: ({ signal }) => api.config(signal) });
 
+/** Built-in default of `decision.min_data_completeness` (used until the config has loaded). */
+export const DEFAULT_MIN_DATA_COMPLETENESS = 0.95;
+
+/**
+ * The effective `min_data_completeness` the engine uses (dashboard overrides included), so the
+ * data-completeness badges turn green exactly when a match passes the engine's check. Shares the
+ * config query (and its cache) with the settings page.
+ */
+export function useMinDataCompleteness(): number {
+  const q = useQuery({
+    queryKey: qk.config,
+    queryFn: ({ signal }) => api.config(signal),
+    select: (data) => data.effective.decision.min_data_completeness,
+    staleTime: 60_000,
+  });
+  return typeof q.data === "number" && Number.isFinite(q.data) ? q.data : DEFAULT_MIN_DATA_COMPLETENESS;
+}
+
 export const useMatches = (q: MatchQuery, opts: { poll?: boolean } = {}) =>
   useQuery({
     queryKey: qk.matches(q),
@@ -60,6 +78,8 @@ export const useOddsHistory = (id: number, enabled = true) =>
     queryKey: qk.oddsHistory(id),
     queryFn: ({ signal }) => api.oddsHistory(id, { max_points: 2000 }, signal),
     enabled: enabled && Number.isInteger(id) && id > 0,
+    // The chart carries the last price forward to "now", so keep it as fresh as the markets table.
+    refetchInterval: POLL.slow,
   });
 
 export const useBets = (q: BetQuery, opts: { poll?: boolean } = {}) =>

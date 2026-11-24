@@ -21,6 +21,10 @@ All commands below run in a PowerShell window in the repository folder (e.g. `C:
 `cs2bot up` is the single long-running process. Stopping it (Ctrl+C or `stop.cmd`) stops all jobs;
 nothing else keeps working in the background except PostgreSQL.
 
+Only one copy can run: `start.ps1` holds a lock (a named Windows mutex) for as long as it starts and
+runs the bot, so the autostart task, the daily wake task and a double-clicked `start.cmd` never start
+a second bot; `update.ps1` and `restore-db.ps1` hold the same lock while they work.
+
 ## What runs when
 
 The built-in scheduler runs jobs in **lanes**: each lane is one thread running its jobs one at a

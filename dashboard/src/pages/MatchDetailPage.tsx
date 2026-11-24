@@ -5,7 +5,7 @@
  */
 import { useMemo, useRef, useState } from "react";
 import { Link, useParams } from "react-router-dom";
-import { useMatch, useOddsHistory } from "../api/hooks";
+import { useMatch, useMinDataCompleteness, useOddsHistory } from "../api/hooks";
 import type { MarketRow, MatchDetail } from "../api/types";
 import { CompletenessBadge, EvBadge, LinkBadge, MatchStatusBadge, TierBadge } from "../components/badges";
 import {
@@ -23,11 +23,13 @@ import { Badge, Card, Empty, ErrorState, Loading, QueryView, Tabs } from "../com
 import { parseAnalysis } from "../lib/analysis";
 import { formatDateTime, formatRelative, teamName } from "../lib/format";
 import { safeHref, SafeMarkdown } from "../lib/markdown";
+import { useNow } from "../lib/useNow";
 
 type Tab = "markets" | "model" | "context";
 
 function Header({ detail }: { detail: MatchDetail }) {
   const m = detail.match;
+  const minCompleteness = useMinDataCompleteness();
   const finished = m.team1_score !== null && m.team2_score !== null;
   const betclicUrl = m.betclic?.url ? safeHref(m.betclic.url) : null;
   return (
@@ -63,7 +65,7 @@ function Header({ detail }: { detail: MatchDetail }) {
       </div>
       <div className="row" style={{ marginTop: "0.5rem", justifyContent: "center" }}>
         <span className="small muted">Data</span>
-        <CompletenessBadge value={m.data_completeness} />
+        <CompletenessBadge value={m.data_completeness} threshold={minCompleteness} />
         <span className="small muted">Betclic</span>
         <LinkBadge status={m.betclic?.link_status} confidence={m.betclic?.link_confidence} />
         {m.betclic?.link_status === "pending_review" && (
@@ -88,12 +90,26 @@ function Header({ detail }: { detail: MatchDetail }) {
   );
 }
 
-function OddsHistorySection({ matchId, selectedKey, onSelect }: { matchId: number; selectedKey: string | null; onSelect: (k: string) => void }) {
+function OddsHistorySection({
+  matchId,
+  startsAt,
+  selectedKey,
+  onSelect,
+}: {
+  matchId: number;
+  startsAt: string | null;
+  selectedKey: string | null;
+  onSelect: (k: string) => void;
+}) {
   const history = useOddsHistory(matchId);
+  const now = useNow(60_000);
   const groups = useMemo(() => groupOddsSeries(history.data?.series ?? []), [history.data]);
+  // Pre-match prices stay valid until they change or the match starts.
+  const start = startsAt ? new Date(startsAt).getTime() : NaN;
+  const until = Number.isFinite(start) ? Math.min(now.getTime(), start) : now.getTime();
   return (
     <QueryView query={history}>
-      {() => <OddsHistoryChart groups={groups} selectedKey={selectedKey} onSelect={onSelect} />}
+      {() => <OddsHistoryChart groups={groups} selectedKey={selectedKey} onSelect={onSelect} until={until} />}
     </QueryView>
   );
 }
@@ -144,7 +160,7 @@ export default function MatchDetailPage() {
           </Card>
           <div ref={historyRef}>
             <Card title="Odds history" sub="Betclic prices over time (step line)">
-              <OddsHistorySection matchId={match.id} selectedKey={oddsKey} onSelect={setOddsKey} />
+              <OddsHistorySection matchId={match.id} startsAt={match.scheduled_at} selectedKey={oddsKey} onSelect={setOddsKey} />
             </Card>
           </div>
         </>

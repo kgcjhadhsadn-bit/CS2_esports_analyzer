@@ -22,7 +22,7 @@ import {
   YAxis,
   ZAxis,
 } from "recharts";
-import { useBankroll, useCalibration, useMarketPerformance } from "../api/hooks";
+import { useBankroll, useCalibration, useHealth, useMarketPerformance } from "../api/hooks";
 import type { Bankroll, BankrollMode, CalibrationSet, MarketPerf, PeriodPnl } from "../api/types";
 import { axisProps, ChartTooltip, useChartColors } from "../components/charts";
 import { Card, Empty, QueryView, Segmented, Stat } from "../components/ui";
@@ -126,7 +126,7 @@ function EquityChart({ data }: { data: Bankroll }) {
 function DrawdownChart({ data }: { data: Bankroll }) {
   const colors = useChartColors();
   const rows = useMemo(() => drawdownSeries(data.pnl_curve), [data.pnl_curve]);
-  if (rows.length < 2) return <Empty>No settled bets yet.</Empty>;
+  if (rows.length < 2) return <Empty>Not enough settled bets for a drawdown chart yet.</Empty>;
   return (
     <div className="chart-box short" role="img" aria-label="Drawdown">
       <ResponsiveContainer width="100%" height="100%">
@@ -412,7 +412,10 @@ function CalibrationSection({ mode }: { mode: BankrollMode }) {
 }
 
 export default function PerformancePage() {
-  const [mode, setMode] = useState<BankrollMode>("real");
+  const health = useHealth();
+  // Like the overview: default to the mode the bot runs in (paper while dry-run is on).
+  const [modeChoice, setModeChoice] = useState<BankrollMode | null>(null);
+  const mode: BankrollMode = modeChoice ?? (health.data?.dry_run === false ? "real" : "dry_run");
   const [period, setPeriod] = useState<Period>("week");
   const bankroll = useBankroll(mode);
   const markets = useMarketPerformance(mode);
@@ -427,7 +430,7 @@ export default function PerformancePage() {
         <Segmented<BankrollMode>
           label="Money"
           value={mode}
-          onChange={setMode}
+          onChange={setModeChoice}
           options={[
             { value: "real", label: "Real money" },
             { value: "dry_run", label: "Paper" },

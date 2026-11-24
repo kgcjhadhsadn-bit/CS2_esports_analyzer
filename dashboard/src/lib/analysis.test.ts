@@ -1,7 +1,9 @@
 import { describe, expect, it } from "vitest";
 import { analysisPayload } from "../test/fixtures";
 import {
+  fillIntegerGaps,
   parseAnalysis,
+  pmfBars,
   pmfStats,
   probOver,
   roundMarginBars,
@@ -100,5 +102,28 @@ describe("veto slots", () => {
     expect(scopeLabel("map:2")).toBe("Map 2");
     expect(scopeLabel("maps:1,2")).toBe("Maps 1+2");
     expect(sortScopes(["maps:1,2", "map:2", "match", "map:1"])).toEqual(["match", "map:1", "map:2", "maps:1,2"]);
+  });
+});
+
+describe("fillIntegerGaps", () => {
+  it("fills integer gaps with empty bars so every bar is one unit wide", () => {
+    const filled = fillIntegerGaps(pmfBars({ "15": 0.3, "18": 0.4, "21": 0.3 }));
+    expect(filled.map((b) => b.x)).toEqual([15, 16, 17, 18, 19, 20, 21]);
+    expect(filled.map((b) => b.p)).toEqual([0.3, 0, 0, 0.4, 0, 0, 0.3]);
+  });
+
+  it("pads a single value so it is drawn, keeping signed labels", () => {
+    expect(fillIntegerGaps([{ x: 4, label: "+4", p: 1 }])).toEqual([
+      { x: 3, label: "+3", p: 0 },
+      { x: 4, label: "+4", p: 1 },
+      { x: 5, label: "+5", p: 0 },
+    ]);
+    expect(fillIntegerGaps(roundMarginBars({ "13-11": 0.5, "11-13": 0.5 })).map((b) => b.label)).toEqual(["-2", "-1", "0", "+1", "+2"]);
+  });
+
+  it("leaves non-integer, very wide and empty supports alone", () => {
+    expect(fillIntegerGaps([{ x: 0.5, label: "0.5", p: 1 }])).toEqual([{ x: 0.5, label: "0.5", p: 1 }]);
+    expect(fillIntegerGaps([{ x: 0, label: "0", p: 0.5 }, { x: 1000, label: "1000", p: 0.5 }])).toHaveLength(2);
+    expect(fillIntegerGaps([])).toEqual([]);
   });
 });

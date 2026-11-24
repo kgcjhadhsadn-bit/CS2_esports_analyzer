@@ -2,6 +2,7 @@
 import { Fragment } from "react";
 import type { ReactNode } from "react";
 import { Link } from "react-router-dom";
+import { useMinDataCompleteness } from "../api/hooks";
 import type { BetOut, MatchBrief, MatchSummary } from "../api/types";
 import { formatDateTime, formatMoney, formatOdds, formatSignedPct, signClass, teamName } from "../lib/format";
 import { BetStatusBadge, CompletenessBadge, EvBadge, LinkBadge, MatchStatusBadge, TierBadge } from "./badges";
@@ -18,6 +19,7 @@ export function MatchTitle({ match }: { match: Pick<MatchBrief, "id" | "team1" |
 }
 
 export function MatchesTable({ matches, compact = false }: { matches: MatchSummary[]; compact?: boolean }) {
+  const minCompleteness = useMinDataCompleteness();
   if (!matches.length) return <Empty>No matches.</Empty>;
   return (
     <div className="table-wrap">
@@ -64,7 +66,7 @@ export function MatchesTable({ matches, compact = false }: { matches: MatchSumma
                 <LinkBadge status={m.betclic?.link_status} confidence={m.betclic?.link_confidence} />
               </td>
               <td className="num">
-                <CompletenessBadge value={m.data_completeness} />
+                <CompletenessBadge value={m.data_completeness} threshold={minCompleteness} />
               </td>
               <td className="num">
                 <EvBadge ev={m.best_ev} />

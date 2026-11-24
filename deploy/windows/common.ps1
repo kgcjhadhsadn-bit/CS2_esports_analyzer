@@ -31,6 +31,9 @@ $script:PostgresContainer = 'cs2bot-postgres'
 $script:PostgresVolume = 'cs2bot_pgdata'
 $script:AutostartTaskName = 'cs2bot'
 $script:WakeTaskName = 'cs2bot-wake'
+# Named mutex held by start.ps1 / update.ps1 / restore-db.ps1 (see Enter-StartLock).
+$script:StartLockName = 'Local\cs2bot-start-lock'
+$script:StartLock = $null
 
 # uv must use the committed lock file as it is and never re-resolve dependencies on the owner's PC.
 $env:UV_FROZEN = '1'
@@ -237,27 +240,61 @@ function Get-EnvFileValue {
         [string]$Path = $script:EnvFile
     )
     if (-not (Test-Path -LiteralPath $Path)) { return $Default }
+    # The bot reads .env with python-dotenv rules, mirrored here: the last line for a name wins,
+    # names are not case-sensitive, a quoted value ends at its closing quote, and in an unquoted
+    # value " # ..." is a comment ("CS2BOT_EXECUTOR__DRY_RUN=false  # live" means false).
     $pattern = '^\s*(?:export\s+)?' + [regex]::Escape($Name) + '\s*=(.*)$'
-    $value = $null
+    $raw = $null
     foreach ($line in [System.IO.File]::ReadAllLines($Path)) {
-        if ($line -match $pattern) { $value = $Matches[1].Trim() }
+        if ($line -match $pattern) { $raw = $Matches[1].Trim() }
     }
-    if ($null -eq $value) { return $Default }
-    if ($value.Length -ge 2) {
-        $first = $value.Substring(0, 1)
-        $last = $value.Substring($value.Length - 1, 1)
-        if (($first -eq '"' -and $last -eq '"') -or ($first -eq "'" -and $last -eq "'")) {
-            $value = $value.Substring(1, $value.Length - 2)
-        }
+    if ($null -eq $raw) { return $Default }
+    $value = $raw
+    if ($raw.Length -ge 1 -and ($raw[0] -eq [char]'"' -or $raw[0] -eq [char]"'")) {
+        $end = $raw.IndexOf($raw[0], 1)
+        if ($end -gt 0) { $value = $raw.Substring(1, $end - 1) }
+    } else {
+        $value = ($raw -replace '\s+#.*$', '').Trim()
     }
     if ($value -eq '') { return $Default }
     return $value
 }
 
+function Get-EnvFileInt {
+    # An integer setting from .env (ports); $Default when it is missing or not a number.
+    param([Parameter(Mandatory = $true)][string]$Name, [Parameter(Mandatory = $true)][int]$Default)
+    $parsed = 0
+    if ([int]::TryParse((Get-EnvFileValue -Name $Name -Default ([string]$Default)), [ref]$parsed)) { return $parsed }
+    return $Default
+}
+
+function Test-DryRunEnabled {
+    # $false only when the bot will place REAL bets. Mirrors how the bot reads
+    # CS2BOT_EXECUTOR__DRY_RUN: a process environment variable wins over .env, the default is true,
+    # and pydantic accepts 0/false/f/no/n/off as false.
+    $value = [Environment]::GetEnvironmentVariable('CS2BOT_EXECUTOR__DRY_RUN')
+    if ([string]::IsNullOrWhiteSpace($value)) { $value = Get-EnvFileValue -Name 'CS2BOT_EXECUTOR__DRY_RUN' -Default 'true' }
+    return (@('0', 'false', 'f', 'no', 'n', 'off') -notcontains $value.Trim().ToLowerInvariant())
+}
+
+function Import-AnthropicApiKey {
+    # The bot's settings read .env themselves, but ANTHROPIC_API_KEY (the name .env.example uses)
+    # is not a CS2BOT_ setting: the Claude client only finds it in the process environment, so a
+    # key that is only written in .env would silently switch the Claude layer off. Copy that one
+    # value into this process's environment; "uv run" and the bot inherit it. (Loading the whole
+    # file with uv's --env-file is avoided on purpose: uv expands "$name" inside values, which
+    # would corrupt passwords and proxy URLs that contain "$".) Never printed.
+    if (-not [string]::IsNullOrWhiteSpace($env:ANTHROPIC_API_KEY)) { return }
+    $key = Get-EnvFileValue -Name 'ANTHROPIC_API_KEY'
+    if ($key -ne '') { $env:ANTHROPIC_API_KEY = $key }
+}
+Import-AnthropicApiKey
+
 function Get-DashboardUrl {
     $apiHost = Get-EnvFileValue -Name 'CS2BOT_API__HOST' -Default '127.0.0.1'
     if ($apiHost -eq '0.0.0.0' -or $apiHost -eq '::') { $apiHost = '127.0.0.1' }
-    $apiPort = Get-EnvFileValue -Name 'CS2BOT_API__PORT' -Default '8000'
+    if ($apiHost.Contains(':') -and -not $apiHost.StartsWith('[')) { $apiHost = "[$apiHost]" }
+    $apiPort = Get-EnvFileInt -Name 'CS2BOT_API__PORT' -Default 8000
     return "http://${apiHost}:${apiPort}"
 }
 
@@ -352,7 +389,7 @@ function Start-Postgres {
     # docker compose up -d, then wait until the health check passes. Safe to call when it already runs.
     param([int]$TimeoutSeconds = 180)
     if (-not (Test-PostgresContainerRunning)) {
-        $port = [int](Get-EnvFileValue -Name 'POSTGRES_PORT' -Default '5432')
+        $port = Get-EnvFileInt -Name 'POSTGRES_PORT' -Default 5432
         if (Test-TcpPort -Port $port) {
             throw ("Port $port on this PC is already used by another program (often a PostgreSQL that was installed separately). " +
                 "Stop that program, or choose another port: put POSTGRES_PORT=5433 in .env AND change the port in CS2BOT_DATABASE__URL to 5433. " +
@@ -406,6 +443,38 @@ function Get-BotProcess {
 
 function Test-BotRunning {
     return (@(Get-BotProcess).Count -gt 0)
+}
+
+function Enter-StartLock {
+    # Only one start.ps1 (or update.ps1 / restore-db.ps1) may prepare and run the bot at a time in
+    # this Windows session. Without this, the autostart task (which can wait up to 15 minutes for
+    # Docker after logon), the daily wake task and a double-clicked start.cmd could each find "no
+    # bot running" and start a second bot. The lock is a named mutex: Windows releases it when the
+    # process that holds it ends, however it ends. Returns $true when this script holds the lock.
+    param([int]$WaitSeconds = 0)
+    if ($null -ne $script:StartLock) { return $true }
+    $mutex = New-Object System.Threading.Mutex($false, $script:StartLockName)
+    $acquired = $false
+    try {
+        $acquired = $mutex.WaitOne([TimeSpan]::FromSeconds($WaitSeconds))
+    } catch [System.Threading.AbandonedMutexException] {
+        # The previous holder ended without releasing it (closed window, killed): it is ours now.
+        $acquired = $true
+    }
+    if (-not $acquired) {
+        $mutex.Dispose()
+        return $false
+    }
+    $script:StartLock = $mutex
+    return $true
+}
+
+function Exit-StartLock {
+    # Releases the lock taken by Enter-StartLock (.NET calls only: also safe in a "finally" block).
+    if ($null -eq $script:StartLock) { return }
+    try { $script:StartLock.ReleaseMutex() } catch { $null = $_ }
+    try { $script:StartLock.Dispose() } catch { $null = $_ }
+    $script:StartLock = $null
 }
 
 function Stop-ProcessTree {

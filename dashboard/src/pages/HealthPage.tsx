@@ -171,7 +171,9 @@ function JobsTable({ jobs }: { jobs: JobHealth[] }) {
                     {j.stale && <Badge tone="neg">stale</Badge>}
                   </span>
                 </td>
-                <td className="nowrap small"><span title={formatDateTime(j.last_started_at)}>{formatAge(j.age_s)} ago</span></td>
+                <td className="nowrap small">
+                  <span title={formatDateTime(j.last_started_at)}>{formatAge(j.age_s)} ago</span>
+                </td>
                 <td className="num">{j.duration_s !== null ? `${formatNumber(j.duration_s, 1)} s` : "—"}</td>
                 <td className="num">{j.items}</td>
                 <td className="num">

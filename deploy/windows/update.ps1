@@ -70,6 +70,12 @@ try {
     } else {
         Write-Ok 'The bot is not running.'
     }
+    # Hold the start lock until the update is finished, so that the autostart / wake task cannot
+    # start the bot on half-updated files. A start.ps1 that is still waiting for Docker holds it.
+    if (-not (Enter-StartLock -WaitSeconds 60)) {
+        throw ('start.ps1 is still starting the bot (for example the autostart task, which waits for Docker after ' +
+            'sign-in). Wait until the dashboard answers, or run stop.cmd, then run update again. Nothing was updated.')
+    }
 
     Write-Step 'Checking for local changes'
     $branch = Get-NativeOutput 'git' @('rev-parse', '--abbrev-ref', 'HEAD')
@@ -138,6 +144,7 @@ try {
         Write-Host 'Read docs\OPERATIONS.md if the update mentions new settings (compare .env with .env.example).'
     }
 
+    Exit-StartLock
     if ($wasRunning -and -not $NoRestart) {
         Write-Step 'Starting the bot again'
         Restart-Bot
@@ -154,4 +161,6 @@ try {
         }
     }
     exit 1
+} finally {
+    Exit-StartLock
 }

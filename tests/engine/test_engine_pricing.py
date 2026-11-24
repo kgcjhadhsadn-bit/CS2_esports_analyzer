@@ -112,6 +112,24 @@ def test_correct_map_score_bo3(bo3: MatchPrediction) -> None:
         price(spec(MT.CORRECT_MAP_SCORE), SELECTION_TEAM1, bo3)
 
 
+def test_correct_score_selections_that_settlement_refuses_are_unpriceable(bo3: MatchPrediction) -> None:
+    """Review round 2: a malformed pmf carrying mass on an impossible score used to make that
+    selection priceable, while settlement leaves it UNKNOWN forever (the bet could never settle)."""
+    broken_series = bo3.central.model_copy(
+        update={"map_score_pmf": {**bo3.central.map_score_pmf, "1-0": 0.0}}
+    )
+    slot = bo3.central.slots[0]
+    broken_slot = slot.model_copy(update={"score_pmf": {**slot.score_pmf, "13-12": 0.0}})
+    broken = bo3.model_copy(
+        update={"central": broken_series.model_copy(update={"slots": [broken_slot, *bo3.central.slots[1:]]})}
+    )
+    with pytest.raises(UnpriceableMarket, match="not a possible final score"):
+        price(spec(MT.CORRECT_MAP_SCORE), "1-0", broken)
+    with pytest.raises(UnpriceableMarket, match="not a possible final CS2 map score"):
+        price(spec(MT.MAP_CORRECT_SCORE, map_number=1), "13-12", broken)
+    assert price(spec(MT.CORRECT_MAP_SCORE), "2-0", broken).p_win == pytest.approx(0.33)
+
+
 def test_final_map_scores() -> None:
     assert final_map_scores(MatchFormat.BO1) == {(1, 0), (0, 1)}
     assert final_map_scores(MatchFormat.BO2) == {(2, 0), (1, 1), (0, 2)}

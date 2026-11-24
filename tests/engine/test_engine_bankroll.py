@@ -275,6 +275,22 @@ def test_daily_loss_limit_pauses_once_and_respects_manual_resume(
     assert db_state.get_state(session, LOSS_LIMIT_STATE_KEY)["daily"] == "2026-01-14T23:00:00+00:00"
 
 
+def test_loss_limit_pause_keeps_an_earlier_pause_reason(session: Session, settings: Settings) -> None:
+    """Review round 2: the loss-limit pause overwrote the reason of an existing pause (a balance
+    mismatch found by reconcile), so the owner would resume without ever seeing the mismatch."""
+    now = utc(2026, 1, 15, 10)
+    ledger.ensure_initialized(session, settings, at=utc(2026, 1, 1))
+    db_state.set_paused(session, True, actor="system", reason="balance mismatch: check the account")
+    bets = [place(session, "25", now - timedelta(hours=3)) for _ in range(2)]
+    for b in bets:
+        settle(session, b, BetStatus.LOST, now - timedelta(hours=1), settings)
+    st = compute_state(session, settings, now=now)
+    assert check_loss_limits(session, st, settings, now=now) is True
+    paused, reason = db_state.get_pause(session)
+    assert paused and reason is not None
+    assert reason.startswith("balance mismatch: check the account; daily loss limit reached")
+
+
 def test_loss_limit_period_comes_from_the_state_not_the_wall_clock(
     session: Session, settings: Settings
 ) -> None:

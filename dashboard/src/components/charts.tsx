@@ -6,6 +6,7 @@
 import { useEffect, useState } from "react";
 import type { ReactNode } from "react";
 import { Bar, BarChart, CartesianGrid, Cell, ReferenceLine, ResponsiveContainer, Tooltip, XAxis, YAxis } from "recharts";
+import { fillIntegerGaps } from "../lib/analysis";
 import type { Bar as BarDatum } from "../lib/analysis";
 import { formatPct } from "../lib/format";
 
@@ -119,8 +120,9 @@ export function Histogram({
   height?: number;
 }) {
   const colors = useChartColors();
-  const data = bars.map((b) => ({ ...b, fill: colorFor ? colorFor(b.x) : colors.series[0] }));
-  const xs = bars.map((b) => b.x);
+  const filled = fillIntegerGaps(bars);
+  const data = filled.map((b) => ({ ...b, fill: colorFor ? colorFor(b.x) : colors.series[0] }));
+  const xs = filled.map((b) => b.x);
   const ticks = xs.length ? integerTicks(Math.min(...xs), Math.max(...xs)) : undefined;
   return (
     <div className="chart-box" style={{ height }} aria-label={`${xLabel} distribution`} role="img">

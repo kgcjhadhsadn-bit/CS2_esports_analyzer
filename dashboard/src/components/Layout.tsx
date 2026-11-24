@@ -3,7 +3,9 @@ import { useQueryClient } from "@tanstack/react-query";
 import { NavLink, Outlet } from "react-router-dom";
 import { api } from "../api/client";
 import { qk, useHealth, useTradingState } from "../api/hooks";
+import type { AuthMe } from "../api/types";
 import { useAuth } from "../auth";
+import { toast } from "./toast";
 import { Badge } from "./ui";
 
 const NAV: { to: string; label: string; icon: string }[] = [
@@ -29,13 +31,19 @@ export function Layout() {
   const pending = health.data?.pending_link_reviews ?? 0;
   const t = trading.data ?? health.data?.trading ?? null;
 
+  // The /auth/me observer must see the change: `qc.clear()` would drop that query from under the
+  // mounted observer (nothing would re-render), so set the logged-out state on it directly and
+  // only drop the other cached data.
   const logout = async () => {
+    let next: AuthMe;
     try {
-      await api.logout();
-    } finally {
-      qc.clear();
-      await qc.invalidateQueries({ queryKey: qk.me });
+      next = await api.logout();
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : "Logout failed", "Action failed");
+      return;
     }
+    qc.removeQueries({ predicate: (q) => q.queryKey[0] !== qk.me[0] });
+    qc.setQueryData(qk.me, { ...next, authenticated: false, username: null });
   };
 
   return (

@@ -62,6 +62,36 @@ describe("auth flow", () => {
     await waitFor(() => expect(screen.getByLabelText("Password")).toBeInTheDocument(), { timeout: 3000 });
   });
 
+  it("shows the login page right after logging out", async () => {
+    // Regression: logout used to clear the whole query cache from under the /auth/me observer, so
+    // nothing re-rendered and the owner stayed on the (now unauthenticated) page.
+    const user = userEvent.setup();
+    let loggedIn = true;
+    const denied = { status: 401, body: { detail: "not authenticated" } };
+    const { calls } = mockApi({
+      "GET /api/auth/me": () => ({ auth_enabled: true, authenticated: loggedIn, username: loggedIn ? "admin" : null }),
+      "POST /api/auth/logout": () => {
+        loggedIn = false;
+        return { auth_enabled: true, authenticated: false, username: null };
+      },
+      "GET /api/health": () => (loggedIn ? health : denied),
+      "GET /api/control/state": () => (loggedIn ? tradingState : denied),
+      "GET /api/bets": () => (loggedIn ? betPage : denied),
+    });
+    renderWithProviders(
+      <>
+        <UnauthorizedWatcher />
+        <AppRoutes />
+      </>,
+      { route: "/bets" },
+    );
+    await user.click(await screen.findByRole("button", { name: "Log out" }));
+    expect(await screen.findByLabelText("Password", undefined, { timeout: 3000 })).toBeInTheDocument();
+    const logout = calls.find((c) => c.path === "/api/auth/logout");
+    expect(logout?.method).toBe("POST");
+    expect(logout?.headers["X-Requested-With"]).toBe("cs2bot");
+  });
+
   it("only follows same-app next paths", () => {
     expect(safeNext("/bets?x=1")).toBe("/bets?x=1");
     expect(safeNext("//evil.example")).toBe("/");

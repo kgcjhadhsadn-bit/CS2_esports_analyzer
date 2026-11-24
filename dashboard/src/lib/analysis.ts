@@ -98,6 +98,29 @@ export function roundMarginBars(scorePmf: Record<string, number>): Bar[] {
   return groupScores(scorePmf, (a, b) => a - b).map((b) => ({ ...b, label: b.x > 0 ? `+${b.x}` : String(b.x) }));
 }
 
+/**
+ * Histogram-ready bars: integer gaps filled with zero-probability bars, and a lone value padded
+ * with empty neighbours. Recharts sizes bars on a numeric axis by the smallest distance between
+ * data points, so a sparse pmf ("15", "18", "21") would draw 3-unit-wide bars and a single value
+ * would draw no bar at all. Non-integer or very wide supports are returned unchanged.
+ */
+export function fillIntegerGaps(bars: readonly Bar[], maxSpan = 400): Bar[] {
+  if (!bars.length || !bars.every((b) => Number.isInteger(b.x))) return [...bars];
+  const sorted = [...bars].sort((a, b) => a.x - b.x);
+  const lo = sorted[0]?.x ?? 0;
+  const hi = sorted.at(-1)?.x ?? 0;
+  if (hi - lo > maxSpan) return sorted;
+  const signed = bars.some((b) => b.label.startsWith("+"));
+  const byX = new Map(sorted.map((b) => [b.x, b]));
+  const from = lo === hi ? lo - 1 : lo;
+  const to = lo === hi ? hi + 1 : hi;
+  const out: Bar[] = [];
+  for (let x = from; x <= to; x++) {
+    out.push(byX.get(x) ?? { x, label: signed && x > 0 ? `+${x}` : String(x), p: 0 });
+  }
+  return out;
+}
+
 /** P(X > line) for a bar distribution (normalized by the total mass). */
 export function probOver(bars: readonly Bar[], line: number): number | null {
   const total = bars.reduce((s, b) => s + b.p, 0);

@@ -34,8 +34,14 @@ interface Row {
   [seriesKey: string]: number | null;
 }
 
-/** Merge the step series on one time axis (each value carried forward until it changes). */
-export function mergeSeries(series: OddsSeries[]): { rows: Row[]; keys: string[] } {
+/**
+ * Merge the step series on one time axis (each value carried forward until it changes).
+ *
+ * Snapshots are stored only when a price changes, so the last price is still valid after its
+ * snapshot: with `until` (ms, e.g. now or the match start) a final row carries every series
+ * forward to that instant. Without it a price that never changed (one snapshot) would draw nothing.
+ */
+export function mergeSeries(series: OddsSeries[], until?: number | null): { rows: Row[]; keys: string[] } {
   const keys = series.map((s) => `s${s.selection_id}`);
   const times = new Set<number>();
   const points = series.map((s) =>
@@ -46,6 +52,10 @@ export function mergeSeries(series: OddsSeries[]): { rows: Row[]; keys: string[]
   );
   points.forEach((ps) => ps.forEach((p) => times.add(p.t)));
   const sorted = [...times].sort((a, b) => a - b);
+  const lastT = sorted.at(-1);
+  if (until !== null && until !== undefined && Number.isFinite(until) && lastT !== undefined && until > lastT) {
+    sorted.push(until);
+  }
   const idx = points.map(() => 0);
   const last: (number | null)[] = points.map(() => null);
   const rows: Row[] = sorted.map((t) => {
@@ -66,14 +76,17 @@ export function OddsHistoryChart({
   groups,
   selectedKey,
   onSelect,
+  until,
 }: {
   groups: OddsGroup[];
   selectedKey: string | null;
   onSelect: (key: string) => void;
+  /** Carry the last prices forward to this instant (ms): now, or the match start once it began. */
+  until?: number | null;
 }) {
   const colors = useChartColors();
   const group = groups.find((g) => g.key === selectedKey) ?? groups[0];
-  const merged = useMemo(() => (group ? mergeSeries(group.series) : { rows: [], keys: [] }), [group]);
+  const merged = useMemo(() => (group ? mergeSeries(group.series, until) : { rows: [], keys: [] }), [group, until]);
   if (!groups.length || !group) return <Empty>No Betclic odds recorded for this match yet.</Empty>;
   const spanMs = merged.rows.length > 1 ? (merged.rows.at(-1)?.t ?? 0) - (merged.rows[0]?.t ?? 0) : 0;
   const tickFormat = (t: number) => (spanMs > 36 * 3600_000 ? formatShortDate(new Date(t)) : formatTime(new Date(t)));

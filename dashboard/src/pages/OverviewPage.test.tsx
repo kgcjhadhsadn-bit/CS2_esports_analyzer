@@ -59,6 +59,28 @@ describe("OverviewPage", () => {
     expect(await screen.findByText(/Kill switch is ON/)).toBeInTheDocument();
   });
 
+  it("keeps the dialog's action when the switch changes underneath it", async () => {
+    // The trading state polls: if the switch flips while the "Engage" dialog is open, confirming
+    // must still engage it, never release it.
+    const user = userEvent.setup();
+    let state = tradingState;
+    const { calls } = mockApi(
+      routes({
+        "GET /api/control/state": () => state,
+        "POST /api/control/kill-switch": { on: true, reason: "x", updated_at: null, updated_by: "dashboard" },
+      }),
+    );
+    const { queryClient } = renderWithProviders(<OverviewPage />);
+    await user.click(await screen.findByRole("button", { name: /Kill switch - stop all betting/ }));
+    state = { ...tradingState, halted: true, reason: "kill switch is on", kill_switch: { on: true, reason: "engine", updated_at: null, updated_by: "engine" } };
+    await queryClient.invalidateQueries({ queryKey: ["control"] });
+    await screen.findByRole("button", { name: /Kill switch ON - release/ });
+    const dialog = screen.getByRole("dialog", { name: "Engage the kill switch?" });
+    await user.click(within(dialog).getByRole("button", { name: "Stop all betting" }));
+    await waitFor(() => expect(calls.some((c) => c.path === "/api/control/kill-switch")).toBe(true));
+    expect((calls.find((c) => c.path === "/api/control/kill-switch")?.body as { on: boolean }).on).toBe(true);
+  });
+
   it("cancelling the dialog sends nothing", async () => {
     const user = userEvent.setup();
     const { calls } = mockApi(routes());

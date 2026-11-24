@@ -240,7 +240,7 @@ function Show-EnvWarnings {
     foreach ($item in $missing) {
         Write-Warn "Not filled in yet: $item. Edit .env (notepad .env) before starting the bot."
     }
-    if ((Get-EnvFileValue -Name 'CS2BOT_EXECUTOR__DRY_RUN' -Default 'true').ToLowerInvariant() -eq 'false') {
+    if (-not (Test-DryRunEnabled)) {
         Write-Warn 'CS2BOT_EXECUTOR__DRY_RUN=false: the bot will place REAL bets once it runs and you are logged in to Betclic.'
     }
 }
@@ -283,6 +283,7 @@ try {
 
     $envCreated = Initialize-EnvFile
     if ($envCreated -and -not $NoEditEnv -and -not $Yes) { Edit-EnvFile }
+    Import-AnthropicApiKey
     Show-EnvWarnings
 
     foreach ($folder in @($LogDir, $BackupDir, $RunDir)) { Initialize-RuntimeFolder -Path $folder }

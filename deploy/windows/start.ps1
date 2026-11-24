@@ -221,6 +221,13 @@ function Invoke-BotOnce {
         Write-BotLogMarker 'stop requested before the bot started - not starting it'
         return 0
     }
+    if (Test-BotRunning) {
+        # Started by other means while we waited for Docker (e.g. "uv run cs2bot up" typed by hand).
+        # Two bots would share one Betclic profile and one dashboard port: leave it running.
+        $script:StopRequested = $true
+        Write-BotLogMarker 'another cs2bot is already running - not starting a second one'
+        return 0
+    }
     Write-BotLogMarker ("cs2bot starting (start.ps1, dry_run={0}, background={1})" -f $script:DryRun, [bool]$Background)
     $script:PendingRead = $null
     $bot = [System.Diagnostics.Process]::Start($startInfo)
@@ -254,6 +261,7 @@ function Invoke-BotOnce {
             # Ctrl+C: PowerShell is unwinding and will not run any code after this block.
             if ($null -ne $script:LogWriter) { $script:LogWriter.Dispose(); $script:LogWriter = $null }
             if ($script:KeepAwake) { Disable-KeepAwake }
+            Exit-StartLock
             if ($Background) {
                 # Under Task Scheduler this PowerShell exists only for the bot: leave with the right
                 # exit code (a plain "exit" further down would never be reached).
@@ -282,9 +290,29 @@ function Wait-BeforeRestart {
 
 $exitCode = 1
 $script:KeepAwake = $false
+$script:DryRun = $true
 try {
     Assert-RepoReady
     foreach ($folder in @($LogDir, $RunDir)) { Initialize-RuntimeFolder -Path $folder }
+
+    # Only one start.ps1 at a time (see Enter-StartLock). Whoever holds the lock is starting or
+    # running the bot, or updating / restoring: leave it alone. No long wait, so that a bot
+    # stopped on purpose is not started again by a start.ps1 that was waiting in the background.
+    # Background mode waits a few seconds for a start.ps1 that is just finishing.
+    $lockWait = 0
+    if ($Background) { $lockWait = 15 }
+    if (-not (Enter-StartLock -WaitSeconds $lockWait)) {
+        if (-not $Background) {
+            if (Test-BotRunning) {
+                Write-Host "The bot is already running. Dashboard: $(Get-DashboardUrl)" -ForegroundColor Green
+            } else {
+                Write-Host ('Another start.ps1 is already starting the bot (for example the autostart task, which waits ' +
+                    'for Docker after sign-in), or update / restore is running. Wait a few minutes and look at ' +
+                    "$(Get-DashboardUrl), or check the newest file in $LogDir.") -ForegroundColor Yellow
+            }
+        }
+        exit 0
+    }
 
     if (Test-BotRunning) {
         if (-not $Background) {
@@ -299,13 +327,13 @@ try {
     $supervise = ($Background -or $RestartOnCrash)
     $dockerTimeout = 300
     if ($Background) { $dockerTimeout = 900 }
-    $script:DashboardPort = [int](Get-EnvFileValue -Name 'CS2BOT_API__PORT' -Default '8000')
-    $script:DryRun = (Get-EnvFileValue -Name 'CS2BOT_EXECUTOR__DRY_RUN' -Default 'true').ToLowerInvariant()
+    $script:DashboardPort = Get-EnvFileInt -Name 'CS2BOT_API__PORT' -Default 8000
+    $script:DryRun = Test-DryRunEnabled
 
     if (-not $Background) {
         Write-Step 'Starting Docker and PostgreSQL'
-        if ($script:DryRun -eq 'false') {
-            Write-Host '    LIVE MODE: CS2BOT_EXECUTOR__DRY_RUN=false - the bot places REAL bets.' -ForegroundColor Yellow
+        if (-not $script:DryRun) {
+            Write-Host '    LIVE MODE: the dry run is off (CS2BOT_EXECUTOR__DRY_RUN) - the bot places REAL bets.' -ForegroundColor Yellow
         } else {
             Write-Host '    Dry run: bets are simulated, no real money is placed.' -ForegroundColor Green
         }
@@ -387,5 +415,8 @@ try {
     }
     if ($script:KeepAwake) { Disable-KeepAwake }
     $exitCode = 1
+} finally {
+    # Also runs after Ctrl+C while Docker / PostgreSQL were still starting.
+    Exit-StartLock
 }
 exit $exitCode

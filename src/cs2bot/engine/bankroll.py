@@ -311,12 +311,14 @@ def check_loss_limits(
     actor: str = "system",
     now: datetime | None = None,
 ) -> bool:
-    """Pause the bot (``db.state.set_paused``) when a realized loss limit is reached.
+    """Pause the bot (:func:`cs2bot.engine.ledger.pause_trading`) when a realized loss limit is reached.
 
     Returns True if a daily or weekly limit is currently reached. The pause is written once per
     period (remembered in ``system_state["loss_limit_pauses"]``) so that the owner's manual resume
-    is respected; this function never resumes. The current day / week are ``state.day_start`` /
-    ``state.week_start`` (set by :func:`compute_state`); for a state without them they are derived
+    is respected; this function never resumes. If the bot is already paused for another reason (a
+    balance mismatch), that reason is kept and the limit is appended to it. The current day / week
+    are ``state.day_start`` / ``state.week_start`` (set by :func:`compute_state`); for a state
+    without them they are derived
     from ``now`` (default: utcnow) and the timezone of a full :class:`Settings` (default
     Europe/Warsaw).
     """
@@ -356,7 +358,8 @@ def check_loss_limits(
     fresh = [hit for hit in hits if memo.get(hit[0]) != hit[1]]
     if fresh:
         reason = "; ".join(msg for _, _, msg in hits) + " - resume manually from the dashboard"
-        db_state.set_paused(session, True, actor=actor, reason=reason)
+        # an existing pause (e.g. a balance mismatch) keeps its reason; the limit is appended to it
+        ledger.pause_trading(session, reason, actor=actor)
         memo.update({kind: period for kind, period, _ in fresh})
         db_state.set_state(session, LOSS_LIMIT_STATE_KEY, memo, actor=actor)
         logger.warning("trading paused: %s", reason)

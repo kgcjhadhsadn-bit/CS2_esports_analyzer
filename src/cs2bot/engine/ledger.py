@@ -295,6 +295,33 @@ def record_withdrawal(
     return _append(session, kind=LedgerKind.WITHDRAWAL, amount=-D(amount), note=note, at=at)
 
 
+#: Longest pause reason :func:`pause_trading` keeps when it adds to an existing one.
+MAX_PAUSE_REASON_CHARS = 2000
+
+
+def pause_trading(session: Session, reason: str, *, actor: str = "system") -> bool:
+    """Pause trading with ``reason``; an existing pause keeps its reason and gets this one appended.
+
+    Safety controls (balance mismatch, loss limits) must never hide each other: the owner resumes
+    from the dashboard after reading the pause reason, so a second problem found while the bot is
+    already paused has to show up there too, not only in the audit log. Returns True when this call
+    paused a running bot, False when it only extended the reason of an existing pause (or the
+    reason was already there). Flushes nothing itself (``db.state`` writes through the session).
+    """
+    paused, existing = state.get_pause(session)
+    if not paused:
+        state.set_paused(session, True, actor=actor, reason=reason)
+        return True
+    current = existing or ""
+    if reason in current:
+        return False
+    combined = f"{current}; {reason}" if current else reason
+    if len(combined) > MAX_PAUSE_REASON_CHARS:  # keep the start (the first reason) and the newest one
+        combined = f"{current[: MAX_PAUSE_REASON_CHARS // 2]} [...]; {reason}"[:MAX_PAUSE_REASON_CHARS]
+    state.set_paused(session, True, actor=actor, reason=combined)
+    return False
+
+
 def _unconfirmed_stakes(session: Session) -> Decimal:
     """Stakes of real bets that may or may not exist at the bookmaker and are not debited in the
     ledger: ``PLACING`` (the executor could not confirm them) and ``PENDING`` (the row was committed
@@ -335,7 +362,8 @@ def reconcile(
       (``db.state.set_paused``) with the numbers in the reason. Money appeared or disappeared that the
       bot cannot explain (a deposit or withdrawal, a bet it does not know about, a balance the
       executor misread): sizes and limits are fractions of this number, so the owner confirms it and
-      resumes from the dashboard. An existing pause (and its reason) is left untouched.
+      resumes from the dashboard. An existing pause stays and gets the mismatch appended to its
+      reason (:func:`pause_trading`), so resuming for the other reason cannot hide it.
     * Exception - *deferred*: while placements are unconfirmed (``PLACING`` / ``PENDING`` bets, not
       debited yet) a shortfall of up to their total stake is exactly what an accepted-but-unconfirmed
       bet looks like.
@@ -399,19 +427,17 @@ def reconcile(
             tol,
         )
         state.audit(session, actor=actor, action="reconciliation_mismatch", details=details)
-        if pause_on_flag and not state.get_pause(session)[0]:
-            state.set_paused(
+        if pause_on_flag:
+            paused = pause_trading(
                 session,
-                True,
-                actor=actor,
-                reason=(
-                    f"balance mismatch: Betclic shows {observed} PLN, the ledger expected "
-                    f"{ledger_balance} PLN (difference {diff:+} PLN). The ledger now follows Betclic - "
-                    "check the account for deposits, withdrawals or bets the bot does not know, then "
-                    "resume from the dashboard"
+                (
+                    f"balance mismatch at {when:%Y-%m-%d %H:%M} UTC: Betclic shows {observed} PLN, the "
+                    f"ledger expected {ledger_balance} PLN (difference {diff:+} PLN). The ledger now "
+                    "follows Betclic - check the account for deposits, withdrawals or bets the bot does "
+                    "not know, then resume from the dashboard"
                 ),
+                actor=actor,
             )
-            paused = True
     details["paused"] = paused
     state.set_state(session, state.LAST_RECONCILIATION, details, actor=actor)
     return ReconcileResult(
@@ -491,7 +517,9 @@ def apply_placement(session: Session, bet: Bet, result: PlacementResult, setting
       debited - the stake stays *reserved* (``bankroll.compute_state`` subtracts it from the free
       balance and counts it as exposure) until reconciliation against the bookmaker's bet history
       calls this function again with a ``PLACED`` or a failure result. The attempt time is kept in
-      ``extra["placement_attempted_at"]``; such a bet must never be retried automatically;
+      ``extra["placement_attempted_at"]``; such a bet must never be retried automatically. A dry-run
+      row turns into a real one here (logged as an error): the executor only answers ``UNCERTAIN`` in
+      dry-run mode when money may have moved, and dry-run rows count for no exposure or limit;
     * ``FAILED`` (anything else): no bet exists at the bookmaker; a stake that was already debited
       (not expected) is refunded in full.
 
@@ -552,6 +580,17 @@ def apply_placement(session: Session, bet: Bet, result: PlacementResult, setting
             record_refund(session, bet, at=result.at)
         bet.status, bet.dry_run, bet.extra = BetStatus.DRY_RUN, True, extra
     elif new_status is BetStatus.PLACING:
+        if is_dry_run(bet):
+            # The executor reports UNCERTAIN even in dry-run mode when money may have moved (e.g. a
+            # quick-bet mode placed a bet on the selection click). Dry-run rows are invisible to the
+            # exposure, the limits, the duplicate check and the reconcile deferral, so the row must
+            # become a real one until reconciliation shows whether a bet exists.
+            logger.error(
+                "bet %s was a dry run but the executor could not rule out a REAL placement - counting it "
+                "as an open real bet until reconciled",
+                bet_id,
+            )
+            bet.dry_run = False
         extra.setdefault(PLACEMENT_ATTEMPTED_AT_KEY, result.at.isoformat())
         bet.status, bet.extra = BetStatus.PLACING, extra
         bet.error = result.message or "the bookmaker did not confirm the bet - reconcile before retrying"

@@ -103,6 +103,12 @@ try {
         Show-Backups
         exit 0
     }
+    # Hold the start lock for the whole restore: an autostart / wake task (or start.cmd) that fires
+    # now waits instead of starting the bot on a half-restored database.
+    if (-not (Enter-StartLock)) {
+        throw ('start.ps1 (perhaps the autostart task waiting for Docker), update.ps1 or another restore is ' +
+            'running. Stop the bot first (deploy\windows\stop.cmd), wait a minute, then run this script again.')
+    }
     if (Test-BotRunning) {
         throw 'The bot is running. Stop it first (deploy\windows\stop.cmd), then run this script again.'
     }
@@ -172,4 +178,6 @@ try {
 } catch {
     Write-Fail $_.Exception.Message
     exit 1
+} finally {
+    Exit-StartLock
 }

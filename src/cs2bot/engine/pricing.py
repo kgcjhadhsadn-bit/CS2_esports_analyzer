@@ -613,10 +613,11 @@ def _correct_map_score(spec: MarketSpec, selection: str, core: PredictionCore, c
     score = parse_score_selection(selection)
     if score is None:
         raise UnpriceableMarket(f"selection {selection!r} is not a map score like '2-1'")
-    pmf = _map_scores(core)
-    if score not in pmf and score not in final_map_scores(ctx.fmt):
+    # settlement refuses (UNKNOWN) a selection that is not a possible final score, so pricing does
+    # too - even if a malformed pmf carries mass on it
+    if score not in final_map_scores(ctx.fmt):
         raise UnpriceableMarket(f"{selection} is not a possible final score of a {ctx.fmt.value}")
-    return OutcomeSplit(p_win=pmf.get(score, 0.0))
+    return OutcomeSplit(p_win=_map_scores(core).get(score, 0.0))
 
 
 def _map_handicap(spec: MarketSpec, selection: str, core: PredictionCore, ctx: _Ctx) -> OutcomeSplit:
@@ -692,10 +693,9 @@ def _map_correct_score(spec: MarketSpec, selection: str, core: PredictionCore, c
     score = parse_score_selection(selection)
     if score is None:
         raise UnpriceableMarket(f"selection {selection!r} is not a round score like '13-9'")
-    pmf = _slot_scores(slot)
-    if score not in pmf and not is_final_round_score(*score):
+    if not is_final_round_score(*score):  # settlement refuses it too (UNKNOWN)
         raise UnpriceableMarket(f"{selection} is not a possible final CS2 map score")
-    return _on_slot(slot, OutcomeSplit(p_win=pmf.get(score, 0.0)))
+    return _on_slot(slot, OutcomeSplit(p_win=_slot_scores(slot).get(score, 0.0)))
 
 
 def _map_overtime(spec: MarketSpec, selection: str, core: PredictionCore, ctx: _Ctx) -> OutcomeSplit:

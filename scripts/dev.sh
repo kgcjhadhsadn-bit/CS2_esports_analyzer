@@ -61,6 +61,18 @@ fi
 export UV_FROZEN=1
 export PYTHONUTF8=1
 
+# ANTHROPIC_API_KEY is not a CS2BOT_ setting: the bot's settings read .env themselves, but the
+# Claude client only looks in the environment. Pass the value from .env on (never printed). The
+# whole file is not sourced: values may contain shell characters.
+if [[ -z "${ANTHROPIC_API_KEY:-}" ]]; then
+    key="$(grep -E '^[[:space:]]*(export[[:space:]]+)?ANTHROPIC_API_KEY[[:space:]]*=' .env | tail -n 1 | cut -d= -f2- | tr -d '\r' || true)"
+    key="$(printf '%s' "$key" | sed -E 's/^[[:space:]]+//; s/[[:space:]]+#.*$//; s/[[:space:]]+$//; s/^"(.*)"$/\1/; s/^'"'"'(.*)'"'"'$/\1/')"
+    if [[ -n "$key" ]]; then
+        export ANTHROPIC_API_KEY="$key"
+    fi
+    unset key
+fi
+
 echo "==> Starting PostgreSQL (docker compose up -d --wait)"
 docker compose -f "$ROOT/docker-compose.yml" up -d --wait
 

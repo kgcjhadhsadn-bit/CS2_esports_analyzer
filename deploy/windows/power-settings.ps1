@@ -122,9 +122,11 @@ function Save-PowerBackup {
     }
     $sleep = Get-PowerIndex 'SUB_SLEEP' 'STANDBYIDLE'
     $hibernate = Get-PowerIndex 'SUB_SLEEP' 'HIBERNATEIDLE'
-    if ($null -eq $sleep.AC -or $null -eq $hibernate.AC) {
-        throw 'Could not read the current sleep settings, so they cannot be saved. Nothing was changed.'
+    if ($null -eq $sleep.AC) {
+        throw 'Could not read the current sleep setting, so it cannot be saved. Nothing was changed.'
     }
+    # Hibernate may be unreadable (hibernation switched off with "powercfg /h off"): saved as null
+    # and then left alone on restore.
     $data = @{ standby_ac_s = $sleep.AC; hibernate_ac_s = $hibernate.AC; saved_at = (Get-Date).ToString('o') }
     Initialize-RuntimeFolder -Path $RunDir
     [System.IO.File]::WriteAllText($PowerBackupFile, ($data | ConvertTo-Json), (New-Object System.Text.UTF8Encoding($false)))
@@ -139,7 +141,12 @@ function Set-NeverSleepOnAc {
     if (-not (Confirm-Action 'Change these settings now?' -Default $false)) { Write-Info 'Nothing changed.'; return }
     Save-PowerBackup
     Set-AcIndex -Setting 'STANDBYIDLE' -Value 0
-    Set-AcIndex -Setting 'HIBERNATEIDLE' -Value 0
+    try {
+        Set-AcIndex -Setting 'HIBERNATEIDLE' -Value 0
+    } catch {
+        # Hibernation switched off on this PC: there is no hibernate timeout to change.
+        Write-Info 'Hibernate timeout not changed (hibernation seems to be switched off on this PC).'
+    }
     Invoke-Checked 'powercfg /setactive' 'powercfg' @('/setactive', 'SCHEME_CURRENT')
     Write-Ok 'On mains power the PC no longer goes to sleep or hibernates on its own.'
 }
@@ -147,10 +154,17 @@ function Set-NeverSleepOnAc {
 function Restore-PowerBackup {
     if (-not (Test-Path -LiteralPath $PowerBackupFile)) { Write-Info 'There are no saved values to restore.'; return }
     $data = [System.IO.File]::ReadAllText($PowerBackupFile) | ConvertFrom-Json
-    Write-Info ('Saved values: sleep {0}, hibernate {1} (on mains power)' -f (Format-Timeout ([long]$data.standby_ac_s)), (Format-Timeout ([long]$data.hibernate_ac_s)))
+    $names = @($data.PSObject.Properties | ForEach-Object { $_.Name })
+    if ($names -notcontains 'standby_ac_s' -or $null -eq $data.standby_ac_s) {
+        throw "$PowerBackupFile does not contain the saved sleep value. Nothing was changed."
+    }
+    $hibernateSaved = ($names -contains 'hibernate_ac_s' -and $null -ne $data.hibernate_ac_s)
+    $hibernateText = 'not saved'
+    if ($hibernateSaved) { $hibernateText = Format-Timeout ([long]$data.hibernate_ac_s) }
+    Write-Info ('Saved values: sleep {0}, hibernate {1} (on mains power)' -f (Format-Timeout ([long]$data.standby_ac_s)), $hibernateText)
     if (-not (Confirm-Action 'Restore them now?' -Default $false)) { Write-Info 'Nothing changed.'; return }
     Set-AcIndex -Setting 'STANDBYIDLE' -Value ([long]$data.standby_ac_s)
-    Set-AcIndex -Setting 'HIBERNATEIDLE' -Value ([long]$data.hibernate_ac_s)
+    if ($hibernateSaved) { Set-AcIndex -Setting 'HIBERNATEIDLE' -Value ([long]$data.hibernate_ac_s) }
     Invoke-Checked 'powercfg /setactive' 'powercfg' @('/setactive', 'SCHEME_CURRENT')
     Remove-Item -LiteralPath $PowerBackupFile -Force
     Write-Ok 'Previous sleep settings restored.'
