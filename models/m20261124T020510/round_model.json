@@ -1,0 +1,128 @@
+{
+  "buy_pair_order": [
+    [
+      "pistol",
+      "eco"
+    ],
+    [
+      "pistol",
+      "force"
+    ],
+    [
+      "pistol",
+      "full"
+    ],
+    [
+      "eco",
+      "force"
+    ],
+    [
+      "eco",
+      "full"
+    ],
+    [
+      "force",
+      "full"
+    ]
+  ],
+  "buy_pairs": [
+    0.0,
+    1.1,
+    2.0,
+    1.0052411985137664,
+    1.7371259962265466,
+    0.61014079926236
+  ],
+  "ct_bias": {
+    "ancient": 0.12238401524686565,
+    "anubis": -0.06984779257284897,
+    "cache": 0.14,
+    "dust2": 0.019507543158368643,
+    "inferno": 0.03270320541875933,
+    "mirage": 0.10491259494978919,
+    "nuke": 0.2771028282293078,
+    "overpass": 0.16,
+    "train": 0.17364386220092878,
+    "vertigo": 0.04
+  },
+  "fit_stats": {
+    "as_of": "2026-11-24T02:05:10+00:00",
+    "converged": true,
+    "effective_rounds": 7625.872541122998,
+    "half_life_days": 365.0,
+    "iterations": 32,
+    "n_map_instances": 433,
+    "n_rounds": 9186,
+    "n_skipped": 0,
+    "objective": 4504.229725249047,
+    "per_map": {
+      "ancient": {
+        "ct_bias": 0.12238401524686565,
+        "n_rounds": 1363,
+        "raw_ct_win_rate": 0.5164179553200587
+      },
+      "anubis": {
+        "ct_bias": -0.06984779257284897,
+        "n_rounds": 1305,
+        "raw_ct_win_rate": 0.4852998776897224
+      },
+      "dust2": {
+        "ct_bias": 0.019507543158368643,
+        "n_rounds": 1136,
+        "raw_ct_win_rate": 0.5006297508278975
+      },
+      "inferno": {
+        "ct_bias": 0.03270320541875933,
+        "n_rounds": 1463,
+        "raw_ct_win_rate": 0.49414412852317297
+      },
+      "mirage": {
+        "ct_bias": 0.10491259494978919,
+        "n_rounds": 1364,
+        "raw_ct_win_rate": 0.5190856463126966
+      },
+      "nuke": {
+        "ct_bias": 0.2771028282293078,
+        "n_rounds": 1258,
+        "raw_ct_win_rate": 0.5529687201715364
+      },
+      "train": {
+        "ct_bias": 0.17364386220092878,
+        "n_rounds": 1297,
+        "raw_ct_win_rate": 0.530527454232355
+      }
+    },
+    "pistol_rounds": 866
+  },
+  "kind": "cs2bot.RoundModel",
+  "pistol_ct_adj": -0.0809322513635434,
+  "priors": {
+    "buy_pair_mean": [
+      0.0,
+      1.1,
+      2.0,
+      1.1,
+      2.0,
+      0.85
+    ],
+    "buy_pair_sd": 0.35,
+    "ct_bias_default": 0.05,
+    "ct_bias_mean": {
+      "ancient": 0.16,
+      "anubis": -0.201,
+      "cache": 0.14,
+      "dust2": 0.02,
+      "inferno": 0.04,
+      "mirage": 0.08,
+      "nuke": 0.261,
+      "overpass": 0.16,
+      "train": 0.18,
+      "vertigo": 0.04
+    },
+    "ct_bias_sd": 0.12,
+    "pistol_ct_adj_mean": 0.0,
+    "pistol_ct_adj_sd": 0.2,
+    "strength_sd": 0.6
+  },
+  "version": 1
+}

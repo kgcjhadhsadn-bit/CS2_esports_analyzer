@@ -59,7 +59,7 @@ class BetDecision(BaseModel):
 class PlacementStatus(StrEnum):
     PLACED = "placed"
     DRY_RUN_OK = "dry_run_ok"
-    ODDS_MOVED = "odds_moved"
+    ODDS_MOVED = "odds_moved"  # also: odds rose implausibly far above the request - re-price, never resend
     MARKET_UNAVAILABLE = "market_unavailable"
     INSUFFICIENT_BALANCE = "insufficient_balance"
     LOGIN_REQUIRED = "login_required"
@@ -85,6 +85,19 @@ class BetOrder(BaseModel):
     min_acceptable_odds: Decimal
     stake: Decimal
     dry_run: bool = True
+    # UTC kick-off of the bookmaker event: the executor refuses the order once it has passed (orders can
+    # wait in the executor's queue, e.g. behind a manual login window). None disables that check.
+    event_starts_at: datetime | None = None
+    event_name: str = ""  # bookmaker event name (diagnostics / future on-page verification)
+
+    @field_validator("event_starts_at")
+    @classmethod
+    def _starts_utc(cls, value: datetime | None) -> datetime | None:
+        if value is None:
+            return None
+        if value.tzinfo is None:
+            raise ValueError("event_starts_at must be timezone-aware")
+        return ensure_utc(value)
 
 
 class PlacementResult(BaseModel):

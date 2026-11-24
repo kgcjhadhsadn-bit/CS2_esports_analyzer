@@ -1,0 +1,82 @@
+{
+  "format": 1,
+  "version": "m20261124T020510",
+  "trained_at": "2026-11-24T02:05:14.854741+00:00",
+  "as_of": "2026-11-24T02:05:10+00:00",
+  "model_run_id": 1,
+  "files": {
+    "ratings": "ratings.json",
+    "veto": "veto.json",
+    "round_model": "round_model.json",
+    "kill_model": "kill_model.npz",
+    "ensemble": null
+  },
+  "metrics": {
+    "n_map_results": 433,
+    "n_vetoes": 220,
+    "n_rounds": 9186,
+    "n_player_maps": 4330,
+    "ratings": {
+      "n_processed": 433,
+      "teams": 8
+    },
+    "veto": {
+      "n_records": 220
+    },
+    "round_model": {
+      "n_rounds": 9186,
+      "n_skipped": 0,
+      "n_map_instances": 433,
+      "effective_rounds": 7625.872541122998,
+      "converged": true,
+      "iterations": 32,
+      "objective": 4504.229725249047,
+      "per_map": {
+        "train": {
+          "n_rounds": 1297,
+          "raw_ct_win_rate": 0.530527454232355,
+          "ct_bias": 0.17364386220092878
+        },
+        "dust2": {
+          "n_rounds": 1136,
+          "raw_ct_win_rate": 0.5006297508278975,
+          "ct_bias": 0.019507543158368643
+        },
+        "inferno": {
+          "n_rounds": 1463,
+          "raw_ct_win_rate": 0.49414412852317297,
+          "ct_bias": 0.03270320541875933
+        },
+        "anubis": {
+          "n_rounds": 1305,
+          "raw_ct_win_rate": 0.4852998776897224,
+          "ct_bias": -0.06984779257284897
+        },
+        "mirage": {
+          "n_rounds": 1364,
+          "raw_ct_win_rate": 0.5190856463126966,
+          "ct_bias": 0.10491259494978919
+        },
+        "nuke": {
+          "n_rounds": 1258,
+          "raw_ct_win_rate": 0.5529687201715364,
+          "ct_bias": 0.2771028282293078
+        },
+        "ancient": {
+          "n_rounds": 1363,
+          "raw_ct_win_rate": 0.5164179553200587,
+          "ct_bias": 0.12238401524686565
+        }
+      },
+      "pistol_rounds": 866,
+      "half_life_days": 365.0,
+      "as_of": "2026-11-24T02:05:10+00:00"
+    },
+    "kill_model": {
+      "n_records": 4330,
+      "n_skipped": 0
+    },
+    "ensemble": null,
+    "rating_config": "default"
+  }
+}
