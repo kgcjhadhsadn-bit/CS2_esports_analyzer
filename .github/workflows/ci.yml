@@ -170,6 +170,27 @@ jobs:
           command -v shellcheck >/dev/null || { sudo apt-get update -q && sudo apt-get install -y -q shellcheck; }
           shellcheck --version
           shellcheck -x -S warning deploy/linux/*.sh
+      - name: init-env.sh (fresh .env, re-run keeps values, never uid 0)
+        run: |
+          tmp="$(mktemp -d)"
+          cp -r deploy .env.example docker-compose.cloud.yml "$tmp/"
+          bash "$tmp/deploy/linux/init-env.sh" --domain bot.example.pl
+          test "$(stat -c %a "$tmp/.env")" = 600
+          for key in POSTGRES_PASSWORD CS2BOT_API__PASSWORD CS2BOT_API__SESSION_SECRET; do
+            grep -Eq "^${key}=[A-Za-z0-9]{24,}$" "$tmp/.env"
+          done
+          grep -qx 'CS2BOT_API__HOST=0.0.0.0' "$tmp/.env"
+          grep -qx 'CS2BOT_PUBLIC_HOST=bot.example.pl' "$tmp/.env"
+          grep -qx 'CS2BOT_TLS_MODE=auto' "$tmp/.env"
+          grep -qx 'CS2BOT_EXECUTOR__DRY_RUN=true' "$tmp/.env"
+          pw="$(grep '^CS2BOT_API__PASSWORD=' "$tmp/.env")"
+          sed -i 's/^CS2BOT_EXECUTOR__DRY_RUN=true$/CS2BOT_EXECUTOR__DRY_RUN=false/' "$tmp/.env"
+          bash "$tmp/deploy/linux/init-env.sh"
+          grep -qx "$pw" "$tmp/.env"
+          grep -qx 'CS2BOT_EXECUTOR__DRY_RUN=false' "$tmp/.env"
+          sudo bash "$tmp/deploy/linux/init-env.sh"
+          if grep -Eq '^APP_(UID|GID)=0$' "$tmp/.env"; then echo "APP_UID/APP_GID 0 written"; exit 1; fi
+          sudo rm -rf "$tmp"
       - name: Test .env
         run: |
           {
@@ -216,6 +237,10 @@ jobs:
           test "$(curl -s -k -o /dev/null -w '%{http_code}' https://localhost/api/health)" = 401
           bash deploy/linux/backup.sh --label ci
           bash deploy/linux/restore.sh --yes
+          # restore.sh leaves betting paused (the restored ledger may miss newer bets)
+          state="$(docker compose exec -T app cs2bot control status)"
+          echo "$state"
+          grep -q '^paused: yes' <<<"$state"
           bash deploy/linux/status.sh
       - name: Container logs
         if: failure()

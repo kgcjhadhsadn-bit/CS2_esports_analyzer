@@ -22,7 +22,7 @@ Files (all new except `ci.yml`):
 | `deploy/linux/deploy.sh` | Preflight (.env keys, TLS mode vs IP, DRY_RUN warning, empty Betclic/Telegram warnings, `data/ logs/` owner = `APP_UID`, disk), `compose build --pull app`, optional `--selftest` (`compose run --rm --no-deps app selftest`), `compose up -d --remove-orphans`, wait healthy (postgres 180 s, app `--timeout` 1200 s), status + URL. |
 | `deploy/linux/update.sh` | Backup (`before-update`), refuses local edits outside `config/` (those are stashed and re-applied), `git pull --ff-only` (`--branch`), `deploy.sh --selftest`. |
 | `deploy/linux/backup.sh` | `pg_dump -Fc -Z6` via `compose exec -T postgres` to `backups/cs2bot-YYYYMMDD-HHMMSS[-label].dump`, verified with `pg_restore --list`, retention (`--keep-days` / `BACKUP_KEEP_DAYS` 14, newest `--keep-at-least` 3 kept), optional `--with-data` / `BACKUP_INCLUDE_DATA` (tar of `data/models` + `data/browser` without caches), optional off-site `rclone copy` to `RCLONE_REMOTE` + remote retention `RCLONE_KEEP_DAYS` (30); log in `logs/backup.log`. |
-| `deploy/linux/restore.sh` | `--list`; FILE or newest; typed `RESTORE` (or `--yes`); safety backup `before-restore`; stops the app; `compose cp` into the container; `dropdb --force` + `createdb`; `pg_restore --exit-on-error --no-owner`; starts the app (its entrypoint migrates) and waits; on failure the app stays stopped. |
+| `deploy/linux/restore.sh` | `--list`; FILE or newest; typed `RESTORE` (or `--yes`); safety backup `before-restore`; stops the app; `compose cp` into the container; `dropdb --force` + `createdb`; `pg_restore --exit-on-error --no-owner`; migrates and sets a **manual pause** in a one-off container (`--no-pause` skips it); starts the app and waits; on any failure the app stays stopped. |
 | `deploy/linux/logs.sh`, `status.sh`, `prune.sh`, `vnc.sh` | Logs per service / log files; overview (health, `cs2bot control status`, `--doctor`, settings, disk, latest backup age, timers); weekly clean-up (images/build cache/networks older than 7 days, never volumes); x11vnc on `:99` with a one-time password, `-once`, timeout, reachable only through `ssh -L 5900:127.0.0.1:5900`. |
 | `deploy/linux/systemd/cs2bot-{backup,prune}.{service,timer}`, `deploy/linux/logrotate.conf` | Templates (`@DIR@`, `@USER@`) installed by provision.sh: backup daily 04:15 (Persistent), prune Sunday 05:40; logrotate daily, 14 files, copytruncate, for `logs/*.log`. |
 | `deploy/linux/.gitattributes` | LF line endings. |
@@ -52,14 +52,14 @@ deploy/linux/deploy.sh   [--no-build] [--no-wait] [--timeout SECONDS(1200)] [--s
 deploy/linux/update.sh   [--no-backup] [--branch NAME] [--yes]
 deploy/linux/backup.sh   [--label WORD] [--keep-days N] [--keep-at-least N(3)] [--no-prune] [--no-offsite]
                          [--with-data] [--quiet]
-deploy/linux/restore.sh  --list | [FILE] [--yes] [--no-safety-backup]
+deploy/linux/restore.sh  --list | [FILE] [--yes] [--no-safety-backup] [--no-pause]
 deploy/linux/logs.sh     [app|postgres|caddy|all] [--since 2h] [--tail N] [--no-follow] | --file | --backup
 deploy/linux/status.sh   [--doctor]
 deploy/linux/prune.sh    [--dry-run]
 deploy/linux/vnc.sh      [--timeout SECONDS(600)] [--view-only] | --stop
 ```
 
-Container entrypoint (`/usr/local/bin/cs2bot-entrypoint`, PID 1 = tini): `up` (default) | `selftest` | `migrate` | any command (`docker compose exec app cs2bot <cmd>`, `docker compose run --rm app cs2bot <cmd>`). Environment it reads: `CS2BOT_PUBLIC_HOST`, `DISPLAY` (:99), `XVFB_SCREEN` (1920x1080x24), `CS2BOT_APP_DIR` (/app), `CS2BOT_LOG_FILE` (`/app/logs/cs2bot.log`, empty = off), `DB_UPGRADE_ATTEMPTS` (10). It never overrides `CS2BOT_API__ALLOWED_HOSTS` / `CS2BOT_API__CORS_ORIGINS` when they are set.
+Container entrypoint (`/usr/local/bin/cs2bot-entrypoint`, PID 1 = tini): `up` (default) | `selftest` | `migrate` | any command (`docker compose exec app cs2bot <cmd>`, `docker compose run --rm app cs2bot <cmd>`; for a one-off `run` container the entrypoint first starts its own Xvfb on `DISPLAY` when that display's socket is missing - a failure is only a warning - and then `exec`s the command). Environment it reads: `CS2BOT_PUBLIC_HOST`, `DISPLAY` (:99), `XVFB_SCREEN` (1920x1080x24), `CS2BOT_APP_DIR` (/app), `CS2BOT_LOG_FILE` (`/app/logs/cs2bot.log`, empty = off), `DB_UPGRADE_ATTEMPTS` (10). It never overrides `CS2BOT_API__ALLOWED_HOSTS` / `CS2BOT_API__CORS_ORIGINS` when they are set.
 
 `.env` keys added for the VPS (besides every `CS2BOT_*` setting): `COMPOSE_FILE=docker-compose.cloud.yml`, `APP_UID`, `APP_GID`, `POSTGRES_USER`, `POSTGRES_PASSWORD`, `POSTGRES_DB`, `POSTGRES_SHARED_BUFFERS` / `_EFFECTIVE_CACHE_SIZE` / `_WORK_MEM` / `_MAINTENANCE_WORK_MEM`, `CS2BOT_PUBLIC_HOST`, `CS2BOT_TLS_MODE` (`auto` | `internal`), `VNC_HOST_PORT` (5900), `BACKUP_KEEP_DAYS` (14), `BACKUP_INCLUDE_DATA`, `RCLONE_REMOTE`, `RCLONE_KEEP_DAYS` (30).
 
@@ -106,3 +106,84 @@ cd /opt/cs2bot && docker compose run -d --name cs2bot-backfill \
 ## New dependency requests
 
 None for the Python project or the dashboard. The image adds Debian packages (`tini`, `xvfb`, `x11vnc`, `unar`, `libarchive-tools`, `curl`, fonts, plus Playwright's own `--with-deps` set) and the VPS gets Docker CE, ufw, fail2ban, unattended-upgrades and rclone from apt.
+
+## Review round 1
+
+Independent review of every file of the package against the brief, `config.py`, the CLI, the API's
+Host / CSRF / password rules and the cloud_autonomy settings.
+
+### What was verified
+
+- **Env names**: every `CS2BOT_*` name in the Dockerfile, compose file, scripts, CI and VPS_SETUP.md
+  was checked programmatically against `Settings` (sections and fields). All are real settings except
+  the deploy-only variables (`CS2BOT_PUBLIC_HOST`, `CS2BOT_TLS_MODE`, `CS2BOT_APP_DIR`, `CS2BOT_LOG_FILE`,
+  `CS2BOT_BACKUP_DIR`, `CS2BOT_REPO_URL`, `CS2BOT_BRANCH`, the internal lock / sourcing guards), which
+  `extra="ignore"` drops.
+- **CLI names** used by the scripts and docs exist with those options (`db upgrade`, `up`, `doctor`,
+  `control status|pause --reason|resume|kill-switch`, `telegram test`, `ingest backfill --since`,
+  `odds unmapped`, `models train|list`, `version`).
+- **API host / password rule**: compose forces `CS2BOT_API__HOST=0.0.0.0` and makes
+  `CS2BOT_API__PASSWORD` + `CS2BOT_API__SESSION_SECRET` required (`${VAR:?}`; `docker compose config`
+  fails without them, re-checked here); the entrypoint refuses to start without them too. The Host
+  allow-list / https origin are derived from `CS2BOT_PUBLIC_HOST`; the healthcheck's
+  `127.0.0.1:8000` is always allowed (loopback + API port).
+- **Exposure**: rendered compose config - only Caddy publishes 80/443; PostgreSQL has no ports and sits
+  on the `internal` backend network; the API port 8000 is never published (only Caddy reaches it); the
+  VNC port is published on the host's 127.0.0.1 only. ufw allows SSH/80/443.
+- **DISPLAY / Xvfb**: `DISPLAY=:99` in compose, supervised Xvfb in the entrypoint, executor
+  `headless=false`; `effective_headless` cannot fall back because DISPLAY is always set.
+- **Volumes**: `./data` (browser profiles incl. the Betclic session and placement journal, models,
+  caches, screenshots, demos), `./logs`, `./config:ro`; named volumes for PostgreSQL and Caddy.
+- **Proxies**: `CS2BOT_BETCLIC__PROXY_URL` is optional and empty by default; `CS2BOT_HLTV__PROXY_URL`
+  with `CS2BOT_HLTV__PROXY_MODE=after_block` (default) is the configurable HLTV fallback.
+- Ran: `bash -n` on every script; `yaml.safe_load` on compose + CI; `docker compose config` (and its
+  failure on a missing secret); `init-env.sh` fresh / re-run / as root; deploy.sh and restore.sh (success,
+  pause failure, pg_restore failure) and `wait_healthy` (restart loop) against a fake `docker`; the
+  entrypoint with real Xvfb and a fake `cs2bot` (SIGTERM forwarding, derived hosts/origins, no leftover
+  Xvfb) and its new one-off-command display path (piped stdin preserved, existing display reused);
+  the new CI `init-env.sh` step locally; ruff / ruff format / mypy on `selftest.py`; tests/foundation
+  (37 passed).
+
+### Issues found
+
+1. **major, fixed** - `restore.sh` restarted the bot with betting enabled on a restored ledger that
+   misses every bet placed after the backup (exposure, daily / weekly loss limits and bets-per-day
+   computed too low; the kill switch / pause state reverts to the backup's). It now migrates the
+   restored database and sets a **manual pause** (never auto-resumed) in a one-off container before
+   starting the bot; if that fails the bot stays stopped with instructions. `--no-pause` opts out.
+   VPS_SETUP.md section 13 explains it; CI asserts `paused: yes` after the restore.
+2. **major, fixed** - `init-env.sh` run as root without `--uid` wrote `APP_UID=0` / `APP_GID=0`
+   (reproduced): the image build fails (`useradd` cannot create a second uid 0) and the intent is that
+   the bot never runs as root. It now uses the checkout owner's uid (or 10001) and repairs an existing
+   0; `deploy.sh` refuses `APP_UID`/`APP_GID` 0 or non-numeric values. CI step added.
+3. **minor, fixed** - `restore.sh`: a failing `dropdb` / `createdb` aborted via `set -e` without a
+   message and without restarting the bot; now explicit (database unchanged -> bot restarted; database
+   missing -> bot stays stopped, clear message).
+4. **minor, fixed** - `wait_healthy` waited the whole timeout (20 min for the app) when the container
+   was crash-looping (health resets to `starting` after every restart); more than one restart while
+   waiting now fails at once.
+5. **minor, fixed** - entrypoint: a SIGTERM arriving after the traps were installed but before the bot's
+   pid was known was lost (the bot then ran until Docker's SIGKILL); it is now remembered and delivered.
+6. **minor, fixed** - one-off containers (`docker compose run`, e.g. the backfill) had no X display, so
+   `CS2BOT_HLTV__HEADLESS=false` (visible HLTV browser, PLAN 0b) crashed there; the entrypoint now starts
+   an Xvfb for them (warning only on failure) and still `exec`s the command. (A first version of this
+   change computed the socket path wrongly - caught by the test and fixed before finishing.)
+7. **minor, fixed** - `deploy.sh` accepted a `CS2BOT_PUBLIC_HOST` with a scheme / port / path, which
+   yields a broken Caddy `default_sni`, Host allow-list and CSRF origin; it now requires a bare domain or
+   IPv4.
+8. **docs, fixed** - VPS_SETUP.md: Betclic proxy presented as optional with the owner's observation
+   that Betclic works from a Polish VPN (start without a proxy); HLTV proxy fallback and
+   `CS2BOT_HLTV__PROXY_MODE` documented (settings table + backfill section); visible-HLTV option and its
+   VNC caveat; restore pause. `status.sh` also shows the HLTV proxy mode.
+
+### Remaining concerns
+
+- Still not built or run here (no Docker daemon, no shellcheck): the image, Caddy, Let's Encrypt and
+  the full compose smoke test are validated only by the CI `docker` job; `provision.sh` only by reading.
+- `cs2bot up` installs its SIGTERM handler only after the first model training (`flows/supervisor.py`):
+  a `docker stop` during a long first training kills the process without a clean shutdown (harmless for
+  training, noted for the integration owner).
+- Visible HLTV on the same Xvfb display can cover the Betclic window in VNC (no window manager); kept
+  headless by default, documented as an option.
+- FCR 1 (proxy headers: per-Caddy login rate limit, non-`Secure` cookie) and FCR 2 (Chromium args
+  instead of the `cs2bot-chromium` wrapper) from the implementer still stand.

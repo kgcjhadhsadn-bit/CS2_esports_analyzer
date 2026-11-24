@@ -272,6 +272,10 @@ docker logs -f cs2bot-backfill        # progress (Ctrl+C stops following)
   as a fallback while the server's own IP is blocked (`CS2BOT_HLTV__PROXY_MODE=after_block`, the
   default; `always` sends every HLTV page through it). The backfill container reads the same `.env`.
   See OPERATIONS.md for slowing down.
+- HLTV's browser is invisible (headless) by default. `CS2BOT_HLTV__HEADLESS=false` runs it visibly
+  on the server's virtual screen instead (fewer Cloudflare challenges; the backfill container starts
+  its own virtual screen for it). Its window can then cover the Betclic window when you look through
+  VNC ([section 12](#12-when-betclic-asks-for-an-sms-code-vnc-over-ssh)).
 
 ## 10. Dry-run smoke test, then going live
 

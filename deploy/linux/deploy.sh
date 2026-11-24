@@ -44,6 +44,10 @@ done
 public_host="$(env_get CS2BOT_PUBLIC_HOST)"
 tls_mode="$(env_get CS2BOT_TLS_MODE)"
 tls_mode="${tls_mode:-auto}"
+# Caddy's site address, the API's Host allow-list and the CSRF origin are all built from this value.
+if [[ ! "$public_host" =~ ^[A-Za-z0-9.-]+$ ]]; then
+    die "CS2BOT_PUBLIC_HOST must be a bare domain or IPv4 address like bot.example.pl (no https://, port, path or IPv6); got '$public_host'"
+fi
 if [[ "$public_host" =~ ^[0-9.]+$ || "$public_host" == *:* ]] && [[ "$tls_mode" != "internal" ]]; then
     warn "CS2BOT_PUBLIC_HOST is an IP address: set CS2BOT_TLS_MODE=internal (no public certificate for IPs)"
 fi
@@ -67,7 +71,7 @@ app_gid="$(env_get APP_GID)"
 app_gid="${app_gid:-10001}"
 [[ "$app_uid" =~ ^[0-9]+$ && "$app_gid" =~ ^[0-9]+$ ]] || die "APP_UID / APP_GID in .env must be numbers"
 if [[ "$app_uid" == "0" || "$app_gid" == "0" ]]; then
-    die "APP_UID/APP_GID is 0 (root) in .env: the bot must not run as root - run deploy/linux/init-env.sh as the cs2bot user, or set both to $(stat -c '%u' "$REPO_ROOT"):$(stat -c '%g' "$REPO_ROOT")"
+    die "APP_UID/APP_GID is 0 (root) in .env: the bot must not run as root - run $DEPLOY_DIR/init-env.sh (it replaces 0 with the checkout owner's uid) or set both to the cs2bot user's uid/gid (id cs2bot)"
 fi
 for dir in "$DATA_DIR" "$LOG_DIR"; do
     if [[ ! -d "$dir" ]]; then

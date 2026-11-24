@@ -133,13 +133,14 @@ ok "database restored from $(basename "$FILE")"
 if ((PAUSE)); then
     info "migrating the restored database and pausing betting (check the ledger, then resume)"
     note="database restored from $(basename "$FILE") on $(date '+%Y-%m-%d %H:%M'): bets placed after that backup are missing from the ledger - check bankroll and bets, then resume"
-    # One-off container of the new image (no ports, no Xvfb): migrate first, the backup may be older.
+    # One-off container of the current image (no published ports): migrate first, the backup may be older.
     # The reason travels as an environment variable, never through shell quoting.
     if ! compose run --rm --no-deps -T -e "CS2BOT_RESTORE_NOTE=$note" app \
         bash -c 'cs2bot db upgrade && cs2bot control pause --reason "$CS2BOT_RESTORE_NOTE"'; then
         err "could not pause betting after the restore, so the bot stays STOPPED (it would bet with an"
         err "incomplete ledger). Pause it by hand and start it:"
-        err "  docker compose run --rm --no-deps app cs2bot control pause && docker compose start app"
+        err "  docker compose run --rm --no-deps app bash -c 'cs2bot db upgrade && cs2bot control pause'"
+        err "  docker compose start app"
         exit 1
     fi
     ok "betting is paused (manual pause: resume it from the dashboard, Telegram /resume or cs2bot control resume)"

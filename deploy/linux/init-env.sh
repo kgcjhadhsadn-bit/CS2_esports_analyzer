@@ -43,7 +43,7 @@ if ((NEW_UID == 0)); then
         NEW_UID=10001
         NEW_GID=10001
     fi
-    warn "running as root: APP_UID/APP_GID set to $NEW_UID:$NEW_GID (the bot never runs as root)"
+    warn "running as root: a missing APP_UID/APP_GID becomes $NEW_UID:$NEW_GID (the bot never runs as root)"
 fi
 ((NEW_GID != 0)) || NEW_GID="$NEW_UID"
 

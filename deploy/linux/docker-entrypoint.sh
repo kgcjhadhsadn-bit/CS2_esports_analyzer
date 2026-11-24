@@ -6,7 +6,11 @@
 #             and the container exits non-zero so Docker restarts it.
 #   selftest  Xvfb + deploy/linux/selftest.py (Chromium headful/headless, dashboard, tools); no DB.
 #   migrate   only `cs2bot db upgrade`.
-#   <other>   executed as given, e.g. `docker compose run --rm app cs2bot doctor` or `bash`.
+#   <other>   executed as given, e.g. `docker compose run --rm app cs2bot doctor` or `bash`. A one-off
+#             container (`docker compose run`) has no Xvfb of its own, so one is started first (when
+#             DISPLAY is set and its socket is missing; a failure is only a warning): a visible browser
+#             (e.g. CS2BOT_HLTV__HEADLESS=false in the backfill container) then works like in the bot.
+#             The command replaces this script (exec), so signals and the terminal reach it directly.
 #
 # Environment (all optional; docker-compose.cloud.yml sets the important ones):
 #   CS2BOT_PUBLIC_HOST       domain or IP of the dashboard behind Caddy. When CS2BOT_API__ALLOWED_HOSTS /
@@ -259,6 +263,14 @@ case "$cmd" in
         db_upgrade
         ;;
     *)
+        display_number="${DISPLAY:-}"
+        display_number="${display_number#*:}"
+        display_socket="/tmp/.X11-unix/X${display_number%%.*}"
+        if [[ -n "${DISPLAY:-}" && ! -S "$display_socket" ]]; then
+            # In a subshell: `die` there only skips the display. Xvfb keeps running after the exec below
+            # (tini, PID 1, reaps it) and ends with the container.
+            (start_xvfb) || log "WARNING: no virtual display ($DISPLAY); continuing without it"
+        fi
         exec "$@"
         ;;
 esac
