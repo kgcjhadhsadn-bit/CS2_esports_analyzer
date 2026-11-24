@@ -30,7 +30,8 @@ One cycle (:func:`run_betting_cycle`):
    * ``LOGIN_REQUIRED`` / ``SELECTOR_ERROR`` pause trading with a clear reason (dashboard alert).
    * ``UNCERTAIN`` keeps the bet ``PLACING`` (exposure, audit alert, never retried) and stops placing
      for the rest of the cycle, like ``KILL_SWITCH`` / ``INSUFFICIENT_BALANCE`` (no pause: the next
-     cycle tries again).
+     cycle tries again) - unless another real placement is still unconfirmed: two open UNCERTAIN
+     placements pause trading (the confirmation step itself is probably broken).
    * An executor that is closed (shutdown) answers before sending anything: FAILED, cycle stopped.
    * A result that cannot be recorded leaves the bet ``PLACING`` for settlement; the cycle stops.
    * ``should_stop`` (the shutdown event of ``cs2bot up``) is checked before every placement.
@@ -73,16 +74,16 @@ from cs2bot.domain.betting import (
     PlacementStatus,
     PricedOutcome,
 )
-from cs2bot.domain.enums import BetStatus, MatchStatus
+from cs2bot.domain.enums import BetStatus, MatchFormat, MatchStatus
 from cs2bot.domain.predictions import MatchPrediction
 from cs2bot.engine import bankroll, decision, ledger
 from cs2bot.engine.decision import NON_BLOCKING_BET_STATUSES, ReasonCode, make_reason
 from cs2bot.engine.ev import price_all
 from cs2bot.engine.pricing import price_quotes
 from cs2bot.odds import latest_quotes
-from cs2bot.services.prediction import write_outcome_predictions, write_rationale
+from cs2bot.services.prediction import stale_reason, write_outcome_predictions, write_rationale
 from cs2bot.services.registry import ModelBundle
-from cs2bot.services.settlement import UNCONFIRMED_NOT_FOUND_KEY
+from cs2bot.services.settlement import TEAMS_AT_PLACEMENT_KEY, UNCONFIRMED_NOT_FOUND_KEY
 from cs2bot.utils.time import ensure_utc, utcnow
 
 log = logging.getLogger(__name__)
@@ -502,6 +503,7 @@ def candidate_analyses(
             MatchAnalysis.is_latest.is_(True),
             MatchAnalysis.created_at >= now - max_prediction_age,
             Match.status.in_([MatchStatus.SCHEDULED, MatchStatus.UNKNOWN]),
+            Match.in_scope.is_(True),  # Tier 1/2 only (PLAN.md 4.1), also when a match left the scope
             Match.scheduled_at.is_not(None),
             Match.scheduled_at > now,
             Match.scheduled_at <= horizon,
@@ -512,6 +514,30 @@ def candidate_analyses(
     if model_version is not None:
         rows = [r for r in rows if r.model_version == model_version]
     return rows
+
+
+def prediction_mismatch(prediction: MatchPrediction, match: Match) -> str | None:
+    """Why a stored prediction must not be bet for ``match`` any more (None = it describes the match).
+
+    The prediction is in the orientation of the match row when it was made, and the quotes are mapped in
+    the orientation of the match row now. A source can replace a participant (PandaScore resolving a
+    placeholder, HLTV re-pointing a match it alone knows) or change the format, and a prediction that
+    could not be refreshed afterwards is flagged stale by :mod:`cs2bot.services.prediction`: in every
+    such case the old probabilities would be priced against odds for other teams / another series.
+    """
+    if prediction.match_id != match.id:
+        return f"the prediction belongs to match {prediction.match_id}"
+    if (prediction.team1_id, prediction.team2_id) != (match.team1_id, match.team2_id):
+        return (
+            f"the prediction is for teams {prediction.team1_id} / {prediction.team2_id}, the match now has "
+            f"{match.team1_id} / {match.team2_id}"
+        )
+    if match.format is not None and MatchFormat(match.format) is not prediction.format:
+        return f"the prediction is for a {prediction.format.value}, the match is now a {match.format.value}"
+    stale = stale_reason(match)
+    if stale is not None:
+        return f"the stored prediction is out of date ({stale})"
+    return None
 
 
 def _event_info(session: Session, event_id: int, match: Match | None) -> tuple[datetime | None, str]:
@@ -700,6 +726,11 @@ def _bet_match(
         if analysis is None or match is None:
             return
         prediction = MatchPrediction.model_validate(analysis.payload)
+        mismatch = prediction_mismatch(prediction, match)
+        if mismatch is not None:
+            log.warning("match %s is not bet: %s", match_id, mismatch)
+            report.notes.append(f"match {match_id} not bet: {mismatch}"[:500])
+            return
         quotes = latest_quotes(session, match_id, max_age_s=settings.betclic.odds_max_age_s, now=now)
         if not quotes:
             return
@@ -884,6 +915,8 @@ def _place_one(
         "p_win": dec.priced.outcome.p_win,
         "ev": dec.priced.ev,
         "model_odds_captured_at": quote.captured_at.isoformat(),
+        # the orientation the bet was priced in: settlement refuses to resolve "team1" against other teams
+        TEAMS_AT_PLACEMENT_KEY: [match.team1_id, match.team2_id],
     }
     session.add(bet)
     session.commit()  # the row exists (PENDING) before anything is sent
@@ -981,6 +1014,7 @@ def _place_one(
     if result.screenshot_path:
         bet.screenshot_path = result.screenshot_path
     bet.extra = {**dict(bet.extra or {}), "placement_message": result.message[:1000]}
+    pause_reason: str | None = None
     if status is BetStatus.FAILED:
         bet.error = f"{result.status.value}: {result.message}"[:2000]
         report.failed += 1
@@ -996,6 +1030,7 @@ def _place_one(
                 "idempotency_key": bet.idempotency_key,
             },
         )
+        pause_reason = _repeated_uncertain_reason(session, bet)
     elif status is BetStatus.DRY_RUN:
         report.dry_run_ok += 1
     elif status is BetStatus.PLACED:
@@ -1008,7 +1043,6 @@ def _place_one(
                 details={"bet_id": bet.id, "message": result.message[:500]},
             )
     report.bets.append(_summary(bet, result.status.value, result.message))
-    pause_reason: str | None = None
     if result.status in PAUSING_STATUSES:
         what = (
             "Betclic login required"
@@ -1016,6 +1050,7 @@ def _place_one(
             else "Betclic page layout changed (selector error)"
         )
         pause_reason = f"{what}: {result.message}"[:500]
+    if pause_reason is not None:
         ledger.pause_trading(session, pause_reason, actor=ACTOR)
     session.commit()
     if pause_reason is not None:
@@ -1030,6 +1065,33 @@ def _place_one(
         # paper bets are invisible to compute_state; reserve them locally so caps hold in this cycle
         return bankroll.reserve_stake(state, match.id, dec.stake)
     return _sizing_state(session, settings, now=now, dry=dry)
+
+
+def _repeated_uncertain_reason(session: Session, bet: Bet) -> str | None:
+    """Pause reason when ``bet`` is not the only unconfirmed real placement still open.
+
+    One UNCERTAIN answer stops the cycle (``STOP_CYCLE_STATUSES``) and the next cycle tries again. A second
+    one while the first is still unresolved means the confirmation step itself is broken (a changed
+    receipt layout, a stuck page): every further cycle would click one more real bet that nobody can
+    confirm. Pausing bounds that to two unconfirmed bets until the owner has checked "Moje zakłady"
+    (settlement resolves PLACING bets from the bet history). Final review.
+    """
+    if bet.dry_run:
+        return None
+    others = (
+        session.scalar(
+            select(func.count(Bet.id)).where(
+                Bet.status == BetStatus.PLACING, Bet.dry_run.is_(False), Bet.id != bet.id
+            )
+        )
+        or 0
+    )
+    if not others:
+        return None
+    return (
+        f"{others + 1} bet placements are unconfirmed (UNCERTAIN, latest bet {bet.id}): check 'Moje zakłady' "
+        "on Betclic and the receipt selectors in config/betclic_selectors.yaml, then resume"
+    )
 
 
 def _summary(bet: Bet, placement: str, message: str) -> BetSummary:

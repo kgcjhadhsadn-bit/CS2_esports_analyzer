@@ -8,7 +8,10 @@
    * upsert ``bookmaker_events`` by (bookmaker, external_id) and record the archived raw payload
      paths in ``extra["raw_payloads"]``;
    * (re)link it with :func:`cs2bot.odds.event_matching.link_event` (manual CONFIRMED / REJECTED
-     decisions are preserved);
+     decisions are preserved). ``teams_swapped`` is positional, so when Betclic starts listing the
+     teams of a linked event the other way round the flag is flipped with the names (a CONFIRMED link
+     whose team names changed beyond recognition goes back to ``PENDING_REVIEW``), see
+     :func:`_follow_team_order` - final review;
    * live events are stored and flagged (``is_live``) but their prices are not processed - the
      system is pre-match only and the last pre-match snapshot stays the closing line;
    * upsert ``bookmaker_markets`` by (event_id, raw_name, external_id) and ``bookmaker_selections``
@@ -61,6 +64,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import math
 from collections import Counter
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
@@ -76,10 +80,11 @@ from cs2bot.config import Settings
 from cs2bot.db.models import BookmakerEvent, BookmakerMarket, BookmakerSelection, Match, OddsSnapshot
 from cs2bot.domain.enums import Bookmaker, LinkStatus, MatchFormat
 from cs2bot.domain.odds import CollectedEvent, CollectedMarket, CollectedSelection, MappedSelection
-from cs2bot.odds.event_matching import MANUAL_STATUSES, LinkConfig, link_event
+from cs2bot.odds.event_matching import MANUAL_STATUSES, LinkConfig, link_event, team_name_score
 from cs2bot.odds.market_mapping import MarketMapper, PlayerResolver, lineup_player_resolver
 from cs2bot.odds.sources import FetchInfo, OddsSource, SupportsFetchInfo
 from cs2bot.odds.text import MAX_ODDS, MIN_ODDS_EXCLUSIVE, quantize_odds, truncate
+from cs2bot.utils.names import normalize_team_name
 from cs2bot.utils.time import ensure_utc, utcnow
 
 logger = logging.getLogger(__name__)
@@ -387,8 +392,12 @@ def _upsert_event(run: _Run, ce: CollectedEvent, partial: bool) -> tuple[Bookmak
         )
         session.add(row)
     row.name = truncate(ce.name, 256) or row.name
-    row.team1_raw = truncate(ce.team1_raw, 128) or row.team1_raw
-    row.team2_raw = truncate(ce.team2_raw, 128) or row.team2_raw
+    new_team1 = truncate(ce.team1_raw, 128) or row.team1_raw
+    new_team2 = truncate(ce.team2_raw, 128) or row.team2_raw
+    if not is_new:
+        _follow_team_order(row, new_team1, new_team2, run.config.link, at=run.now)
+    row.team1_raw = new_team1
+    row.team2_raw = new_team2
     if ce.competition_raw:
         row.competition_raw = truncate(ce.competition_raw, 256)
     if ce.starts_at is not None:
@@ -410,6 +419,67 @@ def _upsert_event(run: _Run, ce: CollectedEvent, partial: bool) -> tuple[Bookmak
     row.extra = extra
     session.flush()
     return row, is_new
+
+
+def _follow_team_order(
+    row: BookmakerEvent, new_team1: str, new_team2: str, cfg: LinkConfig, *, at: datetime
+) -> None:
+    """Keep ``teams_swapped`` meaning the same TEAMS when Betclic changes the order it lists them in.
+
+    ``teams_swapped`` is positional ("bookmaker team1 is our team2") and the mapper decides the slot of a
+    selection by matching its text against the CURRENT ``team1_raw`` / ``team2_raw``. If a later payload
+    lists the contestants the other way round (another page / API, a re-published event), an AUTO link is
+    re-scored by :func:`link_event`, but a CONFIRMED link is never touched - every selection would then be
+    keyed for the wrong team (the model's probability of team A priced against the odds of team B).
+
+    So for a linked event whose stored names come back clearly flipped, the flag is flipped with them; when
+    the names changed so much that the order cannot be told (both teams renamed), a manual link goes back
+    to review (``PENDING_REVIEW``: never bet until the owner confirms it again, or the automatic linker
+    re-links it with a clear orientation). Either way every stored market is re-mapped
+    (``extra["remap_required"]``).
+    """
+    if row.match_id is None:
+        return
+    old1, old2 = row.team1_raw or "", row.team2_raw or ""
+    if normalize_team_name(old1) == normalize_team_name(new_team1) and normalize_team_name(
+        old2
+    ) == normalize_team_name(new_team2):
+        return
+    straight = math.sqrt(team_name_score(new_team1, [old1]) * team_name_score(new_team2, [old2]))
+    flipped = math.sqrt(team_name_score(new_team1, [old2]) * team_name_score(new_team2, [old1]))
+    extra = dict(row.extra or {})
+    if flipped >= straight + cfg.min_orientation_margin:
+        row.teams_swapped = not bool(row.teams_swapped)
+        extra[REMAP_REQUIRED_KEY] = True
+        extra["team_order_flipped_at"] = at.isoformat()
+        logger.warning(
+            "Betclic event %s now lists its teams the other way round (%r - %r, was %r - %r): "
+            "teams_swapped follows it",
+            row.external_id,
+            new_team1,
+            new_team2,
+            old1,
+            old2,
+        )
+    elif straight < flipped + cfg.min_orientation_margin and row.link_status is LinkStatus.CONFIRMED:
+        row.link_status = LinkStatus.PENDING_REVIEW
+        extra[REMAP_REQUIRED_KEY] = True
+        extra["review_reason"] = (
+            f"Betclic renamed the teams ({new_team1!r} - {new_team2!r}, confirmed as {old1!r} - {old2!r}); "
+            "the team order is unclear - confirm the link again"
+        )
+        logger.warning(
+            "Betclic event %s: team names changed beyond recognition since the manual confirmation "
+            "(%r - %r, was %r - %r): sent back to review",
+            row.external_id,
+            new_team1,
+            new_team2,
+            old1,
+            old2,
+        )
+    else:
+        return
+    row.extra = extra
 
 
 def _sync_market(

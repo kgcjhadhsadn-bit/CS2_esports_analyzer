@@ -74,6 +74,11 @@ HISTORY_TIME_SLACK = timedelta(minutes=2)
 #: show it after the grace period: the bet may still exist (the executor skips unreadable history
 #: rows), so ``services.betting`` never decides this outcome again automatically.
 UNCONFIRMED_NOT_FOUND_KEY = "unconfirmed_not_found"
+#: ``bets.extra`` key holding ``[team1_id, team2_id]`` of the match when the bet was created (written by
+#: ``services.betting``). The selection key ("team1", a handicap line ...) only means something in that
+#: orientation: if a source later replaces a participant, the local resolver must not settle the bet
+#: against the new teams (final review) - it stays UNKNOWN (alert) unless Betclic's history settles it.
+TEAMS_AT_PLACEMENT_KEY = "teams_at_placement"
 
 _BOOKMAKER_OUTCOME = {
     BookmakerBetStatus.WON: SettlementOutcome.WON,
@@ -305,6 +310,13 @@ def _local_resolution(
     """The local resolver's verdict, or None when the match is not finished (nothing to resolve yet)."""
     if match is None or match.status not in FINISHED_STATUSES:
         return None
+    teams = (bet.extra or {}).get(TEAMS_AT_PLACEMENT_KEY)
+    if isinstance(teams, list) and len(teams) == 2 and teams != [match.team1_id, match.team2_id]:
+        return settlement.Resolution(
+            SettlementOutcome.UNKNOWN,
+            f"the match teams changed since the bet was placed (then {teams[0]} / {teams[1]}, now "
+            f"{match.team1_id} / {match.team2_id}) - settle it from Betclic's history or by hand",
+        )
     actuals, player_teams = actuals_cache.get(match)
     if actuals is None:
         return settlement.Resolution(SettlementOutcome.UNKNOWN, "no result data for the match")

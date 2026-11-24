@@ -69,7 +69,8 @@ Every component that can move money checks the controls immediately before actin
 | **Loss limits** | When the realised loss of the day (week) reaches `DAILY_LOSS_LIMIT_FRACTION` (`WEEKLY_...`) x the bankroll at the start of that day (week), betting pauses until you resume. Stakes are also sized so that even if every open bet loses, the day's loss stays within the limit. Days follow Warsaw time. | `CS2BOT_BANKROLL__DAILY_LOSS_LIMIT_FRACTION=0.05`, `..._WEEKLY_...=0.10`, dashboard Settings |
 | **Caps** | Max stake per bet (2% of bankroll), max exposure per match (4%), max bets per day (10), never two selections of one market. | `CS2BOT_BANKROLL__*`, dashboard Settings |
 | **Dry run** | Everything except the final click; bets are recorded as `dry_run` and settled on paper; no ledger entries, no effect on the limits. | `CS2BOT_EXECUTOR__DRY_RUN=true` in `.env`, restart |
-| **Idempotency** | A bet is written to the database (and committed) before the click and is never placed twice for the same prediction, also after a crash. A placement whose outcome is unclear (`UNCERTAIN`) is never retried; settlement reconciles it with Betclic's bet history. | built in |
+| **Idempotency** | A bet is written to the database (and committed) before the click and is never placed twice for the same prediction, also after a crash. A placement whose outcome is unclear (`UNCERTAIN`) is never retried; settlement reconciles it with Betclic's bet history. A **second** unconfirmed placement while the first is still open **pauses** the bot (the confirmation step is probably broken): check "Moje zakłady" and the receipt selectors, then resume. | built in |
+| **Stale predictions** | A match is never bet on a prediction made for other teams / another format, after it left the Tier 1/2 scope, or while its prediction could not be refreshed (teams or lineups gone, an error) - the betting log notes "not bet: ...". | built in |
 
 In an emergency: kill switch on the dashboard, or `stop.cmd`. Betclic itself is always the final
 truth for money: compare with "Moje zakłady".
@@ -84,7 +85,9 @@ truth for money: compare with "Moje zakłady".
      continue. Selector error: see [Recalibrating selectors](#recalibrating-betclic-selectors).
    - *Job failing / overdue* -> Health page shows the error; check `logs\`.
    - *Link review pending* -> **Review** page: confirm or reject Betclic events the bot could not
-     link with certainty (they are never bet until confirmed).
+     link with certainty (they are never bet until confirmed). A confirmed event whose team names
+     Betclic later changed beyond recognition comes back here (`extra.review_reason`); one that only
+     lists its teams the other way round keeps its link (the orientation follows the names).
    - *Executor unhealthy / selectors failing* -> `uv run cs2bot executor health` (bot stopped) and
      [Recalibrating selectors](#recalibrating-betclic-selectors).
    - *Loss limit reached* -> the bot paused itself; see the safety controls above.
@@ -133,7 +136,10 @@ Secrets (API keys, passwords, cookies) are never logged.
   removes it).
 - `update.ps1` takes a `before-update` backup, `restore-db.ps1` a `before-restore` backup.
 - `restore-db.cmd [-BackupFile ...]` - bot must be stopped; type `RESTORE` to confirm; then
-  `cs2bot db upgrade` runs. `restore-db.ps1 -List` lists the backups.
+  `cs2bot db upgrade` runs and the **kill switch is switched ON** (bets placed after the backup are
+  missing from the restored database and could be staked again): compare the open bets with "Moje
+  zakłady", run `uv run cs2bot settle`, check the bankroll, then switch the kill switch off.
+  `restore-db.ps1 -List` lists the backups.
 - Copy `backups\` off the PC regularly. Model artefacts (`data\models`) are rebuilt by the nightly
   retrain and need no backup; the Betclic browser profile (`data\browser\betclic`) holds your
   session and the placement journal - do not delete it while bets are open.

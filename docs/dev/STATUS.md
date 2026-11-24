@@ -21,4 +21,4 @@ Test counts are the package's own suite as reported in `docs/dev/reports/<packag
 | dashboard (React) | done | 79 (vitest) | round 1 | |
 | ops (Windows install, CI, docs) | done | 37 | round 1 | PowerShell scripts never run on Windows |
 | integration (services, jobs, `cs2bot up`, CLI, end-to-end test) | done | 58 | round 1 | whole suite 2973 passed |
-| final cross-cutting review | - | | - | |
+| final cross-cutting review (Lens A: money / safety path) | done | 15 | - | 6 bugs fixed (1 critical: confirmed link + Betclic team-order flip); migration 0002; see reports/final_review.md |

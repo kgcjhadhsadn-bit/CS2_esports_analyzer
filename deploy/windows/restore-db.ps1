@@ -10,6 +10,9 @@
     4. Drops the database, creates it empty and restores the backup into it (pg_restore inside the
        PostgreSQL container).
     5. Runs "cs2bot db upgrade" so a backup from an older version gets the current tables.
+    6. Switches the KILL SWITCH ON: bets placed after the backup are missing from the restored
+       database and could otherwise be staked again. Switch it off on the dashboard after comparing
+       the open bets with "Moje zaklady" on Betclic.
 
     Everything in the database goes back to the moment of the backup: bets, ledger, odds history,
     the kill switch / pause state and the thresholds changed on the dashboard. Bets placed on
@@ -169,10 +172,15 @@ try {
     Write-Step 'Bringing the tables up to date (cs2bot db upgrade)'
     Invoke-Checked 'cs2bot db upgrade' 'uv' @('run', 'cs2bot', 'db', 'upgrade')
 
+    # Bets placed after the backup are unknown to the restored database: the bot could stake them again.
+    # The kill switch stays on until the owner has compared the open bets with Betclic.
+    Write-Step 'Switching the kill switch ON (bets placed after the backup are missing from the database)'
+    Invoke-Checked 'cs2bot control kill-switch on' 'uv' @('run', 'cs2bot', 'control', 'kill-switch', 'on', '--reason', 'database restored from a backup - compare open bets with Moje zaklady, run cs2bot settle, then switch the kill switch off')
+
     Write-Host ''
     Write-Host 'Restore finished.' -ForegroundColor Green
-    Write-Host '  * Check the kill switch / pause state and the bankroll on the dashboard after starting the bot.'
-    Write-Host '  * Compare open bets with "Moje zaklady" on Betclic.'
+    Write-Host '  * The KILL SWITCH IS ON: no bet is placed until you switch it off on the dashboard.' -ForegroundColor Yellow
+    Write-Host '  * Compare open bets with "Moje zaklady" on Betclic and the bankroll on the dashboard first.'
     Write-Host '  * Start the bot: deploy\windows\start.cmd'
     exit 0
 } catch {

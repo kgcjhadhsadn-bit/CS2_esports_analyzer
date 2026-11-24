@@ -697,6 +697,11 @@ class Bet(TimestampMixin, Base):
 
 class BankrollLedger(Base):
     __tablename__ = "bankroll_ledger"
+    # At most ONE stake / payout / refund entry per bet, enforced by the database (migration 0002): the
+    # ledger's idempotency checks are read-then-write, so two writers racing on one bet (``cs2bot settle``
+    # next to ``cs2bot up``) could otherwise both book it. Rows without a bet (deposits, adjustments,
+    # reconciliations) never conflict: NULLs are distinct in a unique index.
+    __table_args__ = (Index("uq_bankroll_ledger_bet_kind", "bet_id", "kind", unique=True),)
 
     id: Mapped[int] = mapped_column(primary_key=True)
     ts: Mapped[datetime] = mapped_column(UTCDateTime(), index=True)

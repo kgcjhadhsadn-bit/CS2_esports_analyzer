@@ -51,6 +51,12 @@ log = logging.getLogger(__name__)
 
 #: Key of the bookkeeping entry in ``matches.extra``.
 EXTRA_KEY = "prediction"
+#: Key inside ``matches.extra["prediction"]`` set when the stored prediction no longer describes the match
+#: (its inputs changed but no new prediction could be made: teams / lineups gone, an error). The betting
+#: cycle never bets a match carrying it; the next successful prediction (or an unchanged fingerprint)
+#: clears it. Final review: before it, a failed re-prediction left the old analysis "latest" and bettable
+#: for up to ``max_prediction_age`` (8 h).
+STALE_KEY = "stale"
 #: Re-simulate a prediction older than this even when nothing visible changed (ratings move daily).
 DEFAULT_MAX_AGE = timedelta(hours=6)
 
@@ -482,6 +488,42 @@ def predict_match(
     return prediction
 
 
+def mark_prediction_stale(session: Session, match_id: int, reason: str, *, now: datetime) -> bool:
+    """Flag the match's stored prediction as not bettable (``matches.extra["prediction"]["stale"]``).
+
+    Returns False when the match does not exist. Flushes, never commits.
+    """
+    match = session.get(Match, match_id)
+    if match is None:
+        return False
+    extra = dict(match.extra or {})
+    meta = dict(extra.get(EXTRA_KEY) or {})
+    meta[STALE_KEY] = {"reason": reason[:300], "at": now.isoformat()}
+    extra[EXTRA_KEY] = meta
+    match.extra = extra  # reassigned so the JSON change is persisted
+    session.flush()
+    return True
+
+
+def stale_reason(match: Match) -> str | None:
+    """Why the stored prediction of ``match`` must not be bet (None = it may be)."""
+    meta = (match.extra or {}).get(EXTRA_KEY) or {}
+    stale = meta.get(STALE_KEY) if isinstance(meta, dict) else None
+    if not stale:
+        return None
+    if isinstance(stale, dict):
+        return str(stale.get("reason") or "the stored prediction is out of date")
+    return str(stale)
+
+
+def _clear_stale(match: Match) -> None:
+    meta = (match.extra or {}).get(EXTRA_KEY)
+    if isinstance(meta, dict) and STALE_KEY in meta:
+        extra = dict(match.extra or {})
+        extra[EXTRA_KEY] = {k: v for k, v in meta.items() if k != STALE_KEY}
+        match.extra = extra
+
+
 def upcoming_match_ids(session: Session, settings: Settings, *, now: datetime) -> list[int]:
     """In-scope, scheduled matches with both teams that start inside the betting window."""
     horizon = now + timedelta(hours=max(settings.decision.max_hours_before_start, 1))
@@ -569,6 +611,9 @@ def predict_upcoming(
                 match_id=match_id, status="failed", reason=f"{type(exc).__name__}: {exc}"
             )
             report.errors.append(f"match {match_id}: {type(exc).__name__}: {exc}")
+            _mark_stale_after_failure(
+                session_factory, match_id, f"prediction failed: {type(exc).__name__}", now
+            )
         report.results.append(outcome)
         report.outcomes_written += outcome.outcomes_written
         if outcome.status == "predicted":
@@ -580,6 +625,25 @@ def predict_upcoming(
         else:
             report.failed += 1
     return report
+
+
+def _mark_stale_after_failure(
+    session_factory: sessionmaker[Session], match_id: int, reason: str, now: datetime
+) -> None:
+    """Best effort: a match whose prediction could not be refreshed is not bet on its old prediction."""
+    try:
+        with session_factory() as session:
+            if mark_prediction_stale(session, match_id, reason, now=now):
+                session.commit()
+    except Exception:
+        log.exception("could not flag the prediction of match %s as stale", match_id)
+
+
+def _skip(session: Session, match: Match, reason: str, now: datetime) -> MatchPredictOutcome:
+    """A match that cannot be predicted any more: its stored prediction (if any) is no longer bettable."""
+    if latest_analysis(session, match.id) is not None:
+        mark_prediction_stale(session, match.id, reason, now=now)
+    return MatchPredictOutcome(match.id, "skipped", reason)
 
 
 def _predict_one(
@@ -597,15 +661,15 @@ def _predict_one(
     if match is None:
         return MatchPredictOutcome(match_id, "skipped", "match not found")
     if match.team1_id is None or match.team2_id is None:
-        return MatchPredictOutcome(match_id, "skipped", "teams not known yet")
+        return _skip(session, match, "teams not known yet", now)
     if match.scheduled_at is None or ensure_utc(match.scheduled_at) <= now:
         return MatchPredictOutcome(match_id, "skipped", "match already started")
     try:
         prepared = prepare_match(session, match_id, bundle, settings, analyzer=analyzer, now=now)
     except datasets.MatchNotFoundError as exc:
-        return MatchPredictOutcome(match_id, "skipped", str(exc))
+        return _skip(session, match, str(exc), now)
     if not prepared.ctx.team1_lineup or not prepared.ctx.team2_lineup:
-        return MatchPredictOutcome(match_id, "skipped", "lineups not known")
+        return _skip(session, match, "lineups not known", now)
     analysis = latest_analysis(session, match_id)
     why = (
         "forced"
@@ -623,6 +687,7 @@ def _predict_one(
             now=now,
             replace=False,
         )
+        _clear_stale(match)  # the stored prediction matches the current inputs again
         return MatchPredictOutcome(match_id, "unchanged", analysis_id=analysis.id, outcomes_written=n)
     prediction = simulate(session, prepared, bundle, settings, now=now)
     row, n = persist_prediction(session, prediction, prepared, bundle, settings, analyzer=analyzer, now=now)
